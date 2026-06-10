@@ -112,6 +112,36 @@ fn safe_div(a: Int, b: Int) -> Int
 - **One canonical style.** The grammar admits no formatting wars; a formatter
   will enforce a single rendering (roadmap).
 
+Loops carry **invariants** the same way functions carry contracts:
+
+```sigil
+fn total(n: Int) -> Int
+    requires n >= 0
+    ensures result >= 0
+{
+    var sum: Int = 0;
+    var i: Int = 0;
+    while i < n
+        invariant sum >= 0
+        invariant i >= 0
+    {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+```
+
+The verifier proves each invariant on entry and across an arbitrary
+iteration, then gets to assume it after the loop — which is what makes the
+`ensures` provable. Unproven invariants stay as runtime checks (before the
+loop and after every iteration) that blame the loop.
+
+**Generic functions** (`fn first[T](xs: List[T]) -> T`) infer their type
+arguments at call sites; generic values are opaque (no `==`, no `str`).
+The native backend monomorphizes — each instantiation compiles to its own
+Rust function, so generics cost nothing at runtime.
+
 ## Grammar (v0.1)
 
 ```
@@ -175,9 +205,9 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.1.5** | Native backend: checked AST → Rust → `rustc -O` → executable (`sigil build`). Interpreter retained as reference semantics; differential tests enforce agreement. Capabilities compile to zero-sized types. ~87× over the interpreter on `fib(30)`. | **done** |
 | **0.2a** | Capability *attenuation*: `read_only(fs)`, path-scoped `subdir(fs, p)`; pure, monotonic, enforced by the capability value in both backends. | **done** |
 | **0.2b** | Records: immutable product types, canonical field order, capability-aware equality, recursion via List. Compile to plain Rust structs. | **done** |
-| **0.2c** | Generics for user functions. | |
+| **0.2c** | Generics for user functions: `fn first[T](xs: List[T]) -> T`, inference-only call sites, generic values opaque (no `==`/`str`). Native backend monomorphizes (worklist, mangled instantiations); uncalled generic functions emit no code. | **done** |
 | **0.3** | Static contract verification via SMT (Z3): symbolic execution over Int/Bool, inductive recursion, callee-ensures propagation, division-safety proofs. Proven clauses emit no runtime check in the native backend; everything unmodeled (Text/List/records/loops) conservatively keeps its check. `sigil verify` reports clause-by-clause. | **done** |
-| **0.3b** | Loop invariants (`invariant` clauses on while) so loop-carried contracts become provable. | |
+| **0.3b** | Loop invariants: `while cond invariant e { ... }` — proven on entry + preserved per iteration (Z3), assumed after the loop, so loop-carried `ensures` become provable. Unproven invariants are runtime-checked before the loop and after each iteration, with "blame the loop" diagnostics. | **done** |
 | **0.4** | Canonical typed AST as the on-disk format; stable declaration IDs; semantic diff. Text becomes a projection. | |
 | **0.5** | Compiler-as-a-service API: an LLM queries types/effects/obligations *while generating* instead of generating blind. | |
 | **1.0** | Self-contained backend (LLVM/Cranelift, dropping the rustc dependency) — purity/effect info drives parallelization and check elision. | |

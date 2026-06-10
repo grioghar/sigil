@@ -24,11 +24,15 @@ fn main(console: Console) -> Unit ! {io.write} {
    mints a strictly weaker one to hand to code you trust less.
 2. **Effects in the type** — every function declares what it may do (`! {io.write}`);
    undeclared effects are compile errors, and no annotation means provably pure.
-3. **Contracts with blame, proven where possible** — `requires`/`ensures` are
-   part of the signature; violations name the guilty party (caller vs. callee).
-   With `z3-solver` installed, `sigil verify` proves clauses statically
-   (recursion handled inductively) and `sigil build` erases every proven
-   runtime check from the binary. Unproven clauses conservatively stay.
+3. **Contracts with blame, proven where possible** — `requires`/`ensures` on
+   functions and `invariant` on loops; violations name the guilty party
+   (caller, callee, or loop). With `z3-solver` installed, `sigil verify`
+   proves clauses statically (recursion inductively, loops via invariants)
+   and `sigil build` erases every proven runtime check from the binary.
+   Unproven clauses conservatively stay.
+
+Plus records (`record Point { x: Int, y: Int }`) and generic functions
+(`fn first[T](xs: List[T]) -> T`, monomorphized to native code).
 
 ## Quickstart
 
