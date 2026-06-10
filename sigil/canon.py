@@ -205,8 +205,13 @@ class Renderer:
         header = self.fn_signature(fn)
         if fn.contracts:
             lines.append(header)
-            for contract in fn.contracts:
-                lines.append(f"    {contract.kind} {self.render_expr(contract.expr)}")
+            # The lexer is newline-blind, so the LAST clause sits directly
+            # before the body's '{' and needs the nullary-variant guard.
+            for index, contract in enumerate(fn.contracts):
+                rendered = self.render_expr(contract.expr)
+                if index == len(fn.contracts) - 1:
+                    rendered = _guard_before_block(rendered)
+                lines.append(f"    {contract.kind} {rendered}")
             lines.append("{")
         else:
             lines.append(header + " {")

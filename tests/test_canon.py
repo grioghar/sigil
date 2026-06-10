@@ -121,6 +121,22 @@ class TestFormatterInvariants(unittest.TestCase):
                        "while (x == Empty) {", "invariant (x == Empty)"):
             self.assertIn(needle, formatted)
 
+    def test_nullary_variant_in_last_contract_keeps_parens(self):
+        # The lexer is newline-blind: a final contract clause ending in a
+        # nullary variant sits directly before the body's '{'.
+        source = """
+            enum Opt { Empty, Got(Int) }
+            fn f(x: Opt) -> Opt
+                requires (x == Empty)
+            {
+                return x;
+            }
+            fn main(c: Console) -> Unit {
+            }
+        """
+        formatted = self.assert_canonical(source)
+        self.assertIn("requires (x == Empty)", formatted)
+
     def test_record_rendering(self):
         formatted = self.assert_canonical(SNIPPETS["record"])
         self.assertIn("record Point {\n    x: Int,\n    y: Int,\n}", formatted)
