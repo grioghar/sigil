@@ -211,6 +211,8 @@ def rust_type(ty: A.Type) -> str:
     if ty.kind == "List":
         elem = rust_type(ty.elem) if ty.elem is not None else "i64"
         return f"Vec<{elem}>"
+    if ty.kind == "Record":
+        return f"s_{ty.name}"
     return RUST_TYPES[ty.kind]
 
 
@@ -236,11 +238,44 @@ class RustEmitter:
 
     def emit(self) -> str:
         self.lines = [PRELUDE]
+        for rec in self.program.records:
+            self.emit_record(rec)
+            self.emit_line()
         for fn in self.program.functions:
             self.emit_fn(fn)
             self.emit_line()
         self.emit_entry()
         return "\n".join(self.lines) + "\n"
+
+    # ------------------------------------------------------------ records
+
+    def record_has_capability(self, ty: A.Type,
+                              visiting: set[str] | None = None) -> bool:
+        if ty.kind in ("Console", "Fs"):
+            return True
+        if ty.kind == "List":
+            return ty.elem is not None and self.record_has_capability(ty.elem, visiting)
+        if ty.kind == "Record":
+            visiting = visiting or set()
+            if ty.name in visiting:
+                return False
+            visiting.add(ty.name)
+            rec = next(r for r in self.program.records if r.name == ty.name)
+            return any(self.record_has_capability(ftype, visiting)
+                       for _, ftype in rec.fields)
+        return False
+
+    def emit_record(self, rec: A.RecordDecl) -> None:
+        # Records compare by value unless they hold a capability (the checker
+        # forbids comparing those, so the derive can be dropped).
+        has_cap = any(self.record_has_capability(ftype)
+                      for _, ftype in rec.fields)
+        derives = "Clone" if has_cap else "Clone, PartialEq"
+        self.emit_line(f"#[derive({derives})]")
+        self.emit_line(f"struct s_{rec.name} {{")
+        for fname, ftype in rec.fields:
+            self.emit_line(f"    s_{fname}: {rust_type(ftype)},")
+        self.emit_line("}")
 
     # ------------------------------------------------------------ entry point
 
@@ -376,6 +411,12 @@ class RustEmitter:
             if expr_ty(expr).kind in COPY_KINDS:
                 return name
             return f"{name}.clone()"
+        if isinstance(expr, A.RecordLit):
+            fields = ", ".join(f"s_{fname}: {self.expr(fexpr)}"
+                               for fname, fexpr in expr.fields)
+            return f"s_{expr.name} {{ {fields} }}"
+        if isinstance(expr, A.FieldAccess):
+            return f"({self.expr(expr.base)}).s_{expr.field_name}"
         if isinstance(expr, A.Index):
             return f"rt_index(&({self.expr(expr.base)}), {self.expr(expr.index)})"
         if isinstance(expr, A.Unary):

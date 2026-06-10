@@ -203,6 +203,11 @@ class Interpreter:
         if isinstance(expr, A.Call):
             args = [self.eval(a, frame) for a in expr.args]
             return self.call(expr.name, args, expr.line, expr.col)
+        if isinstance(expr, A.RecordLit):
+            return {fname: self.eval(fexpr, frame)
+                    for fname, fexpr in expr.fields}
+        if isinstance(expr, A.FieldAccess):
+            return self.eval(expr.base, frame)[expr.field_name]
         if isinstance(expr, A.Index):
             base = self.eval(expr.base, frame)
             index = self.eval(expr.index, frame)

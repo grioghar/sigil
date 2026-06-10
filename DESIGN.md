@@ -115,12 +115,13 @@ fn safe_div(a: Int, b: Int) -> Int
 ## Grammar (v0.1)
 
 ```
-program   := fnDecl*
+program   := (fnDecl | recordDecl)*
+recordDecl:= "record" UPPER_IDENT "{" (IDENT ":" type ","?)* "}"
 fnDecl    := "fn" IDENT "(" params? ")" "->" type effects? contract* block
 params    := param ("," param)*
 param     := IDENT ":" type
 type      := "Int" | "Bool" | "Text" | "Unit" | "Console" | "Fs"
-           | "List" "[" type "]"
+           | "List" "[" type "]" | UPPER_IDENT
 effects   := "!" "{" EFFECT ("," EFFECT)* "}"
 contract  := "requires" expr | "ensures" expr
 block     := "{" stmt* "}"
@@ -133,8 +134,21 @@ stmt      := "let" IDENT ":" type "=" expr ";"
            | expr ";"
 expr      := standard precedence: or > and > == != < <= > >= > + - > * / % > unary (not, -)
 primary   := INT | TEXT | "true" | "false" | IDENT | call | "(" expr ")"
-           | "[" (expr ("," expr)*)? "]" | primary "[" expr "]"
+           | "[" (expr ",")* "]" | primary "[" expr "]"
+           | UPPER_IDENT "{" (IDENT ":" expr ","?)* "}" | primary "." IDENT
 ```
+
+**Naming is part of the grammar's canon:** record names start uppercase,
+value and function names start lowercase (enforced by the checker). This is
+what makes `Point { x: 0 }` unambiguous against `if flag { ... }` — and it
+means an auditor can classify any identifier at a glance. Record literals
+must list fields in declaration order: one program, one rendering.
+
+**Records** are immutable user-defined product types. They may hold
+capabilities (bundling a `Console` with a log prefix is normal
+object-capability style), but a record containing a capability cannot be
+compared with `==`. Direct record-in-record recursion is rejected (infinite
+size); recursion through `List` is allowed, so trees are expressible.
 
 ## Builtins (v0.1)
 
@@ -160,7 +174,8 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.1** | Tree-walking interpreter, type + effect checker, runtime contracts with blame. Prove the model end to end. | **done** |
 | **0.1.5** | Native backend: checked AST → Rust → `rustc -O` → executable (`sigil build`). Interpreter retained as reference semantics; differential tests enforce agreement. Capabilities compile to zero-sized types. ~87× over the interpreter on `fib(30)`. | **done** |
 | **0.2a** | Capability *attenuation*: `read_only(fs)`, path-scoped `subdir(fs, p)`; pure, monotonic, enforced by the capability value in both backends. | **done** |
-| **0.2b** | Records and generics for user functions. | |
+| **0.2b** | Records: immutable product types, canonical field order, capability-aware equality, recursion via List. Compile to plain Rust structs. | **done** |
+| **0.2c** | Generics for user functions. | |
 | **0.3** | Static contract verification via SMT (Z3); proven contracts erase their runtime checks — in the native backend that means the emitted branches disappear. | |
 | **0.4** | Canonical typed AST as the on-disk format; stable declaration IDs; semantic diff. Text becomes a projection. | |
 | **0.5** | Compiler-as-a-service API: an LLM queries types/effects/obligations *while generating* instead of generating blind. | |

@@ -74,14 +74,19 @@ class Scope:
         self.names[name] = binding
 
 
+BUILTIN_TYPE_NAMES = {"Int", "Bool", "Text", "Unit", "Console", "Fs", "List"}
+
+
 class Checker:
     def __init__(self, program: A.Program):
         self.program = program
         self.sigs: dict[str, FnSig] = dict(BUILTINS)
+        self.records: dict[str, A.RecordDecl] = {}
 
     # ------------------------------------------------------------ entry
 
     def check(self) -> dict[str, FnSig]:
+        self.check_records()
         for fn in self.program.functions:
             if fn.name in self.sigs:
                 kind = "builtin" if self.sigs[fn.name].decl is None else "function"
@@ -98,16 +103,94 @@ class Checker:
             self.check_fn(fn)
         return self.sigs
 
+    # ------------------------------------------------------------ records
+
+    def check_records(self) -> None:
+        for rec in self.program.records:
+            if not rec.name[0].isupper():
+                raise CheckError(
+                    f"record name '{rec.name}' must start with an uppercase "
+                    f"letter (Sigil's one canonical style)", rec.line, rec.col)
+            if rec.name in BUILTIN_TYPE_NAMES:
+                raise CheckError(f"'{rec.name}' is a builtin type",
+                                 rec.line, rec.col)
+            if rec.name in self.records:
+                raise CheckError(f"record '{rec.name}' is already defined",
+                                 rec.line, rec.col)
+            self.records[rec.name] = rec
+
+        for rec in self.program.records:
+            seen: set[str] = set()
+            for fname, ftype in rec.fields:
+                if fname in seen:
+                    raise CheckError(
+                        f"duplicate field '{fname}' in record '{rec.name}'",
+                        rec.line, rec.col)
+                seen.add(fname)
+                self.validate_type(ftype, rec.line, rec.col)
+
+        # Direct record-in-record cycles have infinite size. Recursion through
+        # List is fine (it is heap-indirected), so trees are expressible.
+        def direct_deps(name: str) -> list[str]:
+            return [t.name for _, t in self.records[name].fields
+                    if t.kind == "Record"]
+
+        for start in self.records:
+            stack, visited = [start], set()
+            while stack:
+                current = stack.pop()
+                for dep in direct_deps(current):
+                    if dep == start:
+                        raise CheckError(
+                            f"record '{start}' contains itself (directly or "
+                            f"via other records), which would be infinite; "
+                            f"use List for recursion",
+                            self.records[start].line, self.records[start].col)
+                    if dep not in visited:
+                        visited.add(dep)
+                        stack.append(dep)
+
+    def validate_type(self, ty: A.Type, line: int, col: int) -> None:
+        if ty.kind == "Record" and ty.name not in self.records:
+            raise CheckError(f"unknown record '{ty.name}'", line, col)
+        if ty.kind == "List" and ty.elem is not None:
+            self.validate_type(ty.elem, line, col)
+
+    def contains_capability(self, ty: A.Type,
+                            visiting: Optional[set[str]] = None) -> bool:
+        if ty.kind in A.CAPABILITY_KINDS:
+            return True
+        if ty.kind == "List":
+            return ty.elem is not None and self.contains_capability(ty.elem, visiting)
+        if ty.kind == "Record":
+            visiting = visiting or set()
+            if ty.name in visiting:
+                return False
+            visiting.add(ty.name)
+            return any(self.contains_capability(ftype, visiting)
+                       for _, ftype in self.records[ty.name].fields)
+        return False
+
     # ------------------------------------------------------------ functions
 
     def check_fn(self, fn: A.FnDecl) -> None:
+        if not fn.name[0].islower():
+            raise CheckError(
+                f"function name '{fn.name}' must start with a lowercase "
+                f"letter (Sigil's one canonical style)", fn.line, fn.col)
+        self.validate_type(fn.ret, fn.line, fn.col)
         scope = Scope()
         seen_params: set[str] = set()
         for pname, ptype in fn.params:
+            if not pname[0].islower():
+                raise CheckError(
+                    f"parameter '{pname}' must start with a lowercase letter",
+                    fn.line, fn.col)
             if pname in seen_params:
                 raise CheckError(f"duplicate parameter '{pname}' in '{fn.name}'",
                                  fn.line, fn.col)
             seen_params.add(pname)
+            self.validate_type(ptype, fn.line, fn.col)
             scope.declare(pname, Binding(ptype, mutable=False), fn.line, fn.col)
 
         for contract in fn.contracts:
@@ -150,6 +233,11 @@ class Checker:
 
     def check_stmt(self, stmt: A.Stmt, scope: Scope, fn: A.FnDecl) -> None:
         if isinstance(stmt, A.Let):
+            if not stmt.name[0].islower():
+                raise CheckError(
+                    f"binding '{stmt.name}' must start with a lowercase letter",
+                    stmt.line, stmt.col)
+            self.validate_type(stmt.declared_type, stmt.line, stmt.col)
             vtype = self.check_expr(stmt.value, scope, fn)
             if not A.compatible(stmt.declared_type, vtype):
                 raise CheckError(
@@ -254,6 +342,42 @@ class Checker:
         if isinstance(expr, A.Call):
             return self.check_call(expr, scope, fn, in_contract)
 
+        if isinstance(expr, A.RecordLit):
+            rec = self.records.get(expr.name)
+            if rec is None:
+                raise CheckError(f"unknown record '{expr.name}'",
+                                 expr.line, expr.col)
+            written = [fname for fname, _ in expr.fields]
+            declared = [fname for fname, _ in rec.fields]
+            if written != declared:
+                raise CheckError(
+                    f"'{expr.name}' literal must list exactly its fields in "
+                    f"declaration order: {', '.join(declared)} (got: "
+                    f"{', '.join(written) if written else 'none'})",
+                    expr.line, expr.col)
+            for (fname, fexpr), (_, ftype) in zip(expr.fields, rec.fields):
+                atype = self.check_expr(fexpr, scope, fn, in_contract)
+                if not A.compatible(ftype, atype):
+                    raise CheckError(
+                        f"field '{fname}' of '{expr.name}' needs {ftype}, "
+                        f"got {atype}", fexpr.line, fexpr.col)
+            return A.Type("Record", name=expr.name)
+
+        if isinstance(expr, A.FieldAccess):
+            btype = self.check_expr(expr.base, scope, fn, in_contract)
+            if btype.kind != "Record":
+                raise CheckError(
+                    f"only record values have fields; got {btype}",
+                    expr.line, expr.col)
+            rec = self.records[btype.name]
+            for fname, ftype in rec.fields:
+                if fname == expr.field_name:
+                    return ftype
+            raise CheckError(
+                f"record '{btype.name}' has no field '{expr.field_name}' "
+                f"(fields: {', '.join(f for f, _ in rec.fields)})",
+                expr.line, expr.col)
+
         if isinstance(expr, A.Index):
             btype = self.check_expr(expr.base, scope, fn, in_contract)
             itype = self.check_expr(expr.index, scope, fn, in_contract)
@@ -294,9 +418,10 @@ class Checker:
                 return A.BOOL
 
             if op in ("==", "!="):
-                if ltype.kind in A.CAPABILITY_KINDS or rtype.kind in A.CAPABILITY_KINDS:
-                    raise CheckError("capability values cannot be compared",
-                                     expr.line, expr.col)
+                if self.contains_capability(ltype) or self.contains_capability(rtype):
+                    raise CheckError(
+                        "capability values cannot be compared (directly or "
+                        "inside a record or list)", expr.line, expr.col)
                 if not (A.compatible(ltype, rtype) or A.compatible(rtype, ltype)):
                     raise CheckError(
                         f"cannot compare {ltype} with {rtype}", expr.line, expr.col)

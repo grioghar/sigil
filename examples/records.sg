@@ -1,0 +1,39 @@
+// Records: user-defined immutable data. One canonical rendering — fields
+// always appear in declaration order, record names are Uppercase, value
+// names lowercase. Recursion is allowed through List (heap-indirected).
+
+record Point {
+    x: Int,
+    y: Int,
+}
+
+record Invoice {
+    id: Int,
+    customer: Text,
+    amounts: List[Int],
+}
+
+fn invoice_total(inv: Invoice) -> Int
+    ensures result >= 0 or inv.id < 0
+{
+    var sum: Int = 0;
+    var i: Int = 0;
+    while i < len(inv.amounts) {
+        sum = sum + inv.amounts[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    let p: Point = Point { x: 3, y: 4 };
+    print(console, "p = (" + str(p.x) + ", " + str(p.y) + ")");
+    print(console, "same point: " + str(p == Point { x: 3, y: 4 }));
+
+    let inv: Invoice = Invoice {
+        id: 1001,
+        customer: "ada",
+        amounts: [1200, 350, 99],
+    };
+    print(console, inv.customer + " owes " + str(invoice_total(inv)));
+}

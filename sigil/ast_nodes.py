@@ -13,12 +13,15 @@ from typing import Optional, Union
 
 @dataclass(frozen=True)
 class Type:
-    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List
+    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List | Record
     elem: Optional["Type"] = None  # element type when kind == 'List'; None = unknown
+    name: Optional[str] = None     # record name when kind == 'Record'
 
     def __str__(self) -> str:
         if self.kind == "List":
             return f"List[{self.elem if self.elem is not None else '?'}]"
+        if self.kind == "Record":
+            return self.name
         return self.kind
 
 
@@ -41,6 +44,8 @@ def compatible(expected: Type, actual: Type) -> bool:
         if expected.elem is None or actual.elem is None:
             return True
         return compatible(expected.elem, actual.elem)
+    if expected.kind == "Record":
+        return expected.name == actual.name
     return True
 
 
@@ -100,6 +105,18 @@ class Unary(Expr):
 class Index(Expr):
     base: Expr = None
     index: Expr = None
+
+
+@dataclass
+class RecordLit(Expr):
+    name: str = ""
+    fields: list[tuple[str, Expr]] = field(default_factory=list)
+
+
+@dataclass
+class FieldAccess(Expr):
+    base: Expr = None
+    field_name: str = ""
 
 
 # ---------------------------------------------------------------- statements
@@ -171,5 +188,14 @@ class FnDecl:
 
 
 @dataclass
+class RecordDecl:
+    name: str
+    fields: list[tuple[str, Type]]
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
 class Program:
     functions: list[FnDecl]
+    records: list[RecordDecl] = field(default_factory=list)

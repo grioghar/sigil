@@ -51,9 +51,27 @@ class Parser:
 
     def parse_program(self) -> A.Program:
         functions = []
+        records = []
         while not self.at("EOF"):
-            functions.append(self.parse_fn())
-        return A.Program(functions)
+            if self.at("record"):
+                records.append(self.parse_record())
+            else:
+                functions.append(self.parse_fn())
+        return A.Program(functions, records)
+
+    def parse_record(self) -> A.RecordDecl:
+        start = self.expect("record")
+        name = self.expect("IDENT", "record name").value
+        self.expect("{")
+        fields: list[tuple[str, A.Type]] = []
+        while not self.at("}"):
+            fname = self.expect("IDENT", "field name").value
+            self.expect(":")
+            fields.append((fname, self.parse_type()))
+            if not self.at("}"):
+                self.expect(",", "',' between record fields")
+        self.expect("}")
+        return A.RecordDecl(name, fields, start.line, start.col)
 
     def parse_fn(self) -> A.FnDecl:
         start = self.expect("fn", "'fn' to start a declaration")
@@ -109,7 +127,11 @@ class Parser:
             return A.Type("List", elem)
         if name in TYPE_NAMES:
             return A.Type(name)
-        raise ParseError(f"unknown type '{name}'", tok.line, tok.col)
+        if name[0].isupper():
+            # A record reference; the checker verifies it is declared.
+            return A.Type("Record", name=name)
+        raise ParseError(f"unknown type '{name}' (record names start with an "
+                         f"uppercase letter)", tok.line, tok.col)
 
     # ------------------------------------------------------------ statements
 
@@ -229,12 +251,18 @@ class Parser:
 
     def parse_postfix(self) -> A.Expr:
         expr = self.parse_primary()
-        while self.at("["):
-            tok = self.advance()
-            index = self.parse_expr()
-            self.expect("]")
-            expr = A.Index(tok.line, tok.col, expr, index)
-        return expr
+        while True:
+            if self.at("["):
+                tok = self.advance()
+                index = self.parse_expr()
+                self.expect("]")
+                expr = A.Index(tok.line, tok.col, expr, index)
+            elif self.at("."):
+                tok = self.advance()
+                fname = self.expect("IDENT", "field name after '.'").value
+                expr = A.FieldAccess(tok.line, tok.col, expr, fname)
+            else:
+                return expr
 
     def parse_primary(self) -> A.Expr:
         tok = self.cur
@@ -256,24 +284,36 @@ class Parser:
         if tok.kind == "[":
             self.advance()
             items: list[A.Expr] = []
-            if not self.at("]"):
-                while True:
-                    items.append(self.parse_expr())
-                    if not self.match(","):
-                        break
+            while not self.at("]"):
+                items.append(self.parse_expr())
+                if not self.match(","):
+                    break
             self.expect("]")
             return A.ListLit(tok.line, tok.col, items)
         if tok.kind == "IDENT":
             self.advance()
             if self.match("("):
                 args: list[A.Expr] = []
-                if not self.at(")"):
-                    while True:
-                        args.append(self.parse_expr())
-                        if not self.match(","):
-                            break
+                while not self.at(")"):
+                    args.append(self.parse_expr())
+                    if not self.match(","):
+                        break
                 self.expect(")")
                 return A.Call(tok.line, tok.col, tok.value, args)
+            # Record literal: uppercase name + '{'. Unambiguous because value
+            # names are required to start lowercase, so `if flag {` can never
+            # look like a record literal.
+            if tok.value[0].isupper() and self.at("{"):
+                self.advance()
+                fields: list[tuple[str, A.Expr]] = []
+                while not self.at("}"):
+                    fname = self.expect("IDENT", "field name").value
+                    self.expect(":")
+                    fields.append((fname, self.parse_expr()))
+                    if not self.at("}"):
+                        self.expect(",", "',' between record fields")
+                self.expect("}")
+                return A.RecordLit(tok.line, tok.col, tok.value, fields)
             return A.Var(tok.line, tok.col, tok.value)
 
         found = tok.value or tok.kind

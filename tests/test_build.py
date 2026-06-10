@@ -24,8 +24,33 @@ HAVE_RUSTC = shutil.which("rustc") is not None
 
 # One program exercising: effects, capability threading, contracts that pass,
 # recursion, while/var, lists (literal, push, index, len), text ops, str(),
-# if/else-if chains, comparison and logic operators, truncating division.
+# if/else-if chains, comparison and logic operators, truncating division,
+# records (construction, field access, equality, recursion through List).
 KITCHEN_SINK = """
+record Point {
+    x: Int,
+    y: Int,
+}
+
+record Tree {
+    value: Int,
+    children: List[Tree],
+}
+
+fn norm2(p: Point) -> Int {
+    return p.x * p.x + p.y * p.y;
+}
+
+fn tree_total(t: Tree) -> Int {
+    var sum: Int = t.value;
+    var i: Int = 0;
+    while i < len(t.children) {
+        sum = sum + tree_total(t.children[i]);
+        i = i + 1;
+    }
+    return sum;
+}
+
 fn fib(n: Int) -> Int
     requires n >= 0
     ensures result >= 0
@@ -70,6 +95,13 @@ fn main(console: Console) -> Unit ! {io.write} {
     print(console, str((0 - 7) / 2) + " " + str((0 - 7) % 2));
     print(console, str(true and not false) + " " + str(1 < 2 or 2 < 1));
     print(console, str(len("héllo")));
+    let p: Point = Point { x: 3, y: 4 };
+    print(console, str(norm2(p)) + " " + str(p == Point { x: 3, y: 4 }));
+    let t: Tree = Tree {
+        value: 1,
+        children: [Tree { value: 2, children: [] }, Tree { value: 3, children: [] }],
+    };
+    print(console, str(tree_total(t)));
 }
 """
 

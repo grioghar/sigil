@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from .errors import LexError
 
 KEYWORDS = {
-    "fn", "let", "var", "return", "if", "else", "while",
+    "fn", "record", "let", "var", "return", "if", "else", "while",
     "true", "false", "requires", "ensures", "and", "or", "not",
 }
 
