@@ -31,7 +31,9 @@ fn main(console: Console) -> Unit ! {io.write} {
    and `sigil build` erases every proven runtime check from the binary.
    Unproven clauses conservatively stay.
 
-Plus records (`record Point { x: Int, y: Int }`) and generic functions
+Plus records (`record Point { x: Int, y: Int }`), sum types with statically
+exhaustive `match` (`enum Shape { Circle(Int), Empty }` — a missing variant
+is a compile error, a dead arm too), and generic functions
 (`fn first[T](xs: List[T]) -> T`, monomorphized to native code).
 
 ## Quickstart

@@ -142,6 +142,35 @@ arguments at call sites; generic values are opaque (no `==`, no `str`).
 The native backend monomorphizes — each instantiation compiles to its own
 Rust function, so generics cost nothing at runtime.
 
+**Sum types** close the data-modeling gap:
+
+```sigil
+enum Shape {
+    Circle(Int),
+    Rect(Int, Int),
+    Empty,
+}
+
+match s {
+    Circle(r) => {
+        return 3 * r * r;
+    }
+    Rect(w, h) => {
+        return w * h;
+    }
+    Empty => {
+        return 0;
+    }
+}
+```
+
+`match` is statically exhaustive — a missing variant is a check error that
+names it, and a wildcard that can never fire (all variants already covered)
+is also an error: no dead arms, one canonical match. Variant names are
+globally unique (an auditor never asks "which Circle?"). The verifier types
+match binders precisely, so contracts prove straight through arms; enums
+compile to native Rust enums.
+
 ## Grammar (v0.1)
 
 ```
@@ -210,6 +239,8 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.3b** | Loop invariants: `while cond invariant e { ... }` — proven on entry + preserved per iteration (Z3), assumed after the loop, so loop-carried `ensures` become provable. Unproven invariants are runtime-checked before the loop and after each iteration, with "blame the loop" diagnostics. | **done** |
 | **0.4** | Canonical form: `sigil fmt` (one rendering, idempotent, AST-round-trip-safe, comment-preserving), `sigil ast` (serialized typed AST with stable content-hash ids + rename-invariant shape hashes), `sigil sdiff` (semantic diff: added/removed/renamed/signature/contracts/body). CI enforces canonical examples. Full on-disk AST-as-source remains future work. | **done** |
 | **0.5** | Compiler-as-a-service: `sigil serve` / `sigil query` — newline-delimited JSON API (check, signatures, effects incl. transitive, verify, obligations, methods) so an LLM can interrogate the compiler while generating instead of generating blind. `obligations` returns exactly the unproven clauses — the AI author's to-do list. | **done** |
+| **0.6** | Sum types: `enum` with positional payloads + statically exhaustive `match` (no dead arms), verifier-typed binders, native Rust enums, full canon/server support. | **done** |
+| **0.7** | Modules and imports — multi-file programs with capability-explicit module boundaries. | |
 | **1.0** | Self-contained backend (LLVM/Cranelift, dropping the rustc dependency) — purity/effect info drives parallelization and check elision. | |
 
 ## Prior art and how Sigil differs
