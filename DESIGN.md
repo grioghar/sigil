@@ -43,6 +43,21 @@ A dependency that was never handed `Fs` **cannot** touch the filesystem — not
 "is trusted not to," *cannot*. This kills most supply-chain attacks at the
 language level: a malicious JSON parser has no handle to exfiltrate with.
 
+Capabilities also **attenuate**: from a full `Fs` you can mint strictly weaker
+ones and hand those down instead.
+
+```sigil
+let plugin_fs: Fs = read_only(subdir(fs, "sandbox"));
+```
+
+The holder of `plugin_fs` can read inside `sandbox/` and do nothing else —
+writes are refused, paths are rebased under the jail, and `..` or absolute
+paths are capability faults at the moment of the attempt. Attenuation is pure
+(minting a weaker capability does no I/O) and monotonic: authority only ever
+shrinks. Effects are the *static* layer (what kind of action, checked at
+compile time); capability scope is the *dynamic* layer (exactly which files,
+enforced by the value itself).
+
 ### 2. Effects: what a function does is in its type
 
 Every function declares its effect set after `!`. No annotation means **pure** —
@@ -128,7 +143,9 @@ primary   := INT | TEXT | "true" | "false" | IDENT | call | "(" expr ")"
 | `print(c: Console, msg: Text) -> Unit` | `io.write` |
 | `read_line(c: Console) -> Text` | `io.read` |
 | `read_file(fs: Fs, path: Text) -> Text` | `fs.read` |
-| `write_file(fs: Fs, path: Text, data: Text) -> Unit` | `fs.write` |
+| `write_file(fs: Fs, path: Text, data: Text) -> Unit` | `fs.write` (creates parent dirs) |
+| `read_only(fs: Fs) -> Fs` | pure (attenuation) |
+| `subdir(fs: Fs, prefix: Text) -> Fs` | pure (attenuation) |
 | `len(x: List[T] | Text) -> Int` | pure |
 | `str(x: Int | Bool | Text) -> Text` | pure |
 | `push(xs: List[T], x: T) -> List[T]` | pure (returns new list) |
@@ -142,7 +159,8 @@ the root capabilities by type. There is no other way to obtain one.
 |---|---|---|
 | **0.1** | Tree-walking interpreter, type + effect checker, runtime contracts with blame. Prove the model end to end. | **done** |
 | **0.1.5** | Native backend: checked AST → Rust → `rustc -O` → executable (`sigil build`). Interpreter retained as reference semantics; differential tests enforce agreement. Capabilities compile to zero-sized types. ~87× over the interpreter on `fib(30)`. | **done** |
-| **0.2** | Capability *attenuation* (`read_only(fs)`, path-scoped `Fs`), records, generics for user functions. | |
+| **0.2a** | Capability *attenuation*: `read_only(fs)`, path-scoped `subdir(fs, p)`; pure, monotonic, enforced by the capability value in both backends. | **done** |
+| **0.2b** | Records and generics for user functions. | |
 | **0.3** | Static contract verification via SMT (Z3); proven contracts erase their runtime checks — in the native backend that means the emitted branches disappear. | |
 | **0.4** | Canonical typed AST as the on-disk format; stable declaration IDs; semantic diff. Text becomes a projection. | |
 | **0.5** | Compiler-as-a-service API: an LLM queries types/effects/obligations *while generating* instead of generating blind. | |

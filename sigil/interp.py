@@ -5,12 +5,13 @@ a failed `requires` blames the caller, a failed `ensures` blames the callee.
 Capabilities are unforgeable runtime objects injected only into main.
 """
 
+import os
 import sys
 from typing import Any, Optional, TextIO
 
 from . import ast_nodes as A
 from .checker import FnSig
-from .errors import ContractViolation, RuntimeFault
+from .errors import CapabilityFault, ContractViolation, RuntimeFault
 
 
 class ConsoleCap:
@@ -19,8 +20,38 @@ class ConsoleCap:
 
 
 class FsCap:
+    """A filesystem capability, possibly attenuated: read-only and/or jailed
+    to a directory prefix. Attenuation only ever shrinks authority."""
+
+    def __init__(self, can_write: bool = True, root: Optional[str] = None):
+        self.can_write = can_write
+        self.root = root
+
     def __repr__(self) -> str:
-        return "<capability Fs>"
+        scope = []
+        if not self.can_write:
+            scope.append("read-only")
+        if self.root is not None:
+            scope.append(f"root={self.root}")
+        return f"<capability Fs{' ' + ', '.join(scope) if scope else ''}>"
+
+
+def clean_path_parts(path: str, line: int, col: int, what: str) -> list[str]:
+    """Validate a path against capability scoping rules: no absolute paths,
+    no '..' escapes. Returns normalized components."""
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("/") or (len(normalized) >= 2 and normalized[1] == ":"):
+        raise CapabilityFault(
+            f"absolute path '{path}' is not permitted {what}", line, col)
+    parts: list[str] = []
+    for comp in normalized.split("/"):
+        if comp == "..":
+            raise CapabilityFault(
+                f"path '{path}' escapes its capability scope", line, col)
+        if comp in ("", "."):
+            continue
+        parts.append(comp)
+    return parts
 
 
 class _ReturnSignal(Exception):
@@ -243,8 +274,9 @@ class Interpreter:
     def builtin_read_file(self, args: list[Any], line: int, col: int) -> str:
         cap, path = args
         self._require_cap(cap, FsCap, "read_file", line, col)
+        effective = self._fs_effective(cap, path, line, col)
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with open(effective, "r", encoding="utf-8") as handle:
                 return handle.read()
         except OSError as exc:
             raise RuntimeFault(f"read_file failed: {exc}", line, col)
@@ -252,11 +284,41 @@ class Interpreter:
     def builtin_write_file(self, args: list[Any], line: int, col: int) -> None:
         cap, path, data = args
         self._require_cap(cap, FsCap, "write_file", line, col)
+        if not cap.can_write:
+            raise CapabilityFault(
+                f"write_file('{path}') denied: this Fs capability is read-only",
+                line, col)
+        effective = self._fs_effective(cap, path, line, col)
         try:
-            with open(path, "w", encoding="utf-8") as handle:
+            parent = os.path.dirname(effective)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(effective, "w", encoding="utf-8") as handle:
                 handle.write(data)
         except OSError as exc:
             raise RuntimeFault(f"write_file failed: {exc}", line, col)
+
+    def builtin_read_only(self, args: list[Any], line: int, col: int) -> FsCap:
+        cap = args[0]
+        self._require_cap(cap, FsCap, "read_only", line, col)
+        return FsCap(can_write=False, root=cap.root)
+
+    def builtin_subdir(self, args: list[Any], line: int, col: int) -> FsCap:
+        cap, prefix = args
+        self._require_cap(cap, FsCap, "subdir", line, col)
+        parts = clean_path_parts(prefix, line, col, "as an Fs scope")
+        if not parts:
+            raise CapabilityFault(
+                f"'{prefix}' is an empty path; it cannot scope an Fs", line, col)
+        cleaned = "/".join(parts)
+        root = cleaned if cap.root is None else f"{cap.root}/{cleaned}"
+        return FsCap(can_write=cap.can_write, root=root)
+
+    def _fs_effective(self, cap: FsCap, path: str, line: int, col: int) -> str:
+        if cap.root is None:
+            return path
+        parts = clean_path_parts(path, line, col, "through a scoped Fs")
+        return f"{cap.root}/{'/'.join(parts)}"
 
     def builtin_len(self, args: list[Any], line: int, col: int) -> int:
         return len(args[0])

@@ -20,7 +20,8 @@ fn main(console: Console) -> Unit ! {io.write} {
 
 1. **No ambient authority** — side effects require an unforgeable capability
    value handed down from `main`; a dependency you never gave the filesystem
-   *cannot* touch it.
+   *cannot* touch it. Capabilities attenuate: `read_only(subdir(fs, "sandbox"))`
+   mints a strictly weaker one to hand to code you trust less.
 2. **Effects in the type** — every function declares what it may do (`! {io.write}`);
    undeclared effects are compile errors, and no annotation means provably pure.
 3. **Contracts with blame** — `requires`/`ensures` are part of the signature;

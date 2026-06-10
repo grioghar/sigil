@@ -35,6 +35,9 @@ BUILTINS: dict[str, FnSig] = {
                        frozenset({"fs.read"})),
     "write_file": FnSig("write_file", [("fs", A.FS), ("path", A.TEXT), ("data", A.TEXT)],
                         A.UNIT, frozenset({"fs.write"})),
+    # Attenuation: minting a weaker capability is pure — no I/O happens.
+    "read_only": FnSig("read_only", [("fs", A.FS)], A.FS, PURE),
+    "subdir": FnSig("subdir", [("fs", A.FS), ("prefix", A.TEXT)], A.FS, PURE),
     # len / str / push are polymorphic and special-cased in check_call.
     "len": FnSig("len", [("x", A.Type("List"))], A.INT, PURE),
     "str": FnSig("str", [("x", A.INT)], A.TEXT, PURE),

@@ -85,6 +85,25 @@ fn main(console: Console) -> Unit ! {io.write} {
 }
 """
 
+# Attenuation happy path: write through a jailed Fs, read back through the
+# parent, prove the jail rebased the path. Then read-only denial.
+ATTENUATION_OK = """
+fn main(console: Console, fs: Fs) -> Unit ! {io.write, fs.read, fs.write} {
+    let jail: Fs = subdir(fs, "inner");
+    write_file(jail, "x.txt", "jailed");
+    print(console, read_file(fs, "inner/x.txt"));
+    let ro: Fs = read_only(fs);
+    print(console, read_file(ro, "inner/x.txt"));
+}
+"""
+
+ATTENUATION_DENIED = """
+fn main(fs: Fs) -> Unit ! {fs.write} {
+    let ro: Fs = read_only(fs);
+    write_file(ro, "x.txt", "data");
+}
+"""
+
 
 def interpret(source: str) -> str:
     program = parse(source)
@@ -120,6 +139,27 @@ class TestNativeBackend(unittest.TestCase):
         self.assertIn("b != 0", result.stderr)
         self.assertIn("CALLER", result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_native_attenuation_matches_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = build_to_tmp(ATTENUATION_OK, tmp, "atten")
+            result = subprocess.run([str(exe)], capture_output=True, text=True,
+                                    cwd=tmp)
+            written = (Path(tmp) / "inner" / "x.txt").read_text(encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.replace("\r\n", "\n"), "jailed\njailed\n")
+        self.assertEqual(written, "jailed")
+
+    def test_native_read_only_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = build_to_tmp(ATTENUATION_DENIED, tmp, "denied")
+            result = subprocess.run([str(exe)], capture_output=True, text=True,
+                                    cwd=tmp)
+            leaked = (Path(tmp) / "x.txt").exists()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("capability fault", result.stderr)
+        self.assertIn("read-only", result.stderr)
+        self.assertFalse(leaked, "read-only Fs must not produce a file")
 
 
 if __name__ == "__main__":

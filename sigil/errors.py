@@ -34,6 +34,11 @@ class RuntimeFault(SigilError):
     LABEL = "runtime fault"
 
 
+class CapabilityFault(SigilError):
+    """An attenuated capability refused an action outside its scope."""
+    LABEL = "capability fault"
+
+
 class ContractViolation(SigilError):
     LABEL = "contract violation"
 

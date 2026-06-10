@@ -1,0 +1,20 @@
+// Capability attenuation: hand a "plugin" LESS authority than you hold.
+// read_only() strips write access; subdir() jails all paths under a prefix.
+// The plugin cannot write, cannot read outside its jail, and cannot escape
+// with ".." — the capability itself enforces its own scope.
+
+fn main(console: Console, fs: Fs) -> Unit ! {io.write, fs.read, fs.write} {
+    write_file(fs, "sandbox/data.txt", "the answer is 42");
+    write_file(fs, "secrets.txt", "hunter2");
+
+    // The plugin gets a capability that can only read inside sandbox/.
+    let plugin_fs: Fs = read_only(subdir(fs, "sandbox"));
+    print(console, plugin(plugin_fs));
+}
+
+// Note the signature: fs.read only. With its attenuated Fs, this function
+// cannot write anywhere, and read_file(fs, "../secrets.txt") would be a
+// capability fault at the moment of the attempt.
+fn plugin(fs: Fs) -> Text ! {fs.read} {
+    return "plugin saw: " + read_file(fs, "data.txt");
+}
