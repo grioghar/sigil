@@ -90,6 +90,37 @@ class TestFormatterInvariants(unittest.TestCase):
             with self.subTest(snippet=name):
                 self.assert_canonical(source)
 
+    def test_nullary_variant_before_block_keeps_parens(self):
+        # `if x == Empty {` would re-parse with `Empty {` as a record literal
+        # swallowing the block; the formatter must keep the parens at every
+        # block-introducing position: if, else-if, while, last invariant.
+        source = """
+            enum Opt { Empty, Got(Int) }
+            fn f(x: Opt, y: Opt) -> Int {
+                if (x == Empty) {
+                    return 0;
+                } else if (y == Empty) {
+                    return 1;
+                }
+                while (x == Empty) {
+                    return 2;
+                }
+                var i: Int = 0;
+                while i < 1
+                    invariant (x == Empty)
+                {
+                    i = i + 1;
+                }
+                return 3;
+            }
+            fn main(c: Console) -> Unit {
+            }
+        """
+        formatted = self.assert_canonical(source)
+        for needle in ("if (x == Empty) {", "} else if (y == Empty) {",
+                       "while (x == Empty) {", "invariant (x == Empty)"):
+            self.assertIn(needle, formatted)
+
     def test_record_rendering(self):
         formatted = self.assert_canonical(SNIPPETS["record"])
         self.assertIn("record Point {\n    x: Int,\n    y: Int,\n}", formatted)

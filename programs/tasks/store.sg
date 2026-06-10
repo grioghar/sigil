@@ -11,12 +11,8 @@ pub fn render_tasks(tasks: List[Task]) -> Text {
     var out: Text = "";
     var i: Int = 0;
     while i < len(tasks) {
-        let t: Task = tasks[i];
-        var flag: Text = "0";
-        if t.done {
-            flag = "1";
-        }
-        out = out + flag + "|" + t.title + "\n";
+        let flag: Text = if tasks[i].done then "1" else "0";
+        out = out + flag + "|" + tasks[i].title + "\n";
         i = i + 1;
     }
     return out;
@@ -25,8 +21,7 @@ pub fn render_tasks(tasks: List[Task]) -> Text {
 pub fn parse_tasks(data: Text) -> List[Task] {
     var tasks: List[Task] = [];
     var rest: Text = data;
-    var scanning: Bool = len(rest) > 0;
-    while scanning {
+    while len(rest) > 0 {
         match split_first(rest, "\n") {
             At(line, tail) => {
                 tasks = parse_line(tasks, line);
@@ -34,10 +29,9 @@ pub fn parse_tasks(data: Text) -> List[Task] {
             }
             Missing => {
                 tasks = parse_line(tasks, rest);
-                rest = "";
+                break;
             }
         }
-        scanning = len(rest) > 0;
     }
     return tasks;
 }

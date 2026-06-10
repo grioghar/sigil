@@ -50,15 +50,20 @@ _UNARY_LEVEL = 6
 _POSTFIX_LEVEL = 7
 _WITH_LEVEL = 6     # `x with { ... }` follows the postfix chain, below it
 
-# A match scrutinee whose rendering ends in a bare uppercase identifier (a
-# nullary variant) must keep parentheses: `match x == Empty {` would re-parse
-# with `Empty {` as a record literal that swallows the match body.
+# Any expression rendered immediately before a block's `{` and ending in a
+# bare uppercase identifier (a nullary variant) must keep parentheses:
+# `match x == Empty {` / `if x == Empty {` / a last `invariant y == Empty`
+# would all re-parse with `Empty {` as a record literal swallowing the block.
 _TRAILING_NAME = re.compile(r"[A-Za-z0-9_]+$")
 
 
 def _scrutinee_needs_parens(text: str) -> bool:
     tail = _TRAILING_NAME.search(text)
     return tail is not None and tail.group()[0].isupper()
+
+
+def _guard_before_block(text: str) -> str:
+    return f"({text})" if _scrutinee_needs_parens(text) else text
 
 
 def escape_text(value: str) -> str:
@@ -275,11 +280,15 @@ class Renderer:
             lines = []
             if stmt.invariants:
                 lines.append(f"{pad}while {self.render_expr(stmt.cond)}")
-                for inv in stmt.invariants:
-                    lines.append(f"{pad}    invariant {self.render_expr(inv.expr)}")
+                for index, inv in enumerate(stmt.invariants):
+                    rendered = self.render_expr(inv.expr)
+                    if index == len(stmt.invariants) - 1:
+                        rendered = _guard_before_block(rendered)
+                    lines.append(f"{pad}    invariant {rendered}")
                 lines.append(f"{pad}{{")
             else:
-                lines.append(f"{pad}while {self.render_expr(stmt.cond)} {{")
+                cond = _guard_before_block(self.render_expr(stmt.cond))
+                lines.append(f"{pad}while {cond} {{")
             lines.extend(self.render_stmts(stmt.body, depth + 1))
             lines.append(f"{pad}}}")
             return lines
@@ -307,7 +316,8 @@ class Renderer:
 
     def _render_if(self, stmt: A.If, depth: int) -> list[str]:
         pad = "    " * depth
-        lines = [f"{pad}if {self.render_expr(stmt.cond)} {{"]
+        cond = _guard_before_block(self.render_expr(stmt.cond))
+        lines = [f"{pad}if {cond} {{"]
         lines.extend(self.render_stmts(stmt.then_body, depth + 1))
         node = stmt
         # `else { if ... }` with a lone nested if is indistinguishable from
@@ -316,7 +326,8 @@ class Renderer:
             if len(node.else_body) == 1 and isinstance(node.else_body[0], A.If):
                 node = node.else_body[0]
                 lines.extend(self._flush(node, depth))
-                lines.append(f"{pad}}} else if {self.render_expr(node.cond)} {{")
+                cond = _guard_before_block(self.render_expr(node.cond))
+                lines.append(f"{pad}}} else if {cond} {{")
                 lines.extend(self.render_stmts(node.then_body, depth + 1))
             else:
                 lines.append(f"{pad}}} else {{")

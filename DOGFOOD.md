@@ -29,22 +29,22 @@ the first run, interpreted and native — but the friction list below is real.
    invariants like `invariant len(out) == i` along the way — written, not
    weakened). Zero runtime contract checks remain in the native binary, and
    a test pins the program at zero obligations forever.
-2. **No if-expression / ternary.** The `var flag: Text = "0"; if t.done {
-   flag = "1"; }` dance appears three times in ~200 lines. Galling in a
-   language that prefers `let`. A `cond ? a : b` or if-expression would
-   remove most remaining `var`s in this program.
-3. **No early `break`,** so search loops thread `var scanning: Bool`
-   state through the condition (see `parse_tasks`). Verifier-friendly
-   design for `break` needs thought (it changes the post-loop fact from
-   `¬cond` to `¬cond ∨ broke`), but the workaround is noisy.
-4. **List update means rebuild** (`set_done` copies the whole list to flip
-   one field). Fine at this scale, quadratic in spirit. Either a `set(xs,
-   i, x)` builtin or functional-update syntax.
-5. **No record functional update** — `Task { done: true, title: t.title }`
-   re-lists every field. Wants `t with { done: true }` (canonical-form
-   friendly).
+2. ~~**No if-expression / ternary.**~~ **FIXED**: `if t.done then "[x]"
+   else "[ ]"` — branches z3.If-merged in the verifier, untaken-branch facts
+   soundness-guarded like short-circuit operands.
+3. ~~**No early `break`.**~~ **FIXED**, with the design rule that invariants
+   hold at every loop exit: each break site is a proof obligation (or a
+   runtime check when unproven), and `¬cond` is no longer assumed after a
+   breaking loop. `parse_tasks` lost its `scanning` flag.
+4. ~~**List update means rebuild.**~~ **FIXED**: `set(xs, i, x)` builtin;
+   the result provably preserves length.
+5. ~~**No record functional update.**~~ **FIXED**: `t with { done: true }`,
+   base-evaluated-first semantics preserved in the Rust lowering.
+   Combined effect of #2+#4+#5: `set_done` went from a 16-line proof-carrying
+   loop (three invariants) to `return set(tasks, index, tasks[index] with
+   { done: true });` — and the program still proves completely (13/13).
 6. **Match arms can't share a tail.** Both arms of `handle`'s match end in
-   `return tasks;` patterns; match-as-expression would also subsume #2.
+   `return tasks;` patterns; match-as-expression would subsume this.
 7. Minor: no `Map` type yet (assoc lists were fine here); `str()` on a
    record/enum for debugging would help; Windows console codepage mangles
    UTF-8 from the interpreter (native binaries print correctly — cosmetic,

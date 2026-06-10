@@ -71,27 +71,11 @@ fn mark_done(console: Console, tasks: List[Task], arg: Text) -> List[Task] ! {io
     }
 }
 
-// Lists are immutable, so "update" means rebuild with one element swapped.
 fn set_done(tasks: List[Task], index: Int) -> List[Task]
     requires index >= 0 and index < len(tasks)
     ensures len(result) == len(tasks)
 {
-    var out: List[Task] = [];
-    var i: Int = 0;
-    while i < len(tasks)
-        invariant i >= 0
-        invariant i <= len(tasks)
-        invariant len(out) == i
-    {
-        let t: Task = tasks[i];
-        if i == index {
-            out = push(out, Task { done: true, title: t.title });
-        } else {
-            out = push(out, t);
-        }
-        i = i + 1;
-    }
-    return out;
+    return set(tasks, index, tasks[index] with { done: true });
 }
 
 fn show(console: Console, tasks: List[Task]) -> Unit ! {io.write} {
@@ -103,10 +87,7 @@ fn show(console: Console, tasks: List[Task]) -> Unit ! {io.write} {
         invariant i >= 0
     {
         let t: Task = tasks[i];
-        var mark: Text = "[ ]";
-        if t.done {
-            mark = "[x]";
-        }
+        let mark: Text = if t.done then "[x]" else "[ ]";
         print(console, str(i + 1) + " " + mark + " " + t.title);
         i = i + 1;
     }

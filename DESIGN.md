@@ -188,13 +188,16 @@ stmt      := "let" IDENT ":" type "=" expr ";"
            | "var" IDENT ":" type "=" expr ";"
            | IDENT "=" expr ";"
            | "return" expr? ";"
+           | "break" ";"
            | "if" expr block ("else" (block | ifStmt))?
-           | "while" expr block
+           | "while" expr ("invariant" expr)* block
            | expr ";"
-expr      := standard precedence: or > and > == != < <= > >= > + - > * / % > unary (not, -)
+expr      := "if" expr "then" expr "else" expr            (lowest precedence)
+           | standard precedence: or > and > == != < <= > >= > + - > * / % > unary (not, -)
+postfix   := primary ("[" expr "]" | "." IDENT)* ("with" "{" (IDENT ":" expr ","?)+ "}")?
 primary   := INT | TEXT | "true" | "false" | IDENT | call | "(" expr ")"
-           | "[" (expr ",")* "]" | primary "[" expr "]"
-           | UPPER_IDENT "{" (IDENT ":" expr ","?)* "}" | primary "." IDENT
+           | "[" (expr ",")* "]"
+           | UPPER_IDENT "{" (IDENT ":" expr ","?)* "}"
 ```
 
 **Naming is part of the grammar's canon:** record names start uppercase,
@@ -225,6 +228,7 @@ size); recursion through `List` is allowed, so trees are expressible.
 | `len(x: List[T] | Text) -> Int` | pure |
 | `str(x: Int | Bool | Text) -> Text` | pure |
 | `push(xs: List[T], x: T) -> List[T]` | pure (returns new list) |
+| `set(xs: List[T], i: Int, x: T) -> List[T]` | pure (new list, strict bounds) |
 
 `main` may take any subset of `(Console, Fs)` parameters; the runtime injects
 the root capabilities by type. There is no other way to obtain one.
