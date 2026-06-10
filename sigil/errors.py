@@ -30,6 +30,18 @@ class CheckError(SigilError):
     LABEL = "check error"
 
 
+class ModuleError(SigilError):
+    """The module loader could not resolve an import: missing file, cycle,
+    visibility (not pub), alias canon, or a name collision. Carries the path
+    of the file that caused it so diagnostics blame the right file."""
+    LABEL = "module error"
+
+    def __init__(self, message: str, line: int = 0, col: int = 0,
+                 path: str | None = None):
+        super().__init__(message, line, col)
+        self.path = path
+
+
 class RuntimeFault(SigilError):
     LABEL = "runtime fault"
 

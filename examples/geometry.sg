@@ -1,0 +1,46 @@
+// A library module: 'pub' is the export surface, and everything else is
+// invisible to importers — not by convention, by the resolver. This file has
+// no main; it exists to be imported (and still checks standalone).
+pub enum Shape {
+    Circle(Int),
+    Rect(Int, Int),
+}
+
+// Pure geometry: no capability parameters, so this code CANNOT touch the
+// console or the filesystem, no matter who calls it or what the importing
+// program holds.
+pub fn area(s: Shape) -> Int
+    ensures result >= 0
+{
+    match s {
+        Circle(r) => {
+            return 3 * square(r);
+        }
+        Rect(w, h) => {
+            return clamp(w * h);
+        }
+    }
+}
+
+// Effectful, and it says so: printing requires the importer to hand over its
+// Console. The capability parameter is the permission slip.
+pub fn describe(c: Console, s: Shape) -> Unit ! {io.write} {
+    print(c, "area = " + str(area(s)));
+}
+
+// Module-private helpers: not marked pub, so 'use geometry { square }' is
+// rejected at resolution time.
+fn square(n: Int) -> Int
+    ensures result >= 0
+{
+    return n * n;
+}
+
+fn clamp(n: Int) -> Int
+    ensures result >= 0
+{
+    if n < 0 {
+        return 0;
+    }
+    return n;
+}

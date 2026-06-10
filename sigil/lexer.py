@@ -8,7 +8,7 @@ from .errors import LexError
 KEYWORDS = {
     "fn", "record", "enum", "match", "let", "var", "return", "if", "else",
     "while", "true", "false", "requires", "ensures", "invariant",
-    "and", "or", "not",
+    "and", "or", "not", "pub", "use", "as",
 }
 
 # Multi-char operators first so maximal munch works ("=>" must precede "=").

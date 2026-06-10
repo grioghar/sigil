@@ -4,6 +4,12 @@ A machine-facing query API: instead of generating code blind and checking it
 afterwards, an LLM (or any tool) interrogates the compiler WHILE generating —
 "does this check?", "what signatures exist?", "what must I still prove?".
 
+Programs arrive one of two ways (exactly one per request): "source" — the
+text of a single self-contained file — or "path" — an entry file on disk
+whose use-imports are resolved and flattened by the module loader (0.7).
+A source string containing use declarations is rejected: imports resolve
+relative to a real file, so they require the path-based form.
+
 Protocol: newline-delimited JSON over stdio. `python -m sigil serve` reads one
 JSON object per line from stdin and writes exactly one JSON response object
 per line to stdout (flushed after each). The server never crashes and never
@@ -29,8 +35,12 @@ DESCRIPTIONS = {
     "effects": "declared, capability, and transitive effects of one function",
     "verify": "prove contracts and divisions statically; all findings + summary",
     "obligations": "unproven findings only — what must still be made true",
-    "methods": "list the available methods (this call; takes no source)",
+    "methods": "list the available methods (this call; takes no program)",
 }
+
+PROGRAM_NOTE = ("program-taking methods accept exactly one of 'source' (the "
+                "text of a single self-contained file) or 'path' (an entry "
+                "file on disk; its use-imports are resolved and flattened)")
 
 
 # ------------------------------------------------------------ dispatch
@@ -52,43 +62,81 @@ def _dispatch(req) -> dict:
         return {"ok": False, "error": "missing or non-text 'method' field"}
     if method == "methods":
         return {"ok": True, "methods": sorted(DESCRIPTIONS),
-                "descriptions": DESCRIPTIONS}
+                "descriptions": DESCRIPTIONS, "program": PROGRAM_NOTE}
     if method not in DESCRIPTIONS:
         return {"ok": False,
                 "error": f"unknown method '{method}'; "
                          f"send {{\"method\": \"methods\"}} for the list"}
 
-    source = req.get("source")
-    if not isinstance(source, str):
-        return {"ok": False, "error": "missing or non-text 'source' field"}
+    program, failure = _obtain_program(req)
+    if failure is not None:
+        return failure
 
     if method == "check":
-        return _method_check(source)
+        return _method_check(program)
     if method == "signatures":
-        return _method_signatures(source)
+        return _method_signatures(program)
     if method == "effects":
         fn = req.get("fn")
         if not isinstance(fn, str):
             return {"ok": False, "error": "missing or non-text 'fn' field"}
-        return _method_effects(source, fn)
+        return _method_effects(program, fn)
     if method == "verify":
-        return _method_verify(source)
-    return _method_obligations(source)
+        return _method_verify(program)
+    return _method_obligations(program)
+
+
+def _obtain_program(req) -> tuple:
+    """(program, None) or (None, failure response). Exactly one of 'source'
+    and 'path' supplies the program; 'path' runs the module loader, so
+    multi-file programs work through the API."""
+    source = req.get("source")
+    path = req.get("path")
+    if source is not None and path is not None:
+        return None, {"ok": False,
+                      "error": "give 'source' or 'path', not both"}
+    if path is not None:
+        if not isinstance(path, str):
+            return None, {"ok": False, "error": "non-text 'path' field"}
+        from .modules import load_program
+        try:
+            return load_program(path), None
+        except SigilError as exc:
+            return None, _check_failure(exc)
+    if not isinstance(source, str):
+        return None, {"ok": False,
+                      "error": "missing or non-text 'source' field "
+                               "(or send 'path' for a file on disk)"}
+    try:
+        program = parse(source)
+    except SigilError as exc:
+        return None, _check_failure(exc)
+    if program.uses:
+        return None, {"ok": False,
+                      "error": "this program has use declarations; imports "
+                               "require the path-based form (send {\"path\": "
+                               "\"<entry.sg>\"} so the loader can resolve "
+                               "modules next to the file)"}
+    return program, None
 
 
 def _check_failure(exc: SigilError) -> dict:
     """Sigil stops at the first lex/parse/check error; the list shape leaves
-    room for multi-error reporting later."""
-    return {"ok": False,
-            "diagnostics": [{"line": exc.line, "col": exc.col,
-                             "label": exc.LABEL, "message": exc.message}]}
+    room for multi-error reporting later. Loader errors carry the path of
+    the file that caused them."""
+    diagnostic = {"line": exc.line, "col": exc.col,
+                  "label": exc.LABEL, "message": exc.message}
+    path = getattr(exc, "path", None)
+    if path is not None:
+        diagnostic["path"] = path
+    return {"ok": False, "diagnostics": [diagnostic]}
 
 
 # ------------------------------------------------------------ methods
 
-def _method_check(source: str) -> dict:
+def _method_check(program: A.Program) -> dict:
     try:
-        check(parse(source))
+        check(program)
     except SigilError as exc:
         return _check_failure(exc)
     return {"ok": True, "diagnostics": []}
@@ -103,9 +151,8 @@ def _fn_json(sig: FnSig) -> dict:
             "effects": sorted(sig.effects)}
 
 
-def _method_signatures(source: str) -> dict:
+def _method_signatures(program: A.Program) -> dict:
     try:
-        program = parse(source)
         sigs = check(program)
     except SigilError as exc:
         return _check_failure(exc)
@@ -186,9 +233,9 @@ def _called_names(stmts: list[A.Stmt]) -> set[str]:
     return names
 
 
-def _method_effects(source: str, fn_name: str) -> dict:
+def _method_effects(program: A.Program, fn_name: str) -> dict:
     try:
-        sigs = check(parse(source))
+        sigs = check(program)
     except SigilError as exc:
         return _check_failure(exc)
     sig = sigs.get(fn_name)
@@ -220,12 +267,11 @@ def _method_effects(source: str, fn_name: str) -> dict:
             "capabilities": capabilities, "transitive": sorted(transitive)}
 
 
-def _run_verifier(source: str):
+def _run_verifier(program: A.Program):
     """(findings, failure) — exactly one is None. Findings are JSON-ready and
     sorted by (fn, line) like the CLI report."""
     from .verify import verify
     try:
-        program = parse(source)
         check(program)
     except SigilError as exc:
         return None, _check_failure(exc)
@@ -239,8 +285,8 @@ def _run_verifier(source: str):
     return (findings, report), None
 
 
-def _method_verify(source: str) -> dict:
-    result, failure = _run_verifier(source)
+def _method_verify(program: A.Program) -> dict:
+    result, failure = _run_verifier(program)
     if failure is not None:
         return failure
     findings, report = result
@@ -251,10 +297,10 @@ def _method_verify(source: str) -> dict:
                         "divisions_total": report.divisions_total}}
 
 
-def _method_obligations(source: str) -> dict:
+def _method_obligations(program: A.Program) -> dict:
     """THE method for an AI author: what must I still make true? An empty
     list means the program is fully proven."""
-    result, failure = _run_verifier(source)
+    result, failure = _run_verifier(program)
     if failure is not None:
         return failure
     findings, _ = result

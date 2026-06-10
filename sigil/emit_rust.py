@@ -208,12 +208,20 @@ def rust_string(value: str) -> str:
     return "".join(out)
 
 
+def sym(name: str) -> str:
+    """Rust identifier component for a (possibly module-qualified) Sigil
+    name: 'geometry.area' -> 'geometry__area'. Dots are not valid in Rust
+    identifiers; every emitted symbol routes through here. Auditor-facing
+    message TEXT (contract blame) keeps the dotted form."""
+    return name.replace(".", "__")
+
+
 def rust_type(ty: A.Type) -> str:
     if ty.kind == "List":
         elem = rust_type(ty.elem) if ty.elem is not None else "i64"
         return f"Vec<{elem}>"
     if ty.kind in ("Record", "Enum"):
-        return f"s_{ty.name}"
+        return f"s_{sym(ty.name)}"
     if ty.kind == "Var":
         raise SigilError(
             f"internal: unsubstituted type variable '{ty.name}' reached the "
@@ -231,7 +239,7 @@ def mangle_type(ty: A.Type) -> str:
         # checker rejects as uninferable; defend with the Rust default anyway.
         return f"List_{mangle_type(ty.elem) if ty.elem is not None else 'Int'}"
     if ty.kind in ("Record", "Enum"):
-        return ty.name
+        return sym(ty.name)
     return ty.kind
 
 
@@ -293,7 +301,8 @@ class RustEmitter:
         return rust_type(A.substitute(ty, self.subst))
 
     def instance_name(self, name: str, parts: tuple[str, ...]) -> str:
-        return f"s_{name}__{'_'.join(parts)}" if parts else f"s_{name}"
+        return (f"s_{sym(name)}__{'_'.join(parts)}" if parts
+                else f"s_{sym(name)}")
 
     # ------------------------------------------------------------ records
 
@@ -328,9 +337,9 @@ class RustEmitter:
                       for _, ftype in rec.fields)
         derives = "Clone" if has_cap else "Clone, PartialEq"
         self.emit_line(f"#[derive({derives})]")
-        self.emit_line(f"struct s_{rec.name} {{")
+        self.emit_line(f"struct s_{sym(rec.name)} {{")
         for fname, ftype in rec.fields:
-            self.emit_line(f"    s_{fname}: {rust_type(ftype)},")
+            self.emit_line(f"    s_{sym(fname)}: {rust_type(ftype)},")
         self.emit_line("}")
 
     def emit_enum(self, enum: A.EnumDecl) -> None:
@@ -339,13 +348,13 @@ class RustEmitter:
                       for _, payloads in enum.variants for ptype in payloads)
         derives = "Clone" if has_cap else "Clone, PartialEq"
         self.emit_line(f"#[derive({derives})]")
-        self.emit_line(f"enum s_{enum.name} {{")
+        self.emit_line(f"enum s_{sym(enum.name)} {{")
         for vname, payloads in enum.variants:
             if payloads:
                 types = ", ".join(rust_type(p) for p in payloads)
-                self.emit_line(f"    s_{vname}({types}),")
+                self.emit_line(f"    s_{sym(vname)}({types}),")
             else:
-                self.emit_line(f"    s_{vname},")
+                self.emit_line(f"    s_{sym(vname)},")
         self.emit_line("}")
 
     # ------------------------------------------------------------ entry point
@@ -363,7 +372,7 @@ class RustEmitter:
             caps.append("Console" if ptype.kind == "Console"
                         else "Fs { can_write: true, root: None }")
         self.emit_line("fn main() {")
-        self.emit_line(f"    s_main({', '.join(caps)});")
+        self.emit_line(f"    s_{sym(main.name)}({', '.join(caps)});")
         self.emit_line("}")
 
     # ------------------------------------------------------------ functions
@@ -372,7 +381,8 @@ class RustEmitter:
         self.fn_name = fn.name
         self.subst = subst
         parts = tuple(mangle_type(subst[tp]) for tp in fn.type_params)
-        params = ", ".join(f"s_{name}: {self.rtype(ty)}" for name, ty in fn.params)
+        params = ", ".join(f"s_{sym(name)}: {self.rtype(ty)}"
+                           for name, ty in fn.params)
         ret = self.rtype(fn.ret)
         self.emit_line(f"fn {self.instance_name(fn.name, parts)}({params}) -> {ret} {{")
         self.depth += 1
@@ -419,9 +429,9 @@ class RustEmitter:
         if isinstance(stmt, A.Let):
             mut = "mut " if stmt.mutable else ""
             ty = self.rtype(stmt.declared_type)
-            self.emit_line(f"let {mut}s_{stmt.name}: {ty} = {self.expr(stmt.value)};")
+            self.emit_line(f"let {mut}s_{sym(stmt.name)}: {ty} = {self.expr(stmt.value)};")
         elif isinstance(stmt, A.Assign):
-            self.emit_line(f"s_{stmt.name} = {self.expr(stmt.value)};")
+            self.emit_line(f"s_{sym(stmt.name)} = {self.expr(stmt.value)};")
         elif isinstance(stmt, A.Return):
             if stmt.value is None:
                 self.emit_line("return;")
@@ -472,10 +482,10 @@ class RustEmitter:
             if arm.variant is None:
                 pattern = "_"
             elif arm.binders:
-                binders = ", ".join(f"s_{b}" for b in arm.binders)
-                pattern = f"s_{enum_name}::s_{arm.variant}({binders})"
+                binders = ", ".join(f"s_{sym(b)}" for b in arm.binders)
+                pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}({binders})"
             else:
-                pattern = f"s_{enum_name}::s_{arm.variant}"
+                pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}"
             self.emit_line(f"{pattern} => {{")
             self.depth += 1
             self.emit_block(arm.body)
@@ -534,19 +544,19 @@ class RustEmitter:
         if isinstance(expr, A.Var):
             # A bare nullary variant, stamped by the checker.
             if getattr(expr, "variant_of", None) is not None:
-                return f"s_{expr.variant_of}::s_{expr.name}"
-            name = "s__ret" if expr.name == "result" else f"s_{expr.name}"
+                return f"s_{sym(expr.variant_of)}::s_{sym(expr.name)}"
+            name = "s__ret" if expr.name == "result" else f"s_{sym(expr.name)}"
             # The clone decision depends on the SUBSTITUTED type: a T that is
             # Int in this instantiation stays un-cloned; a T that is Text clones.
             if A.substitute(expr_ty(expr), self.subst).kind in COPY_KINDS:
                 return name
             return f"{name}.clone()"
         if isinstance(expr, A.RecordLit):
-            fields = ", ".join(f"s_{fname}: {self.expr(fexpr)}"
+            fields = ", ".join(f"s_{sym(fname)}: {self.expr(fexpr)}"
                                for fname, fexpr in expr.fields)
-            return f"s_{expr.name} {{ {fields} }}"
+            return f"s_{sym(expr.name)} {{ {fields} }}"
         if isinstance(expr, A.FieldAccess):
-            return f"({self.expr(expr.base)}).s_{expr.field_name}"
+            return f"({self.expr(expr.base)}).s_{sym(expr.field_name)}"
         if isinstance(expr, A.Index):
             return f"rt_index(&({self.expr(expr.base)}), {self.expr(expr.index)})"
         if isinstance(expr, A.Unary):
@@ -588,7 +598,7 @@ class RustEmitter:
         # Variant construction, stamped by the checker.
         if getattr(expr, "variant_of", None) is not None:
             rendered = ", ".join(self.expr(a) for a in args)
-            return f"s_{expr.variant_of}::s_{name}({rendered})"
+            return f"s_{sym(expr.variant_of)}::s_{sym(name)}({rendered})"
 
         if name == "len":
             arg = args[0]
@@ -633,7 +643,7 @@ class RustEmitter:
                 self.pending.append((callee, bindings))
             return f"{self.instance_name(name, parts)}({rendered})"
 
-        return f"s_{name}({rendered})"
+        return f"s_{sym(name)}({rendered})"
 
 
 def emit_rust(program: A.Program) -> str:

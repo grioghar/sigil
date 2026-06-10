@@ -17,6 +17,14 @@ KNOWN_EFFECTS = {"io.read", "io.write", "fs.read", "fs.write"}
 PURE = frozenset()
 
 
+def last_segment(name: str) -> str:
+    """The declared name inside a possibly module-qualified name. The module
+    loader (0.7) qualifies non-entry declarations as '<module>.<name>'; the
+    naming canon applies to the name the author wrote, while duplicate and
+    collision checks operate on the full qualified name."""
+    return name.rsplit(".", 1)[-1]
+
+
 @dataclass
 class FnSig:
     name: str
@@ -122,11 +130,11 @@ class Checker:
 
     def declare_records(self) -> None:
         for rec in self.program.records:
-            if not rec.name[0].isupper():
+            if not last_segment(rec.name)[0].isupper():
                 raise CheckError(
                     f"record name '{rec.name}' must start with an uppercase "
                     f"letter (Sigil's one canonical style)", rec.line, rec.col)
-            if rec.name in BUILTIN_TYPE_NAMES:
+            if last_segment(rec.name) in BUILTIN_TYPE_NAMES:
                 raise CheckError(f"'{rec.name}' is a builtin type",
                                  rec.line, rec.col)
             if rec.name in self.records:
@@ -153,11 +161,11 @@ class Checker:
 
     def declare_enums(self) -> None:
         for enum in self.program.enums:
-            if not enum.name[0].isupper():
+            if not last_segment(enum.name)[0].isupper():
                 raise CheckError(
                     f"enum name '{enum.name}' must start with an uppercase "
                     f"letter (Sigil's one canonical style)", enum.line, enum.col)
-            if enum.name in BUILTIN_TYPE_NAMES:
+            if last_segment(enum.name) in BUILTIN_TYPE_NAMES:
                 raise CheckError(f"'{enum.name}' is a builtin type",
                                  enum.line, enum.col)
             if enum.name in self.records:
@@ -175,7 +183,7 @@ class Checker:
                     f"enum '{enum.name}' must declare at least one variant",
                     enum.line, enum.col)
             for vname, _ in enum.variants:
-                if not vname[0].isupper():
+                if not last_segment(vname)[0].isupper():
                     raise CheckError(
                         f"variant name '{vname}' must start with an uppercase "
                         f"letter (Sigil's one canonical style)",
@@ -336,7 +344,7 @@ class Checker:
     # ------------------------------------------------------------ functions
 
     def check_fn(self, fn: A.FnDecl) -> None:
-        if not fn.name[0].islower():
+        if not last_segment(fn.name)[0].islower():
             raise CheckError(
                 f"function name '{fn.name}' must start with a lowercase "
                 f"letter (Sigil's one canonical style)", fn.line, fn.col)
@@ -586,7 +594,7 @@ class Checker:
                     expr.variant_of = enum_name
                     return A.Type("Enum", name=enum_name)
                 hint = ""
-                if expr.name[0].isupper() and self.enums:
+                if last_segment(expr.name)[0].isupper() and self.enums:
                     hint = " (no enum declares a variant with this name)"
                 raise CheckError(f"unknown name '{expr.name}'{hint}",
                                  expr.line, expr.col)

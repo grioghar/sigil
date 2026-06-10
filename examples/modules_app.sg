@@ -1,0 +1,12 @@
+// Multi-file Sigil: every name that enters scope is written out — the use
+// header is the audit surface. Imports resolve to geometry.sg in this file's
+// directory, and the resolver flattens everything before the checker runs.
+use geometry { Shape, area, describe }
+
+fn main(console: Console) -> Unit ! {io.write} {
+    let s: Shape = Circle(5);
+    print(console, "circle area = " + str(area(s)));
+    // Threading the Console explicitly: 'describe' declared it, so it can
+    // print; 'area' did not, so it cannot — structurally.
+    describe(console, Rect(3, 4));
+}

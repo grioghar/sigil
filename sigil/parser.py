@@ -50,17 +50,64 @@ class Parser:
     # ------------------------------------------------------------ program
 
     def parse_program(self) -> A.Program:
+        uses: list[A.UseDecl] = []
         functions = []
         records = []
         enums = []
+        # Import headers come first, full stop: the audit surface of a file
+        # starts with what it pulls into scope.
+        while self.at("use"):
+            uses.append(self.parse_use())
         while not self.at("EOF"):
+            if self.at("use"):
+                raise ParseError(
+                    "use declarations must appear at the top of the file, "
+                    "before any declaration", self.cur.line, self.cur.col)
+            public = self.match("pub")
             if self.at("record"):
-                records.append(self.parse_record())
+                decl = self.parse_record()
+                records.append(decl)
             elif self.at("enum"):
-                enums.append(self.parse_enum())
+                decl = self.parse_enum()
+                enums.append(decl)
             else:
-                functions.append(self.parse_fn())
-        return A.Program(functions, records, enums)
+                decl = self.parse_fn()
+                functions.append(decl)
+            decl.public = public
+        # Import order is semantically inert (every name is written out), so
+        # the parser normalizes it: use lines sort by module name, items by
+        # exported name. One program, one rendering.
+        for use in uses:
+            use.items.sort(key=lambda item: (item[0], item[1] or ""))
+        uses.sort(key=lambda u: (u.module,
+                                 [(n, a or "") for n, a in u.items]))
+        return A.Program(functions, records, enums, uses)
+
+    def parse_use(self) -> A.UseDecl:
+        start = self.expect("use")
+        mod = self.expect("IDENT", "module name")
+        if not mod.value[0].islower():
+            raise ParseError(
+                f"module name '{mod.value}' must start with a lowercase "
+                f"letter (a module is a file: '{mod.value}.sg')",
+                mod.line, mod.col)
+        self.expect("{", "'{' listing the imported names "
+                         "(Sigil has no glob imports)")
+        items: list[tuple[str, str | None]] = []
+        while not self.at("}"):
+            name = self.expect("IDENT", "imported name").value
+            alias = None
+            if self.match("as"):
+                alias = self.expect("IDENT", "alias after 'as'").value
+            items.append((name, alias))
+            if not self.at("}"):
+                self.expect(",", "',' between imported names")
+        self.expect("}")
+        if not items:
+            raise ParseError(
+                "a use declaration must import at least one name "
+                "(Sigil has no glob imports)", start.line, start.col)
+        return A.UseDecl(mod.value, items, start.line, start.col)
 
     def parse_record(self) -> A.RecordDecl:
         start = self.expect("record")

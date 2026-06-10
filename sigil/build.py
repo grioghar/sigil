@@ -10,7 +10,7 @@ from . import ast_nodes as A
 from .checker import check
 from .emit_rust import emit_rust
 from .errors import SigilError
-from .parser import parse
+from .modules import load_program
 
 
 def find_rustc() -> str:
@@ -25,11 +25,11 @@ def find_rustc() -> str:
 def build(source_path: str, output: str | None = None,
           emit_rust_path: str | None = None, optimize: bool = True,
           verify_contracts: bool = True, quiet: bool = False) -> Path:
-    """Compile a .sg file to a native executable. Returns the binary path."""
+    """Compile a .sg file (resolving its use-imports) to a native
+    executable. Returns the binary path."""
     src_file = Path(source_path)
-    source = src_file.read_text(encoding="utf-8")
 
-    program = parse(source)
+    program = load_program(source_path)  # flattens the module graph
     check(program)  # stamps expression types the emitter needs
 
     if verify_contracts:

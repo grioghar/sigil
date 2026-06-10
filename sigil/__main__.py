@@ -10,6 +10,10 @@
     python -m sigil serve              JSON query API over stdio (one
                                        request per line, one response per line)
     python -m sigil query "<json>"     answer a single JSON request and exit
+
+check / run / verify / build resolve the file's use-imports (modules load
+from the file's directory) and operate on the flattened program; fmt / ast /
+sdiff are single-file tools that work on what is written.
 """
 
 import argparse
@@ -19,6 +23,12 @@ from .checker import check
 from .errors import SigilError
 from .interp import Interpreter
 from .parser import parse
+
+
+def _render(exc: SigilError, fallback: str) -> str:
+    """Loader errors carry the path of the file that caused them; everything
+    else renders against the CLI argument."""
+    return exc.render(getattr(exc, "path", None) or fallback)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -95,7 +105,10 @@ def main(argv: list[str] | None = None) -> int:
             with open(args.file, "r", encoding="utf-8") as handle:
                 source = handle.read()
             program = parse(source)
-            check(program)
+            # A file with imports cannot check standalone; ast is a
+            # single-file tool and serializes what is written (use included).
+            if not program.uses:
+                check(program)
         except (OSError, SigilError) as exc:
             msg = exc.render(args.file) if isinstance(exc, SigilError) else str(exc)
             print(msg, file=sys.stderr)
@@ -111,7 +124,8 @@ def main(argv: list[str] | None = None) -> int:
                 with open(path, "r", encoding="utf-8") as handle:
                     source = handle.read()
                 program = parse(source)
-                check(program)
+                if not program.uses:  # single-file tool, like ast
+                    check(program)
             except (OSError, SigilError) as exc:
                 msg = exc.render(path) if isinstance(exc, SigilError) else str(exc)
                 print(msg, file=sys.stderr)
@@ -129,21 +143,19 @@ def main(argv: list[str] | None = None) -> int:
                              optimize=not args.debug,
                              verify_contracts=not args.no_verify)
         except SigilError as exc:
-            print(exc.render(args.file), file=sys.stderr)
+            print(_render(exc, args.file), file=sys.stderr)
             return 1
         print(f"built {out_path}")
         return 0
 
     if args.command == "verify":
+        from .modules import load_program
         from .verify import verify
         try:
-            with open(args.file, "r", encoding="utf-8") as handle:
-                source = handle.read()
-            program = parse(source)
+            program = load_program(args.file)
             check(program)
-        except (OSError, SigilError) as exc:
-            msg = exc.render(args.file) if isinstance(exc, SigilError) else str(exc)
-            print(msg, file=sys.stderr)
+        except SigilError as exc:
+            print(_render(exc, args.file), file=sys.stderr)
             return 1
         report = verify(program)
         if report is None:
@@ -157,15 +169,11 @@ def main(argv: list[str] | None = None) -> int:
               f"division(s) proven safe")
         return 0
 
+    # check / run: the module loader is the single entry path — a file with
+    # no imports flattens to itself.
+    from .modules import load_program
     try:
-        with open(args.file, "r", encoding="utf-8") as handle:
-            source = handle.read()
-    except OSError as exc:
-        print(f"sigil: cannot read {args.file}: {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        program = parse(source)
+        program = load_program(args.file)
         sigs = check(program)
         if args.command == "check":
             pure = sum(1 for f in program.functions if not f.effects)
@@ -176,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         Interpreter(program, sigs).run_main()
         return 0
     except SigilError as exc:
-        print(exc.render(args.file), file=sys.stderr)
+        print(_render(exc, args.file), file=sys.stderr)
         return 1
 
 

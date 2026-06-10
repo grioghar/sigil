@@ -161,12 +161,18 @@ class Renderer:
 
     # ---------------------------------------------------------- declarations
 
+    def render_use(self, use: A.UseDecl) -> str:
+        items = ", ".join(name if alias is None else f"{name} as {alias}"
+                          for name, alias in use.items)
+        return f"use {use.module} {{ {items} }}"
+
     def fn_signature(self, fn: A.FnDecl) -> str:
         """The header line, without contracts or the opening brace."""
+        pub = "pub " if fn.public else ""
         type_params = f"[{', '.join(fn.type_params)}]" if fn.type_params else ""
         params = ", ".join(f"{name}: {self.render_type(ty)}"
                            for name, ty in fn.params)
-        header = f"fn {self._name(fn.name)}{type_params}({params}) -> {self.render_type(fn.ret)}"
+        header = f"{pub}fn {self._name(fn.name)}{type_params}({params}) -> {self.render_type(fn.ret)}"
         if fn.effects:
             header += f" ! {{{', '.join(sorted(fn.effects))}}}"
         return header
@@ -186,18 +192,20 @@ class Renderer:
         return lines
 
     def render_record(self, rec: A.RecordDecl) -> list[str]:
+        pub = "pub " if rec.public else ""
         if not rec.fields:
-            return [f"record {self._name(rec.name)} {{}}"]
-        lines = [f"record {self._name(rec.name)} {{"]
+            return [f"{pub}record {self._name(rec.name)} {{}}"]
+        lines = [f"{pub}record {self._name(rec.name)} {{"]
         for fname, ty in rec.fields:
             lines.append(f"    {fname}: {self.render_type(ty)},")
         lines.append("}")
         return lines
 
     def render_enum(self, enum: A.EnumDecl) -> list[str]:
+        pub = "pub " if enum.public else ""
         if not enum.variants:
-            return [f"enum {self._name(enum.name)} {{}}"]
-        lines = [f"enum {self._name(enum.name)} {{"]
+            return [f"{pub}enum {self._name(enum.name)} {{}}"]
+        lines = [f"{pub}enum {self._name(enum.name)} {{"]
         for vname, payloads in enum.variants:
             if payloads:
                 types = ", ".join(self.render_type(p) for p in payloads)
@@ -340,6 +348,8 @@ def _walk_anchors(program: A.Program) -> list[tuple[int, int, object]]:
                     anchors.append((arm.line, arm.col, arm))
                     stmts(arm.body)
 
+    for use in program.uses:
+        anchors.append((use.line, use.col, use))
     for decl in _decls_in_source_order(program):
         anchors.append((decl.line, decl.col, decl))
         if isinstance(decl, A.FnDecl):
@@ -399,6 +409,15 @@ def format_program(program: A.Program, comments: list[Comment] | None = None) ->
     buckets, eof = _assign_comments(comments, _walk_anchors(program))
     renderer = _CommentingRenderer(buckets)
     chunks: list[str] = []
+    if program.uses:
+        # The import header is one chunk: use lines first (the parser already
+        # normalized their order), then exactly one blank line before the
+        # first declaration (chunks join with a blank line).
+        lines: list[str] = []
+        for use in program.uses:
+            lines.extend(renderer._flush(use, 0))
+            lines.append(renderer.render_use(use))
+        chunks.append("\n".join(lines))
     for decl in _decls_in_source_order(program):
         chunks.append(renderer.render_decl(decl))
     if eof:
@@ -467,9 +486,9 @@ def _node_json(node, renderer: Renderer):
 
 
 def program_json(program: A.Program) -> dict:
-    """The serialized typed AST: {"version": 1, "records": [...],
-    "enums": [...], "functions": [...]}, every declaration stamped with
-    id + shape."""
+    """The serialized typed AST: {"version": 1, "uses": [...],
+    "records": [...], "enums": [...], "functions": [...]}, every declaration
+    stamped with id + shape."""
     renderer = Renderer()
     records = []
     for rec in program.records:
@@ -477,6 +496,7 @@ def program_json(program: A.Program) -> dict:
             "id": decl_id(rec),
             "shape": decl_shape(rec),
             "name": rec.name,
+            "public": rec.public,
             "fields": [{"name": fname, "type": renderer.render_type(ty)}
                        for fname, ty in rec.fields],
         })
@@ -486,6 +506,7 @@ def program_json(program: A.Program) -> dict:
             "id": decl_id(enum),
             "shape": decl_shape(enum),
             "name": enum.name,
+            "public": enum.public,
             "variants": [{"name": vname,
                           "payloads": [renderer.render_type(p)
                                        for p in payloads]}
@@ -497,6 +518,7 @@ def program_json(program: A.Program) -> dict:
             "id": decl_id(fn),
             "shape": decl_shape(fn),
             "name": fn.name,
+            "public": fn.public,
             "type_params": list(fn.type_params),
             "params": [{"name": pname, "type": renderer.render_type(ty)}
                        for pname, ty in fn.params],
@@ -506,7 +528,11 @@ def program_json(program: A.Program) -> dict:
                           for c in fn.contracts],
             "body": [_node_json(stmt, renderer) for stmt in fn.body],
         })
-    return {"version": 1, "records": records, "enums": enums,
+    uses = [{"module": use.module,
+             "items": [{"name": name, "alias": alias}
+                       for name, alias in use.items]}
+            for use in program.uses]
+    return {"version": 1, "uses": uses, "records": records, "enums": enums,
             "functions": functions}
 
 
@@ -532,6 +558,9 @@ def _decl_index(program: A.Program) -> dict[tuple[str, str], object]:
 def _classify(kind: str, old, new) -> str:
     """Why two same-named declarations differ. Precedence:
     signature > contracts > body (rename is handled by the caller)."""
+    if old.public != new.public:
+        # Export status is part of a declaration's contract with the world.
+        return "signature"
     if kind in ("record", "enum"):
         # A record IS its field list (and an enum its variant list); any
         # change is its body.

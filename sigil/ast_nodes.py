@@ -232,6 +232,7 @@ class FnDecl:
     line: int = 0
     col: int = 0
     type_params: list[str] = field(default_factory=list)  # generic functions
+    public: bool = False                                  # 'pub' — exported
 
 
 @dataclass
@@ -240,12 +241,25 @@ class RecordDecl:
     fields: list[tuple[str, Type]]
     line: int = 0
     col: int = 0
+    public: bool = False
 
 
 @dataclass
 class EnumDecl:
     name: str
     variants: list[tuple[str, list[Type]]]   # (variant name, payload types)
+    line: int = 0
+    col: int = 0
+    public: bool = False
+
+
+@dataclass
+class UseDecl:
+    """One import header line: `use geometry { area, parse as parse_shape }`.
+    Items are (exported name, alias-or-None) pairs; every name that enters
+    scope is written out (no glob imports — auditability)."""
+    module: str
+    items: list[tuple[str, Optional[str]]]
     line: int = 0
     col: int = 0
 
@@ -255,3 +269,4 @@ class Program:
     functions: list[FnDecl]
     records: list[RecordDecl] = field(default_factory=list)
     enums: list[EnumDecl] = field(default_factory=list)
+    uses: list[UseDecl] = field(default_factory=list)
