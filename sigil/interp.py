@@ -258,6 +258,17 @@ class Interpreter:
                     for fname, fexpr in expr.fields}
         if isinstance(expr, A.FieldAccess):
             return self.eval(expr.base, frame)[expr.field_name]
+        if isinstance(expr, A.IfExpr):
+            # Only the taken branch is evaluated (reference semantics).
+            if self.eval(expr.cond, frame):
+                return self.eval(expr.then_expr, frame)
+            return self.eval(expr.else_expr, frame)
+        if isinstance(expr, A.RecordUpdate):
+            # The base is evaluated FIRST, then the fields left to right.
+            updated = dict(self.eval(expr.base, frame))
+            for fname, fexpr in expr.fields:
+                updated[fname] = self.eval(fexpr, frame)
+            return updated
         if isinstance(expr, A.Index):
             base = self.eval(expr.base, frame)
             index = self.eval(expr.index, frame)

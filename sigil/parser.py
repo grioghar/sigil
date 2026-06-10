@@ -320,7 +320,22 @@ class Parser:
     # ------------------------------------------------------------ expressions
 
     def parse_expr(self) -> A.Expr:
+        # An if-EXPRESSION binds loosest of all: `if c then a else b`. There
+        # is no clash with the statement form — statement position checks for
+        # the `if` keyword before ever reaching parse_expr.
+        if self.at("if"):
+            return self.parse_if_expr()
         return self.parse_or()
+
+    def parse_if_expr(self) -> A.IfExpr:
+        tok = self.expect("if")
+        cond = self.parse_expr()
+        self.expect("then", "'then' after the if-expression condition")
+        then_expr = self.parse_expr()
+        self.expect("else", "'else' (an if-expression must produce a value "
+                            "on both branches)")
+        else_expr = self.parse_expr()
+        return A.IfExpr(tok.line, tok.col, cond, then_expr, else_expr)
 
     def parse_or(self) -> A.Expr:
         left = self.parse_and()
@@ -382,7 +397,26 @@ class Parser:
                 fname = self.expect("IDENT", "field name after '.'").value
                 expr = A.FieldAccess(tok.line, tok.col, expr, fname)
             else:
-                return expr
+                break
+        # Record functional update: at most ONE `with` clause may follow.
+        if self.at("with"):
+            tok = self.advance()
+            self.expect("{", "'{' listing the updated fields")
+            fields: list[tuple[str, A.Expr]] = []
+            while not self.at("}"):
+                fname = self.expect("IDENT", "field name").value
+                self.expect(":")
+                fields.append((fname, self.parse_expr()))
+                if not self.at("}"):
+                    self.expect(",", "',' between updated fields")
+            self.expect("}")
+            expr = A.RecordUpdate(tok.line, tok.col, expr, fields)
+            if self.at("with"):
+                raise ParseError(
+                    "'with' clauses do not chain; parenthesize the first "
+                    "update: (x with { ... }) with { ... }",
+                    self.cur.line, self.cur.col)
+        return expr
 
     def parse_primary(self) -> A.Expr:
         tok = self.cur

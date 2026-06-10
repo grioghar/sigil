@@ -613,6 +613,22 @@ class RustEmitter:
             return f"s_{sym(expr.name)} {{ {fields} }}"
         if isinstance(expr, A.FieldAccess):
             return f"({self.expr(expr.base)}).s_{sym(expr.field_name)}"
+        if isinstance(expr, A.IfExpr):
+            # A parenthesized Rust if-expression: only the taken branch runs.
+            return (f"(if {self.expr(expr.cond)} "
+                    f"{{ {self.expr(expr.then_expr)} }} "
+                    f"else {{ {self.expr(expr.else_expr)} }})")
+        if isinstance(expr, A.RecordUpdate):
+            # Rust struct-update syntax evaluates the listed fields BEFORE
+            # the base expression; Sigil evaluates the base first. Binding
+            # the base in a let restores the reference order (base, then
+            # fields left to right). The base routes through the normal
+            # expr() path, so a Var base clones like any other read.
+            name = A.substitute(expr_ty(expr), self.subst).name
+            fields = ", ".join(f"s_{sym(fname)}: {self.expr(fexpr)}"
+                               for fname, fexpr in expr.fields)
+            return (f"{{ let s__base = {self.expr(expr.base)}; "
+                    f"s_{sym(name)} {{ {fields}, ..s__base }} }}")
         if isinstance(expr, A.Index):
             return f"rt_index(&({self.expr(expr.base)}), {self.expr(expr.index)})"
         if isinstance(expr, A.Unary):

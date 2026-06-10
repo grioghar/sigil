@@ -45,8 +45,10 @@ _LEVEL = {
     "+": 4, "-": 4,
     "*": 5, "/": 5, "%": 5,
 }
+_IF_LEVEL = 0       # if-expressions bind loosest of all expressions
 _UNARY_LEVEL = 6
 _POSTFIX_LEVEL = 7
+_WITH_LEVEL = 6     # `x with { ... }` follows the postfix chain, below it
 
 # A match scrutinee whose rendering ends in a bare uppercase identifier (a
 # nullary variant) must keep parentheses: `match x == Empty {` would re-parse
@@ -157,6 +159,22 @@ class Renderer:
             left = self.render_expr(expr.left, level)
             right = self.render_expr(expr.right, level + 1)
             return f"{left} {expr.op} {right}", level
+        if isinstance(expr, A.IfExpr):
+            # Lowest precedence: parenthesized as the operand of anything.
+            # A nested if-expression keeps parens in cond/then position but
+            # chains bare in else position (`... else if c then a else b`).
+            cond = self.render_expr(expr.cond, _IF_LEVEL + 1)
+            then = self.render_expr(expr.then_expr, _IF_LEVEL + 1)
+            els = self.render_expr(expr.else_expr, _IF_LEVEL)
+            return f"if {cond} then {then} else {els}", _IF_LEVEL
+        if isinstance(expr, A.RecordUpdate):
+            # The base is a postfix-chain value: a bare name, call, index, or
+            # field access needs no parens; anything looser (an if-expression,
+            # an inner `with`) does.
+            base = self.render_expr(expr.base, _POSTFIX_LEVEL)
+            fields = ", ".join(f"{fname}: {self.render_expr(fexpr)}"
+                               for fname, fexpr in expr.fields)
+            return f"{base} with {{ {fields} }}", _WITH_LEVEL
         raise TypeError(f"unknown expression node {type(expr).__name__}")
 
     # ---------------------------------------------------------- declarations
@@ -245,7 +263,10 @@ class Renderer:
         if isinstance(stmt, A.Break):
             return [f"{pad}break;"]
         if isinstance(stmt, A.ExprStmt):
-            return [f"{pad}{self.render_expr(stmt.expr)};"]
+            # Statement position parses the `if` KEYWORD as the statement
+            # form, so a bare if-expression cannot be an expression statement
+            # — it keeps its parentheses (context just above _IF_LEVEL).
+            return [f"{pad}{self.render_expr(stmt.expr, _IF_LEVEL + 1)};"]
         if isinstance(stmt, A.If):
             return self._render_if(stmt, depth)
         if isinstance(stmt, A.Match):

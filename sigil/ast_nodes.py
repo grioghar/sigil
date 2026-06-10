@@ -140,6 +140,28 @@ class FieldAccess(Expr):
     field_name: str = ""
 
 
+@dataclass
+class IfExpr(Expr):
+    """`if cond then a else b` — an expression, both branches mandatory.
+    Distinct from the statement If: only the taken branch is evaluated, and
+    the whole thing has a value. An if-expression can never appear as a bare
+    expression statement (statement position parses the statement form), but
+    that costs nothing: it would be pure and therefore useless there."""
+    cond: Expr = None
+    then_expr: Expr = None
+    else_expr: Expr = None
+
+
+@dataclass
+class RecordUpdate(Expr):
+    """`base with { field: expr, ... }` — functional record update. The base
+    is evaluated first, then the field expressions left to right; the result
+    is a copy of the base with the listed fields replaced. A single clause
+    only (chaining requires parentheses around the inner update)."""
+    base: Expr = None
+    fields: list[tuple[str, Expr]] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------- statements
 
 @dataclass
