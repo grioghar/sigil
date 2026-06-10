@@ -1,0 +1,41 @@
+// Generics (v0.2c): type parameters on functions, inferred from arguments —
+// there is no call-site instantiation syntax. A T-typed value is opaque: it
+// can be bound, passed, returned, and stored in a List[T], but never compared
+// or str()'d, because its concrete type is unknown inside the function. The
+// native backend monomorphizes: each instantiation compiles to its own
+// zero-overhead Rust function (first__Int, first__Text, ...).
+
+fn first[T](xs: List[T]) -> T
+    requires len(xs) > 0
+{
+    return xs[0];
+}
+
+fn tail[T](xs: List[T]) -> List[T] {
+    var out: List[T] = [];
+    var i: Int = 1;
+    while i < len(xs) {
+        out = push(out, xs[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// A generic calling other generics: instantiations propagate.
+fn second[T](xs: List[T]) -> T
+    requires len(xs) > 1
+{
+    return first(tail(xs));
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    let nums: List[Int] = [10, 20, 30];
+    let words: List[Text] = ["alpha", "beta", "gamma"];
+    print(console, "first: " + str(first(nums)) + " / " + first(words));
+    print(console, "second: " + str(second(nums)) + " / " + second(words));
+
+    // Nested instantiation: T = List[Int].
+    let grid: List[List[Int]] = [nums, [7]];
+    print(console, "rows: " + str(len(grid)) + ", first row ends in "
+        + str(first(grid)[2]));
+}

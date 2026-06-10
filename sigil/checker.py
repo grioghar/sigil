@@ -6,7 +6,7 @@ This is the heart of the security model:
   * contract clauses must be pure Bool expressions
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from . import ast_nodes as A
@@ -24,6 +24,7 @@ class FnSig:
     ret: A.Type
     effects: frozenset[str]
     decl: Optional[A.FnDecl] = None  # None for builtins
+    type_params: list[str] = field(default_factory=list)  # generic functions
 
 
 BUILTINS: dict[str, FnSig] = {
@@ -97,7 +98,10 @@ class Checker:
                     raise CheckError(
                         f"unknown effect '{eff}'; known effects: "
                         f"{', '.join(sorted(KNOWN_EFFECTS))}", fn.line, fn.col)
-            self.sigs[fn.name] = FnSig(fn.name, fn.params, fn.ret, fn.effects, fn)
+            if fn.type_params:
+                self.resolve_fn_type_params(fn)
+            self.sigs[fn.name] = FnSig(fn.name, fn.params, fn.ret, fn.effects,
+                                       fn, fn.type_params)
 
         for fn in self.program.functions:
             self.check_fn(fn)
@@ -171,6 +175,62 @@ class Checker:
                        for _, ftype in self.records[ty.name].fields)
         return False
 
+    # ------------------------------------------------------------ generics
+
+    def resolve_fn_type_params(self, fn: A.FnDecl) -> None:
+        """Validate a generic function's type parameters and reinterpret the
+        parsed types: a Record reference whose name is a type parameter is
+        really a type variable."""
+        seen: set[str] = set()
+        for tp in fn.type_params:
+            if not tp[0].isupper():
+                raise CheckError(
+                    f"type parameter '{tp}' must start with an uppercase "
+                    f"letter (Sigil's one canonical style)", fn.line, fn.col)
+            if tp in seen:
+                raise CheckError(
+                    f"duplicate type parameter '{tp}' in '{fn.name}'",
+                    fn.line, fn.col)
+            seen.add(tp)
+            if tp in self.records:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{fn.name}' collides with "
+                    f"record '{tp}'; pick another name", fn.line, fn.col)
+            if tp in BUILTIN_TYPE_NAMES:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{fn.name}' collides with the "
+                    f"builtin type '{tp}'; pick another name", fn.line, fn.col)
+
+        fn.params = [(pname, self.resolve_type(ptype, fn.type_params))
+                     for pname, ptype in fn.params]
+        fn.ret = self.resolve_type(fn.ret, fn.type_params)
+
+        # Sigil has no call-site instantiation syntax, so every type parameter
+        # must be inferable from the arguments alone.
+        used: set[str] = set()
+        for _, ptype in fn.params:
+            used |= self.collect_vars(ptype)
+        for tp in fn.type_params:
+            if tp not in used:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{fn.name}' does not appear in "
+                    f"any parameter type, so no call site could ever infer it",
+                    fn.line, fn.col)
+
+    def resolve_type(self, ty: A.Type, type_params: list[str]) -> A.Type:
+        if ty.kind == "Record" and ty.name in type_params:
+            return A.Type("Var", name=ty.name)
+        if ty.kind == "List" and ty.elem is not None:
+            return A.Type("List", self.resolve_type(ty.elem, type_params))
+        return ty
+
+    def collect_vars(self, ty: A.Type) -> set[str]:
+        if ty.kind == "Var":
+            return {ty.name}
+        if ty.kind == "List" and ty.elem is not None:
+            return self.collect_vars(ty.elem)
+        return set()
+
     # ------------------------------------------------------------ functions
 
     def check_fn(self, fn: A.FnDecl) -> None:
@@ -237,6 +297,9 @@ class Checker:
                 raise CheckError(
                     f"binding '{stmt.name}' must start with a lowercase letter",
                     stmt.line, stmt.col)
+            if fn.type_params:
+                stmt.declared_type = self.resolve_type(stmt.declared_type,
+                                                       fn.type_params)
             self.validate_type(stmt.declared_type, stmt.line, stmt.col)
             vtype = self.check_expr(stmt.value, scope, fn)
             if not A.compatible(stmt.declared_type, vtype):
@@ -418,6 +481,12 @@ class Checker:
                 return A.BOOL
 
             if op in ("==", "!="):
+                if A.contains_var(ltype) or A.contains_var(rtype):
+                    generic = ltype if A.contains_var(ltype) else rtype
+                    raise CheckError(
+                        f"cannot compare values of generic type {generic} "
+                        f"(directly or inside a list); their concrete type is "
+                        f"unknown here", expr.line, expr.col)
                 if self.contains_capability(ltype) or self.contains_capability(rtype):
                     raise CheckError(
                         "capability values cannot be compared (directly or "
@@ -491,6 +560,10 @@ class Checker:
             raise CheckError(
                 f"'{expr.name}' takes {len(sig.params)} argument(s), got "
                 f"{len(arg_types)}", expr.line, expr.col)
+
+        if sig.type_params:
+            return self.check_generic_call(expr, sig, arg_types)
+
         for (pname, ptype), atype, arg in zip(sig.params, arg_types, expr.args):
             if not A.compatible(ptype, atype):
                 hint = ""
@@ -502,6 +575,80 @@ class Checker:
                     f"{atype}{hint}", arg.line, arg.col)
         return sig.ret
 
+    def check_generic_call(self, expr: A.Call, sig: FnSig,
+                           arg_types: list[A.Type]) -> A.Type:
+        """Infer each type parameter by unifying declared parameter types
+        against the actual argument types, then re-check the arguments under
+        the inferred bindings. The bindings are stamped onto the Call node
+        (expr.type_bindings) for the monomorphizing native backend."""
+        bindings: dict[str, A.Type] = {}
+        for (pname, ptype), atype in zip(sig.params, arg_types):
+            self.unify(ptype, atype, bindings, expr)
+
+        for (pname, ptype), atype, arg in zip(sig.params, arg_types, expr.args):
+            concrete = A.substitute(ptype, bindings)
+            if not A.compatible(concrete, atype):
+                raise CheckError(
+                    f"argument '{pname}' of '{expr.name}' needs {concrete}, "
+                    f"got {atype}", arg.line, arg.col)
+
+        for tp in sig.type_params:
+            bound = bindings.get(tp)
+            if bound is None or not self.fully_known(bound):
+                raise CheckError(
+                    f"cannot infer {tp} for this call of '{expr.name}' (an "
+                    f"empty list literal carries no element type)",
+                    expr.line, expr.col)
+
+        expr.type_bindings = bindings
+        return A.substitute(sig.ret, bindings)
+
+    def unify(self, ptype: A.Type, atype: A.Type,
+              bindings: dict[str, A.Type], expr: A.Call) -> None:
+        """Bind type variables in a declared parameter type against the actual
+        argument type. Only binding conflicts are raised here; plain type
+        mismatches get the standard argument error from the caller."""
+        if ptype.kind == "Var":
+            existing = bindings.get(ptype.name)
+            if existing is None:
+                bindings[ptype.name] = atype
+                return
+            merged = self.merge_binding(existing, atype)
+            if merged is None:
+                raise CheckError(
+                    f"conflicting types for {ptype.name} in this call of "
+                    f"'{expr.name}': {existing} and {atype}",
+                    expr.line, expr.col)
+            bindings[ptype.name] = merged
+            return
+        if ptype.kind == "List" and atype.kind == "List":
+            if ptype.elem is not None and atype.elem is not None:
+                self.unify(ptype.elem, atype.elem, bindings, expr)
+
+    def merge_binding(self, a: A.Type, b: A.Type) -> Optional[A.Type]:
+        """The more specific of two bindings for one type parameter, or None
+        when they conflict. A List with unknown element type (an empty list
+        literal) defers to the other side."""
+        if a.kind == "List" and b.kind == "List":
+            if a.elem is None:
+                return b
+            if b.elem is None:
+                return a
+            elem = self.merge_binding(a.elem, b.elem)
+            return A.Type("List", elem) if elem is not None else None
+        if a.kind != b.kind:
+            return None
+        if a.kind in ("Record", "Var"):
+            return a if a.name == b.name else None
+        return a
+
+    def fully_known(self, ty: A.Type) -> bool:
+        """A binding still containing an unknown List element (from an empty
+        list literal) cannot drive monomorphization."""
+        if ty.kind == "List":
+            return ty.elem is not None and self.fully_known(ty.elem)
+        return True
+
     def check_polymorphic(self, expr: A.Call, arg_types: list[A.Type]) -> A.Type:
         name = expr.name
         if name == "len":
@@ -511,7 +658,8 @@ class Checker:
             return A.INT
         if name == "str":
             if len(arg_types) != 1 or arg_types[0] not in (A.INT, A.BOOL, A.TEXT):
-                raise CheckError("str takes one Int, Bool, or Text argument",
+                got = f", got {arg_types[0]}" if len(arg_types) == 1 else ""
+                raise CheckError(f"str takes one Int, Bool, or Text argument{got}",
                                  expr.line, expr.col)
             return A.TEXT
         if name == "push":

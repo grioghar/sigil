@@ -213,7 +213,25 @@ def rust_type(ty: A.Type) -> str:
         return f"Vec<{elem}>"
     if ty.kind == "Record":
         return f"s_{ty.name}"
+    if ty.kind == "Var":
+        raise SigilError(
+            f"internal: unsubstituted type variable '{ty.name}' reached the "
+            f"emitter; monomorphization must replace every type variable", 0, 0)
     return RUST_TYPES[ty.kind]
+
+
+def mangle_type(ty: A.Type) -> str:
+    """One name component of a monomorphized symbol: Int, Text, List_Int,
+    List_List_Text, records by their name. Pathological collisions (a record
+    literally named 'List_Int') are theoretically possible and accepted for
+    now — record names are flat and '_'-joining is unambiguous in practice."""
+    if ty.kind == "List":
+        # elem None can only come from an all-empty-literal binding, which the
+        # checker rejects as uninferable; defend with the Rust default anyway.
+        return f"List_{mangle_type(ty.elem) if ty.elem is not None else 'Int'}"
+    if ty.kind == "Record":
+        return ty.name
+    return ty.kind
 
 
 def expr_ty(expr: A.Expr) -> A.Type:
@@ -230,6 +248,14 @@ class RustEmitter:
         self.program = program
         self.lines: list[str] = []
         self.depth = 0
+        # Monomorphization state. `subst` is the substitution the current
+        # function body is being emitted under (empty for non-generic code);
+        # `pending`/`instantiated` form the worklist of concrete instantiations
+        # of generic functions, deduplicated by (name, mangled type args).
+        self.subst: dict[str, A.Type] = {}
+        self.fn_decls = {fn.name: fn for fn in program.functions}
+        self.instantiated: set[tuple[str, tuple[str, ...]]] = set()
+        self.pending: list[tuple[A.FnDecl, dict[str, A.Type]]] = []
 
     # ------------------------------------------------------------ output
 
@@ -241,11 +267,28 @@ class RustEmitter:
         for rec in self.program.records:
             self.emit_record(rec)
             self.emit_line()
+        # Generic functions are never emitted as-is: seed with the non-generic
+        # functions, then drain the instantiations their bodies demanded.
+        # (An uncalled generic function simply produces no code.)
         for fn in self.program.functions:
-            self.emit_fn(fn)
+            if not fn.type_params:
+                self.emit_fn(fn, {})
+                self.emit_line()
+        while self.pending:
+            fn, subst = self.pending.pop(0)
+            self.emit_fn(fn, subst)
             self.emit_line()
         self.emit_entry()
         return "\n".join(self.lines) + "\n"
+
+    # ------------------------------------------------------------ generics
+
+    def rtype(self, ty: A.Type) -> str:
+        """Render a type under the current substitution."""
+        return rust_type(A.substitute(ty, self.subst))
+
+    def instance_name(self, name: str, parts: tuple[str, ...]) -> str:
+        return f"s_{name}__{'_'.join(parts)}" if parts else f"s_{name}"
 
     # ------------------------------------------------------------ records
 
@@ -297,10 +340,12 @@ class RustEmitter:
 
     # ------------------------------------------------------------ functions
 
-    def emit_fn(self, fn: A.FnDecl) -> None:
-        params = ", ".join(f"s_{name}: {rust_type(ty)}" for name, ty in fn.params)
-        ret = rust_type(fn.ret)
-        self.emit_line(f"fn s_{fn.name}({params}) -> {ret} {{")
+    def emit_fn(self, fn: A.FnDecl, subst: dict[str, A.Type]) -> None:
+        self.subst = subst
+        parts = tuple(mangle_type(subst[tp]) for tp in fn.type_params)
+        params = ", ".join(f"s_{name}: {self.rtype(ty)}" for name, ty in fn.params)
+        ret = self.rtype(fn.ret)
+        self.emit_line(f"fn {self.instance_name(fn.name, parts)}({params}) -> {ret} {{")
         self.depth += 1
 
         for contract in fn.contracts:
@@ -344,7 +389,7 @@ class RustEmitter:
     def emit_stmt(self, stmt: A.Stmt) -> None:
         if isinstance(stmt, A.Let):
             mut = "mut " if stmt.mutable else ""
-            ty = rust_type(stmt.declared_type)
+            ty = self.rtype(stmt.declared_type)
             self.emit_line(f"let {mut}s_{stmt.name}: {ty} = {self.expr(stmt.value)};")
         elif isinstance(stmt, A.Assign):
             self.emit_line(f"s_{stmt.name} = {self.expr(stmt.value)};")
@@ -391,6 +436,11 @@ class RustEmitter:
         # Simplest correct approach: emit the nested if into a sub-emitter.
         sub = RustEmitter(self.program)
         sub.depth = self.depth
+        # Share monomorphization state: instantiations discovered inside an
+        # else-if body must land on the same worklist.
+        sub.subst = self.subst
+        sub.instantiated = self.instantiated
+        sub.pending = self.pending
         sub.emit_if(stmt)
         rendered = "\n".join(sub.lines)
         # Strip the indentation of the first line; it is glued after "} else ".
@@ -410,7 +460,9 @@ class RustEmitter:
             return f"vec![{items}]"
         if isinstance(expr, A.Var):
             name = "s__ret" if expr.name == "result" else f"s_{expr.name}"
-            if expr_ty(expr).kind in COPY_KINDS:
+            # The clone decision depends on the SUBSTITUTED type: a T that is
+            # Int in this instantiation stays un-cloned; a T that is Text clones.
+            if A.substitute(expr_ty(expr), self.subst).kind in COPY_KINDS:
                 return name
             return f"{name}.clone()"
         if isinstance(expr, A.RecordLit):
@@ -479,6 +531,27 @@ class RustEmitter:
             return f"rt_{name}({rendered})"
 
         rendered = ", ".join(self.expr(a) for a in args)
+
+        # A call to a generic function names its concrete instantiation and
+        # enqueues it: the checker stamped the bindings (which may mention the
+        # enclosing function's type parameters, hence the substitution here).
+        callee = self.fn_decls.get(name)
+        if callee is not None and callee.type_params:
+            stamped = getattr(expr, "type_bindings", None)
+            if stamped is None:
+                raise SigilError(
+                    "internal: generic call reached the emitter without "
+                    "inferred type bindings; run the checker before emitting",
+                    expr.line, expr.col)
+            bindings = {tp: A.substitute(ty, self.subst)
+                        for tp, ty in stamped.items()}
+            parts = tuple(mangle_type(bindings[tp]) for tp in callee.type_params)
+            key = (name, parts)
+            if key not in self.instantiated:
+                self.instantiated.add(key)
+                self.pending.append((callee, bindings))
+            return f"{self.instance_name(name, parts)}({rendered})"
+
         return f"s_{name}({rendered})"
 
 
