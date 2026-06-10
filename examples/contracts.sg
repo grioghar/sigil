@@ -1,0 +1,29 @@
+// Contracts with blame. safe_div states its bargain in the signature;
+// fib's ensures clause documents (and enforces) non-negativity.
+
+fn safe_div(a: Int, b: Int) -> Int
+    requires b != 0
+{
+    return a / b;
+}
+
+fn fib(n: Int) -> Int
+    requires n >= 0
+    ensures result >= 0
+{
+    var a: Int = 0;
+    var b: Int = 1;
+    var i: Int = 0;
+    while i < n {
+        let next: Int = a + b;
+        a = b;
+        b = next;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    print(console, "10 / 2 = " + str(safe_div(10, 2)));
+    print(console, "fib(20) = " + str(fib(20)));
+}

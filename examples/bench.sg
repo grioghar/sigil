@@ -1,0 +1,12 @@
+fn fib(n: Int) -> Int
+    requires n >= 0
+{
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    print(console, "fib(30) = " + str(fib(30)));
+}

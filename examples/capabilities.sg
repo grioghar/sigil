@@ -1,0 +1,31 @@
+// Capability threading across a small program: main holds Console and Fs,
+// and hands each helper exactly the authority it needs — no more.
+// audit_summary gets NO capabilities, so it provably cannot leak its input.
+
+fn main(console: Console, fs: Fs) -> Unit ! {io.write, fs.write, fs.read} {
+    let report: Text = audit_summary([3, 1, 4, 1, 5, 9, 2, 6]);
+    save(fs, "report.txt", report);
+    let back: Text = read_file(fs, "report.txt");
+    print(console, "wrote and re-read report:");
+    print(console, back);
+}
+
+// Pure: no effects, no capabilities. The signature is the audit.
+fn audit_summary(xs: List[Int]) -> Text
+    ensures len(result) > 0
+{
+    var total: Int = 0;
+    var i: Int = 0;
+    while i < len(xs) {
+        total = total + xs[i];
+        i = i + 1;
+    }
+    return "items=" + str(len(xs)) + " total=" + str(total);
+}
+
+// Gets the Fs capability but not Console: it can write files, not chatter.
+fn save(fs: Fs, path: Text, data: Text) -> Unit ! {fs.write}
+    requires len(path) > 0
+{
+    write_file(fs, path, data);
+}

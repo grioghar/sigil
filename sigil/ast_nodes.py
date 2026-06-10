@@ -1,0 +1,175 @@
+"""AST node definitions for Sigil.
+
+A design note for the roadmap: these nodes are the real program. The 0.4
+milestone makes a serialized, ID-stamped form of this tree the canonical
+on-disk format, with text as a projection.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional, Union
+
+
+# ---------------------------------------------------------------- types
+
+@dataclass(frozen=True)
+class Type:
+    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List
+    elem: Optional["Type"] = None  # element type when kind == 'List'; None = unknown
+
+    def __str__(self) -> str:
+        if self.kind == "List":
+            return f"List[{self.elem if self.elem is not None else '?'}]"
+        return self.kind
+
+
+INT = Type("Int")
+BOOL = Type("Bool")
+TEXT = Type("Text")
+UNIT = Type("Unit")
+CONSOLE = Type("Console")
+FS = Type("Fs")
+
+CAPABILITY_KINDS = {"Console", "Fs"}
+
+
+def compatible(expected: Type, actual: Type) -> bool:
+    """Structural compatibility; a List with unknown element type (an empty
+    list literal) is compatible with any List."""
+    if expected.kind != actual.kind:
+        return False
+    if expected.kind == "List":
+        if expected.elem is None or actual.elem is None:
+            return True
+        return compatible(expected.elem, actual.elem)
+    return True
+
+
+# ---------------------------------------------------------------- expressions
+
+@dataclass
+class Expr:
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class IntLit(Expr):
+    value: int = 0
+
+
+@dataclass
+class BoolLit(Expr):
+    value: bool = False
+
+
+@dataclass
+class TextLit(Expr):
+    value: str = ""
+
+
+@dataclass
+class ListLit(Expr):
+    items: list[Expr] = field(default_factory=list)
+
+
+@dataclass
+class Var(Expr):
+    name: str = ""
+
+
+@dataclass
+class Call(Expr):
+    name: str = ""
+    args: list[Expr] = field(default_factory=list)
+
+
+@dataclass
+class Binary(Expr):
+    op: str = ""
+    left: Expr = None
+    right: Expr = None
+
+
+@dataclass
+class Unary(Expr):
+    op: str = ""
+    operand: Expr = None
+
+
+@dataclass
+class Index(Expr):
+    base: Expr = None
+    index: Expr = None
+
+
+# ---------------------------------------------------------------- statements
+
+@dataclass
+class Stmt:
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class Let(Stmt):
+    name: str = ""
+    declared_type: Type = None
+    value: Expr = None
+    mutable: bool = False
+
+
+@dataclass
+class Assign(Stmt):
+    name: str = ""
+    value: Expr = None
+
+
+@dataclass
+class Return(Stmt):
+    value: Optional[Expr] = None
+
+
+@dataclass
+class If(Stmt):
+    cond: Expr = None
+    then_body: list[Stmt] = field(default_factory=list)
+    else_body: Optional[list[Stmt]] = None   # may contain a single nested If
+
+
+@dataclass
+class While(Stmt):
+    cond: Expr = None
+    body: list[Stmt] = field(default_factory=list)
+
+
+@dataclass
+class ExprStmt(Stmt):
+    expr: Expr = None
+
+
+# ---------------------------------------------------------------- declarations
+
+@dataclass
+class Contract:
+    kind: str          # 'requires' | 'ensures'
+    expr: Expr = None
+    source: str = ""   # exact source text of the clause, for blame messages
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class FnDecl:
+    name: str
+    params: list[tuple[str, Type]]
+    ret: Type
+    effects: frozenset[str]
+    contracts: list[Contract]
+    body: list[Stmt]
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class Program:
+    functions: list[FnDecl]

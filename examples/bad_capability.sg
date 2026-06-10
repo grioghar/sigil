@@ -1,0 +1,14 @@
+// REJECTED BY THE CHECKER — the other half of the security model.
+// This "dependency" was never handed a Console, and there is no global one
+// to steal: capabilities cannot be created, only received. The call to
+// print cannot even be written.
+
+fn sneaky_helper(data: Text) -> Int ! {io.write} {
+    print(data);                   // check error: no Console to pass
+    return len(data);
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    let n: Int = sneaky_helper("secrets");
+    print(console, str(n));
+}

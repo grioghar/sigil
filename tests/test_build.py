@@ -1,0 +1,126 @@
+"""Differential tests for the native backend.
+
+The interpreter is the reference semantics. For every program here, the
+native binary's stdout must be byte-identical to the interpreter's, and
+faults/violations must exit nonzero with the same diagnostic class.
+
+These tests invoke rustc, so they take seconds, not milliseconds; the
+programs are feature-dense on purpose to keep the build count low.
+"""
+
+import io
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from sigil.build import build
+from sigil.checker import check
+from sigil.interp import Interpreter
+from sigil.parser import parse
+
+HAVE_RUSTC = shutil.which("rustc") is not None
+
+# One program exercising: effects, capability threading, contracts that pass,
+# recursion, while/var, lists (literal, push, index, len), text ops, str(),
+# if/else-if chains, comparison and logic operators, truncating division.
+KITCHEN_SINK = """
+fn fib(n: Int) -> Int
+    requires n >= 0
+    ensures result >= 0
+{
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn classify(n: Int) -> Text {
+    if n < 0 {
+        return "neg";
+    } else if n == 0 {
+        return "zero";
+    } else {
+        return "pos";
+    }
+}
+
+fn total(xs: List[Int]) -> Int {
+    var sum: Int = 0;
+    var i: Int = 0;
+    while i < len(xs) {
+        sum = sum + xs[i];
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn shout(c: Console, msg: Text) -> Unit ! {io.write}
+    requires len(msg) > 0
+{
+    print(c, msg + "!");
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    shout(console, "fib(15) = " + str(fib(15)));
+    let xs: List[Int] = push([3, 1, 4, 1, 5], 9);
+    print(console, str(total(xs)) + " over " + str(len(xs)));
+    print(console, classify(0 - 7) + " " + classify(0) + " " + classify(7));
+    print(console, str((0 - 7) / 2) + " " + str((0 - 7) % 2));
+    print(console, str(true and not false) + " " + str(1 < 2 or 2 < 1));
+    print(console, str(len("héllo")));
+}
+"""
+
+VIOLATION = """
+fn safe_div(a: Int, b: Int) -> Int
+    requires b != 0
+{
+    return a / b;
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    print(console, str(safe_div(1, 0)));
+}
+"""
+
+
+def interpret(source: str) -> str:
+    program = parse(source)
+    sigs = check(program)
+    out = io.StringIO()
+    Interpreter(program, sigs, stdin=io.StringIO(""), stdout=out).run_main()
+    return out.getvalue()
+
+
+def build_to_tmp(source: str, tmp: str, name: str) -> Path:
+    src = Path(tmp) / f"{name}.sg"
+    src.write_text(source, encoding="utf-8")
+    return build(str(src), output=str(Path(tmp) / f"{name}.exe"),
+                 optimize=False)
+
+
+@unittest.skipUnless(HAVE_RUSTC, "rustc not installed")
+class TestNativeBackend(unittest.TestCase):
+    def test_native_matches_interpreter(self):
+        expected = interpret(KITCHEN_SINK)
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = build_to_tmp(KITCHEN_SINK, tmp, "sink")
+            result = subprocess.run([str(exe)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.replace("\r\n", "\n"), expected)
+
+    def test_native_contract_violation_exits_nonzero_with_blame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = build_to_tmp(VIOLATION, tmp, "violation")
+            result = subprocess.run([str(exe)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contract violation", result.stderr)
+        self.assertIn("b != 0", result.stderr)
+        self.assertIn("CALLER", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
+if __name__ == "__main__":
+    unittest.main()

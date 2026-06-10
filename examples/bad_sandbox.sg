@@ -1,0 +1,14 @@
+// REJECTED BY THE CHECKER — this is the point.
+// parse_port claims to be pure (no effect annotation), but tries to do I/O.
+// In most languages this "logging" could just as easily be exfiltration and
+// no tool would blink. In Sigil it does not compile.
+
+fn parse_port(c: Console, cfg: Text) -> Int {
+    print(c, "parsing: " + cfg);   // check error: undeclared effect io.write
+    return 8080;
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    let port: Int = parse_port(console, "port=8080");
+    print(console, str(port));
+}

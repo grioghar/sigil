@@ -1,0 +1,8 @@
+# build artifacts (generated .rs only at root — --emit-rust output)
+*.exe
+*.pdb
+/*.rs
+
+# python
+__pycache__/
+*.pyc
