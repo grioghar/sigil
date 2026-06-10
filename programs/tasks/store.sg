@@ -1,0 +1,55 @@
+// Task persistence: one task per line, "1|title" (done) or "0|title".
+// Parsing and rendering are pure — the signatures say so.
+use textutil { Split, split_first }
+
+pub record Task {
+    done: Bool,
+    title: Text,
+}
+
+pub fn render_tasks(tasks: List[Task]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(tasks) {
+        let t: Task = tasks[i];
+        var flag: Text = "0";
+        if t.done {
+            flag = "1";
+        }
+        out = out + flag + "|" + t.title + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn parse_tasks(data: Text) -> List[Task] {
+    var tasks: List[Task] = [];
+    var rest: Text = data;
+    var scanning: Bool = len(rest) > 0;
+    while scanning {
+        match split_first(rest, "\n") {
+            At(line, tail) => {
+                tasks = parse_line(tasks, line);
+                rest = tail;
+            }
+            Missing => {
+                tasks = parse_line(tasks, rest);
+                rest = "";
+            }
+        }
+        scanning = len(rest) > 0;
+    }
+    return tasks;
+}
+
+// Private: malformed lines are dropped rather than crashing the app.
+fn parse_line(tasks: List[Task], line: Text) -> List[Task] {
+    match split_first(line, "|") {
+        At(flag, title) => {
+            return push(tasks, Task { done: flag == "1", title: title });
+        }
+        Missing => {
+            return tasks;
+        }
+    }
+}

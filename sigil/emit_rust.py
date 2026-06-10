@@ -183,6 +183,37 @@ fn rt_str_int(n: i64) -> String {
 fn rt_str_bool(b: bool) -> String {
     (if b { "true" } else { "false" }).to_string()
 }
+
+fn rt_file_exists(fs: Fs, path: String) -> bool {
+    std::path::Path::new(&rt_fs_effective(&fs, &path)).exists()
+}
+
+fn rt_slice(s: String, start: i64, end: i64) -> String {
+    let n = s.chars().count() as i64;
+    if start < 0 || end < start || end > n {
+        rt_fault(&format!(
+            "slice({}, {}) out of range for text of length {}", start, end, n))
+    } else {
+        s.chars().skip(start as usize).take((end - start) as usize).collect()
+    }
+}
+
+fn rt_ord(s: String) -> i64 {
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => c as i64,
+        _ => rt_fault(&format!(
+            "ord needs a single character, got text of length {}",
+            s.chars().count())),
+    }
+}
+
+fn rt_chr(n: i64) -> String {
+    match u32::try_from(n).ok().and_then(char::from_u32) {
+        Some(c) => c.to_string(),
+        None => rt_fault(&format!("chr({}) is not a valid character code", n)),
+    }
+}
 '''
 
 
@@ -617,7 +648,7 @@ class RustEmitter:
         if name == "push":
             return f"rt_push({self.expr(args[0])}, {self.expr(args[1])})"
         if name in ("print", "read_line", "read_file", "write_file",
-                    "read_only", "subdir"):
+                    "file_exists", "read_only", "subdir", "slice", "ord", "chr"):
             rendered = ", ".join(self.expr(a) for a in args)
             return f"rt_{name}({rendered})"
 

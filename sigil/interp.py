@@ -341,6 +341,12 @@ class Interpreter:
         except OSError as exc:
             raise RuntimeFault(f"write_file failed: {exc}", line, col)
 
+    def builtin_file_exists(self, args: list[Any], line: int, col: int) -> bool:
+        cap, path = args
+        self._require_cap(cap, FsCap, "file_exists", line, col)
+        effective = self._fs_effective(cap, path, line, col)
+        return os.path.exists(effective)
+
     def builtin_read_only(self, args: list[Any], line: int, col: int) -> FsCap:
         cap = args[0]
         self._require_cap(cap, FsCap, "read_only", line, col)
@@ -375,6 +381,30 @@ class Interpreter:
     def builtin_push(self, args: list[Any], line: int, col: int) -> list:
         xs, x = args
         return xs + [x]
+
+    def builtin_slice(self, args: list[Any], line: int, col: int) -> str:
+        s, start, end = args
+        if start < 0 or end < start or end > len(s):
+            raise RuntimeFault(
+                f"slice({start}, {end}) out of range for text of length "
+                f"{len(s)}", line, col)
+        return s[start:end]
+
+    def builtin_ord(self, args: list[Any], line: int, col: int) -> int:
+        s = args[0]
+        if len(s) != 1:
+            raise RuntimeFault(
+                f"ord needs a single character, got text of length {len(s)}",
+                line, col)
+        return ord(s)
+
+    def builtin_chr(self, args: list[Any], line: int, col: int) -> str:
+        n = args[0]
+        # Surrogates rejected for parity with the native backend (Rust char).
+        if n < 0 or n > 0x10FFFF or 0xD800 <= n <= 0xDFFF:
+            raise RuntimeFault(f"chr({n}) is not a valid character code",
+                               line, col)
+        return chr(n)
 
     def _require_cap(self, value: Any, cap_type: type, name: str,
                      line: int, col: int) -> None:

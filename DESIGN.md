@@ -217,8 +217,11 @@ size); recursion through `List` is allowed, so trees are expressible.
 | `read_line(c: Console) -> Text` | `io.read` |
 | `read_file(fs: Fs, path: Text) -> Text` | `fs.read` |
 | `write_file(fs: Fs, path: Text, data: Text) -> Unit` | `fs.write` (creates parent dirs) |
+| `file_exists(fs: Fs, path: Text) -> Bool` | `fs.read` |
 | `read_only(fs: Fs) -> Fs` | pure (attenuation) |
 | `subdir(fs: Fs, prefix: Text) -> Fs` | pure (attenuation) |
+| `slice(s: Text, start: Int, end: Int) -> Text` | pure (strict bounds) |
+| `ord(s: Text) -> Int` / `chr(n: Int) -> Text` | pure (single char / valid code) |
 | `len(x: List[T] | Text) -> Int` | pure |
 | `str(x: Int | Bool | Text) -> Text` | pure |
 | `push(xs: List[T], x: T) -> List[T]` | pure (returns new list) |

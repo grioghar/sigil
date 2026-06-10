@@ -44,9 +44,17 @@ BUILTINS: dict[str, FnSig] = {
                        frozenset({"fs.read"})),
     "write_file": FnSig("write_file", [("fs", A.FS), ("path", A.TEXT), ("data", A.TEXT)],
                         A.UNIT, frozenset({"fs.write"})),
+    "file_exists": FnSig("file_exists", [("fs", A.FS), ("path", A.TEXT)],
+                         A.BOOL, frozenset({"fs.read"})),
     # Attenuation: minting a weaker capability is pure — no I/O happens.
     "read_only": FnSig("read_only", [("fs", A.FS)], A.FS, PURE),
     "subdir": FnSig("subdir", [("fs", A.FS), ("prefix", A.TEXT)], A.FS, PURE),
+    # Text primitives: the minimal set that makes text processing possible.
+    # Everything richer (split, trim, parse_int) is written in Sigil itself.
+    "slice": FnSig("slice", [("s", A.TEXT), ("start", A.INT), ("end", A.INT)],
+                   A.TEXT, PURE),
+    "ord": FnSig("ord", [("s", A.TEXT)], A.INT, PURE),
+    "chr": FnSig("chr", [("n", A.INT)], A.TEXT, PURE),
     # len / str / push are polymorphic and special-cased in check_call.
     "len": FnSig("len", [("x", A.Type("List"))], A.INT, PURE),
     "str": FnSig("str", [("x", A.INT)], A.TEXT, PURE),

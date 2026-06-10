@@ -1,0 +1,111 @@
+// tasks — a tiny task tracker, the first real Sigil program.
+// Commands: add <title> | done <n> | list | quit
+// main holds Console + Fs; storage runs behind a capability jailed to the
+// data/ directory, so nothing in this program can touch any other file.
+use store { Task, parse_tasks, render_tasks }
+use textutil { Parsed, Split, parse_int, split_first, trim }
+
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.write} {
+    let data_fs: Fs = subdir(fs, "data");
+    var tasks: List[Task] = load(data_fs);
+    print(console, "tasks — add <title> | done <n> | list | quit");
+    var running: Bool = true;
+    while running {
+        let input: Text = trim(read_line(console));
+        if input == "quit" {
+            running = false;
+        } else if input == "list" {
+            show(console, tasks);
+        } else if input != "" {
+            tasks = handle(console, tasks, input);
+            save(data_fs, tasks);
+        }
+    }
+    save(data_fs, tasks);
+    print(console, "bye");
+}
+
+fn load(fs: Fs) -> List[Task] ! {fs.read} {
+    if file_exists(fs, "tasks.txt") {
+        return parse_tasks(read_file(fs, "tasks.txt"));
+    }
+    return [];
+}
+
+fn save(fs: Fs, tasks: List[Task]) -> Unit ! {fs.write} {
+    write_file(fs, "tasks.txt", render_tasks(tasks));
+}
+
+fn handle(console: Console, tasks: List[Task], input: Text) -> List[Task] ! {io.write} {
+    match split_first(input, " ") {
+        At(cmd, rest) => {
+            if cmd == "add" {
+                return push(tasks, Task { done: false, title: trim(rest) });
+            }
+            if cmd == "done" {
+                return mark_done(console, tasks, trim(rest));
+            }
+            print(console, "unknown command: " + cmd);
+            return tasks;
+        }
+        Missing => {
+            print(console, "unknown command: " + input);
+            return tasks;
+        }
+    }
+}
+
+fn mark_done(console: Console, tasks: List[Task], arg: Text) -> List[Task] ! {io.write} {
+    match parse_int(arg) {
+        Ok(n) => {
+            if n < 1 or n > len(tasks) {
+                print(console, "no task " + arg);
+                return tasks;
+            }
+            return set_done(tasks, n - 1);
+        }
+        Bad => {
+            print(console, "done needs a number");
+            return tasks;
+        }
+    }
+}
+
+// Lists are immutable, so "update" means rebuild with one element swapped.
+fn set_done(tasks: List[Task], index: Int) -> List[Task]
+    requires index >= 0 and index < len(tasks)
+    ensures len(result) == len(tasks)
+{
+    var out: List[Task] = [];
+    var i: Int = 0;
+    while i < len(tasks)
+        invariant i >= 0
+    {
+        let t: Task = tasks[i];
+        if i == index {
+            out = push(out, Task { done: true, title: t.title });
+        } else {
+            out = push(out, t);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn show(console: Console, tasks: List[Task]) -> Unit ! {io.write} {
+    if len(tasks) == 0 {
+        print(console, "(no tasks)");
+    }
+    var i: Int = 0;
+    while i < len(tasks)
+        invariant i >= 0
+    {
+        let t: Task = tasks[i];
+        var mark: Text = "[ ]";
+        if t.done {
+            mark = "[x]";
+        }
+        print(console, str(i + 1) + " " + mark + " " + t.title);
+        i = i + 1;
+    }
+}
