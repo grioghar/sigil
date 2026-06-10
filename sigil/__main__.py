@@ -4,6 +4,9 @@
     python -m sigil run <file.sg>      check, then execute main (interpreter)
     python -m sigil verify <file.sg>   prove contracts statically (needs z3)
     python -m sigil build <file.sg>    compile to a native executable
+    python -m sigil fmt <file.sg>      print the canonical rendering
+    python -m sigil ast <file.sg>      print the serialized typed AST (JSON)
+    python -m sigil sdiff <old> <new>  semantic diff between two programs
 """
 
 import argparse
@@ -33,7 +36,76 @@ def main(argv: list[str] | None = None) -> int:
                            help="skip rustc optimizations (faster builds)")
     build_cmd.add_argument("--no-verify", action="store_true",
                            help="skip static verification; keep all runtime checks")
+    fmt_cmd = sub.add_parser("fmt", help="print the canonical rendering")
+    fmt_cmd.add_argument("file")
+    fmt_mode = fmt_cmd.add_mutually_exclusive_group()
+    fmt_mode.add_argument("--write", action="store_true",
+                          help="rewrite the file in place")
+    fmt_mode.add_argument("--check", action="store_true",
+                          help="exit 1 if the file is not already canonical")
+    ast_cmd = sub.add_parser("ast", help="print the serialized typed AST (JSON)")
+    ast_cmd.add_argument("file")
+    sdiff_cmd = sub.add_parser("sdiff", help="semantic diff between two programs")
+    sdiff_cmd.add_argument("old")
+    sdiff_cmd.add_argument("new")
     args = cli.parse_args(argv)
+
+    if args.command == "fmt":
+        from .canon import format_source
+        try:
+            with open(args.file, "r", encoding="utf-8") as handle:
+                source = handle.read()
+            formatted = format_source(source)
+        except (OSError, SigilError) as exc:
+            msg = exc.render(args.file) if isinstance(exc, SigilError) else str(exc)
+            print(msg, file=sys.stderr)
+            return 1
+        if args.check:
+            if source != formatted:
+                print(f"{args.file} is not canonical "
+                      f"(run `python -m sigil fmt --write {args.file}`)",
+                      file=sys.stderr)
+                return 1
+            return 0
+        if args.write:
+            with open(args.file, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(formatted)
+            return 0
+        sys.stdout.write(formatted)
+        return 0
+
+    if args.command == "ast":
+        from .canon import program_json_text
+        try:
+            with open(args.file, "r", encoding="utf-8") as handle:
+                source = handle.read()
+            program = parse(source)
+            check(program)
+        except (OSError, SigilError) as exc:
+            msg = exc.render(args.file) if isinstance(exc, SigilError) else str(exc)
+            print(msg, file=sys.stderr)
+            return 1
+        print(program_json_text(program))
+        return 0
+
+    if args.command == "sdiff":
+        from .canon import sdiff
+        programs = []
+        for path in (args.old, args.new):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    source = handle.read()
+                program = parse(source)
+                check(program)
+            except (OSError, SigilError) as exc:
+                msg = exc.render(path) if isinstance(exc, SigilError) else str(exc)
+                print(msg, file=sys.stderr)
+                return 1
+            programs.append(program)
+        changes = sdiff(programs[0], programs[1])
+        for line in changes:
+            print(line)
+        return 1 if changes else 0
 
     if args.command == "build":
         from .build import build
