@@ -10,9 +10,17 @@ tries to discharge four kinds of obligations:
 
 Proven obligations are stamped onto the AST (Contract.proven, Binary.div_safe)
 and the native backend then emits NO runtime check for them — safety pays for
-speed. Everything the engine cannot model (Text, List, records, capabilities,
-loop-carried state not captured by an invariant) becomes an opaque unknown, so
-failure to prove is always conservative: the runtime check simply stays.
+speed. Text and List values are modeled by their LENGTH (a symbolic Int with
+exact semantics for literals, slice, push, concatenation, str, and chr), which
+is what lets contracts like `requires i < len(s)` prove in real programs.
+Everything else the engine cannot model (record/enum structure, capability
+state, loop-carried values not captured by an invariant) becomes an opaque
+unknown, so failure to prove is always conservative: the runtime check stays.
+Two guardrails keep erasure sound: facts arising inside the right operand of
+a short-circuit `and`/`or` are weakened to implications (that code may not
+run), and a clause whose own evaluation contains a partial operation (slice,
+ord, chr, indexing, division, any user call) is never marked proven — erasing
+a check that could itself fault would silently mask the fault.
 
 Recursion is handled inductively: while proving f's ensures, recursive calls
 to f may assume f's ensures (standard partial-correctness reasoning).
@@ -69,13 +77,16 @@ class Report:
 
 
 class Opaque:
-    """A value the engine does not model (Text, List, record, capability)."""
+    """A value the engine does not model structurally. Text and List opaques
+    carry a symbolic LENGTH (a Z3 Int), which is what lets contracts about
+    len() prove; records, enums, and capabilities have length None."""
 
     _next = 0
 
-    def __init__(self):
+    def __init__(self, length=None):
         Opaque._next += 1
         self.oid = Opaque._next
+        self.length = length
 
 
 class State:
@@ -104,6 +115,12 @@ class Verifier:
         self.div_findings: list[Finding] = []
         self.inv_findings: list[Finding] = []
         self.current_fn: str = ""
+        # Bumped whenever translation encounters a PARTIAL operation (slice,
+        # ord, chr, indexing, division, any user-function call — things that
+        # can fault or violate a requires at runtime). A clause may only be
+        # marked proven if translating it bumped nothing: erasing a check
+        # whose own evaluation could fault would silently mask that fault.
+        self.partial_ops = 0
 
     # ------------------------------------------------------------ utilities
 
@@ -115,20 +132,34 @@ class Verifier:
         self.counter += 1
         return z3.Bool(f"_v{self.counter}")
 
-    def fresh_by_type(self, ty: A.Type):
+    def fresh_by_type(self, ty: A.Type, state: "State"):
         if ty is not None and ty.kind == "Int":
             return self.fresh_int()
         if ty is not None and ty.kind == "Bool":
             return self.fresh_bool()
+        if ty is not None and ty.kind in ("Text", "List"):
+            return self.fresh_sized(state)
         return Opaque()
 
-    def havoc_like(self, value):
+    def fresh_sized(self, state: "State") -> Opaque:
+        """An unknown Text/List value: the only fact is len >= 0."""
+        length = self.fresh_int()
+        state.path.append(length >= 0)
+        return Opaque(length)
+
+    def havoc_like(self, value, state: "State"):
         if is_z3(value):
             if value.sort() == z3.IntSort():
                 return self.fresh_int()
             if value.sort() == z3.BoolSort():
                 return self.fresh_bool()
+        if isinstance(value, Opaque) and value.length is not None:
+            return self.fresh_sized(state)
         return Opaque()
+
+    @staticmethod
+    def length_of(value):
+        return value.length if isinstance(value, Opaque) else None
 
     def prove(self, state: State, obligation) -> bool:
         """True iff `obligation` holds on every path satisfying state.path."""
@@ -172,7 +203,7 @@ class Verifier:
         self.current_fn = fn.name
         state = State({}, [])
         for pname, ptype in fn.params:
-            state.vars[pname] = self.fresh_by_type(ptype)
+            state.vars[pname] = self.fresh_by_type(ptype, state)
 
         requires = [c for c in fn.contracts if c.kind == "requires"]
         ensures = [c for c in fn.contracts if c.kind == "ensures"]
@@ -203,8 +234,10 @@ class Verifier:
             env = dict(self.fn_params)
             env["result"] = result_value
             shadow = State(env, state.path)
+            mark = self.partial_ops
             value = self.translate(contract.expr, shadow)
-            if not (is_z3(value) and self.prove(state, value)):
+            if not (self.partial_ops == mark and is_z3(value)
+                    and self.prove(state, value)):
                 self.ensures_ok[idx] = False
 
     # ------------------------------------------------------------ statements
@@ -244,7 +277,7 @@ class Verifier:
             arm_state = state.clone()
             for binder, btype in zip(arm.binders,
                                      getattr(arm, "binder_types", [])):
-                arm_state.vars[binder] = self.fresh_by_type(btype)
+                arm_state.vars[binder] = self.fresh_by_type(btype, arm_state)
             self.exec_block(arm.body, arm_state)
             arm_states.append(arm_state)
 
@@ -258,7 +291,7 @@ class Verifier:
         for name in list(state.vars):
             values = [s.vars[name] for s in survivors]
             if any(value is not values[0] for value in values):
-                state.vars[name] = self.havoc_like(state.vars[name])
+                state.vars[name] = self.havoc_like(state.vars[name], state)
 
     def exec_if(self, stmt: A.If, state: State) -> None:
         cond = self.translate(stmt.cond, state)
@@ -294,6 +327,9 @@ class Verifier:
             for fact in else_state.path[base_len + 1:]:
                 merged_path.append(z3.Implies(z3.Not(cond), fact))
 
+        # Install the merged path BEFORE merging variables: havoc may append
+        # freshness facts (len >= 0) and they must land on the live path.
+        state.path = merged_path
         for name in list(state.vars):
             tval, eval_ = then_state.vars[name], else_state.vars[name]
             if tval is eval_:
@@ -301,32 +337,47 @@ class Verifier:
             if is_z3(cond) and is_z3(tval) and is_z3(eval_) \
                     and tval.sort() == eval_.sort():
                 state.vars[name] = z3.If(cond, tval, eval_)
+            elif is_z3(cond) and isinstance(tval, Opaque) \
+                    and isinstance(eval_, Opaque) \
+                    and tval.length is not None and eval_.length is not None:
+                # Sized values merge by length: the structure is unknown but
+                # the length is exactly one of the two.
+                merged = self.fresh_sized(state)
+                state.path.append(merged.length ==
+                                  z3.If(cond, tval.length, eval_.length))
+                state.vars[name] = merged
             else:
-                state.vars[name] = self.havoc_like(tval)
-        state.path = merged_path
+                state.vars[name] = self.havoc_like(tval, state)
 
     def exec_while(self, stmt: A.While, state: State) -> None:
         # Loop invariants (0.3b), classic inductive recipe. ENTRY: each
         # invariant must hold in the state that first reaches the loop.
         entry_ok: list[bool] = []
         for inv in stmt.invariants:
+            mark = self.partial_ops
             value = self.translate(inv.expr, state)
-            entry_ok.append(is_z3(value) and self.prove(state, value))
+            entry_ok.append(self.partial_ops == mark and is_z3(value)
+                            and self.prove(state, value))
 
         # Havoc everything the body assigns: from here on the state models
         # an arbitrary iteration, about which only the invariants are known.
         for name in self.collect_assigned(stmt.body):
             if name in state.vars:
-                state.vars[name] = self.havoc_like(state.vars[name])
+                state.vars[name] = self.havoc_like(state.vars[name], state)
+
+        # The invariants hold at EVERY loop head (entry-checked, preserved,
+        # and runtime-enforced when unproven), so they join the path before
+        # the condition is translated — obligations inside the condition
+        # (e.g. a requires on a call in a short-circuit guard) may use them.
+        for inv in stmt.invariants:
+            value = self.translate(inv.expr, state)
+            if is_z3(value):
+                state.path.append(value)
 
         cond = self.translate(stmt.cond, state)
-        inv_values = [self.translate(inv.expr, state) for inv in stmt.invariants]
 
-        # The body may assume the invariants and the condition.
+        # The body may additionally assume the condition.
         body_state = state.clone()
-        for value in inv_values:
-            if is_z3(value):
-                body_state.path.append(value)
         if is_z3(cond):
             body_state.path.append(cond)
         self.exec_block(stmt.body, body_state)
@@ -337,19 +388,17 @@ class Verifier:
         for ok, inv in zip(entry_ok, stmt.invariants):
             proven = ok
             if proven and body_state.alive:
+                mark = self.partial_ops
                 value = self.translate(inv.expr, body_state)
-                proven = is_z3(value) and self.prove(body_state, value)
+                proven = (self.partial_ops == mark and is_z3(value)
+                          and self.prove(body_state, value))
             inv.proven = proven
             self.inv_findings.append(Finding(
                 self.current_fn, "invariant", inv.source, proven, inv.line))
 
-        # POST-LOOP: the invariants hold (statically proven, or enforced by
-        # the runtime checks an unproven clause keeps — execution only gets
-        # here if they held) and the condition is now false. This is what
-        # makes loop-carried ensures provable.
-        for value in inv_values:
-            if is_z3(value):
-                state.path.append(value)
+        # POST-LOOP: the invariants are already on the path (appended above);
+        # the condition is now false. This is what makes loop-carried
+        # ensures provable.
         if is_z3(cond):
             state.path.append(z3.Not(cond))
 
@@ -378,22 +427,39 @@ class Verifier:
             return z3.IntVal(expr.value)
         if isinstance(expr, A.BoolLit):
             return z3.BoolVal(expr.value)
+        if isinstance(expr, A.TextLit):
+            return Opaque(z3.IntVal(len(expr.value)))
+        if isinstance(expr, A.ListLit):
+            for item in expr.items:
+                self.translate(item, state)  # record nested obligations
+            return Opaque(z3.IntVal(len(expr.items)))
         if isinstance(expr, A.Var):
             value = state.vars.get(expr.name)
-            return value if value is not None else self.fresh_by_type(ty)
+            return value if value is not None else self.fresh_by_type(ty, state)
+        if isinstance(expr, A.Index):
+            base = self.translate(expr.base, state)
+            index = self.translate(expr.index, state)
+            # Partial: faults unless 0 <= index < len(base). Execution
+            # continuing past it is what justifies the bound facts.
+            self.partial_ops += 1
+            base_len = self.length_of(base)
+            if base_len is not None and is_z3(index):
+                state.path.append(index >= 0)
+                state.path.append(index < base_len)
+            return self.fresh_by_type(ty, state)
         if isinstance(expr, A.Unary):
             operand = self.translate(expr.operand, state)
             if not is_z3(operand):
-                return self.fresh_by_type(ty)
+                return self.fresh_by_type(ty, state)
             return z3.Not(operand) if expr.op == "not" else -operand
         if isinstance(expr, A.Binary):
             return self.translate_binary(expr, state)
         if isinstance(expr, A.Call):
             return self.translate_call(expr, state)
-        # Text/List/record literals, indexing, field access: not modeled.
+        # Record literals, field access: structure not modeled.
         for child in self.subexprs(expr):
             self.translate(child, state)  # still record nested obligations
-        return self.fresh_by_type(ty)
+        return self.fresh_by_type(ty, state)
 
     def subexprs(self, expr: A.Expr) -> list[A.Expr]:
         if isinstance(expr, A.ListLit):
@@ -408,20 +474,47 @@ class Verifier:
             return []
         return []
 
+    def translate_guarded(self, expr: A.Expr, state: State, guard):
+        """Translate `expr` as code that only runs when `guard` holds (the
+        right operand of a short-circuit operator). Facts the translation
+        appends are weakened to implications, since the code may not run."""
+        state.path.append(guard)
+        base = len(state.path)
+        value = self.translate(expr, state)
+        appended = state.path[base:]
+        del state.path[base - 1:]
+        for fact in appended:
+            state.path.append(z3.Implies(guard, fact))
+        return value
+
     def translate_binary(self, expr: A.Binary, state: State):
-        left = self.translate(expr.left, state)
-        right = self.translate(expr.right, state)
         op = expr.op
-        bothz3 = is_z3(left) and is_z3(right)
 
         if op in ("and", "or"):
-            if bothz3:
+            left = self.translate(expr.left, state)
+            if is_z3(left):
+                guard = left if op == "and" else z3.Not(left)
+                right = self.translate_guarded(expr.right, state, guard)
+            else:
+                right = self.translate(expr.right, state)
+            if is_z3(left) and is_z3(right):
                 return (z3.And if op == "and" else z3.Or)(left, right)
             return self.fresh_bool()
+
+        left = self.translate(expr.left, state)
+        right = self.translate(expr.right, state)
+        bothz3 = is_z3(left) and is_z3(right)
+
         if op in ("==", "!="):
             if bothz3 and left.sort() == right.sort():
                 eq = left == right
                 return eq if op == "==" else z3.Not(eq)
+            llen, rlen = self.length_of(left), self.length_of(right)
+            if llen is not None and rlen is not None:
+                # Structure is unknown, but equal values have equal lengths.
+                equal = self.fresh_bool()
+                state.path.append(z3.Implies(equal, llen == rlen))
+                return equal if op == "==" else z3.Not(equal)
             return self.fresh_bool()
         if op in ("<", "<=", ">", ">="):
             if bothz3:
@@ -429,8 +522,10 @@ class Verifier:
                         ">": left > right, ">=": left >= right}[op]
             return self.fresh_bool()
         if op in ("/", "%"):
-            # Obligation: divisor nonzero. Result stays unconstrained because
-            # Sigil division truncates toward zero, which is not Z3's div.
+            # Partial. Obligation: divisor nonzero. Result stays
+            # unconstrained because Sigil division truncates toward zero,
+            # which is not Z3's div.
+            self.partial_ops += 1
             safe = bothz3 and self.prove(state, right != 0)
             expr.div_safe = safe
             self.div_findings.append(Finding(
@@ -439,7 +534,10 @@ class Verifier:
             return self.fresh_int()
         if op == "+":
             if getattr(expr, "ty", None) == A.TEXT:
-                return Opaque()
+                llen, rlen = self.length_of(left), self.length_of(right)
+                if llen is not None and rlen is not None:
+                    return Opaque(llen + rlen)
+                return self.fresh_sized(state)
             if bothz3:
                 return left + right
             return self.fresh_int()
@@ -447,17 +545,22 @@ class Verifier:
             if bothz3:
                 return left - right if op == "-" else left * right
             return self.fresh_int()
-        return self.fresh_by_type(getattr(expr, "ty", None))
+        return self.fresh_by_type(getattr(expr, "ty", None), state)
 
     def translate_call(self, expr: A.Call, state: State):
         callee = self.fns.get(expr.name)
         arg_values = [self.translate(a, state) for a in expr.args]
 
         if callee is None:
-            # Builtin or variant construction: no contracts; result unknown
-            # (an enum-typed result is Opaque). Arguments were translated
+            # Variant construction or builtin. Arguments were translated
             # above, so their nested obligations are already recorded.
-            return self.fresh_by_type(getattr(expr, "ty", None))
+            if getattr(expr, "variant_of", None) is not None:
+                return Opaque()
+            return self.translate_builtin(expr, arg_values, state)
+
+        # A user call is partial from a clause's point of view: its body can
+        # fault, and its (unproven) requires can fail.
+        self.partial_ops += 1
 
         env = {pname: val for (pname, _), val in zip(callee.params, arg_values)}
 
@@ -467,13 +570,15 @@ class Verifier:
                 continue
             key = (callee.name, req_idx)
             shadow = State(env, state.path)
+            mark = self.partial_ops
             value = self.translate(contract.expr, shadow)
-            ok = is_z3(value) and self.prove(state, value)
+            ok = (self.partial_ops == mark and is_z3(value)
+                  and self.prove(state, value))
             self.requires_ok[key] = self.requires_ok.get(key, True) and ok
             self.requires_called.add(key)
             req_idx += 1
 
-        result = self.fresh_by_type(getattr(expr, "ty", None))
+        result = self.fresh_by_type(getattr(expr, "ty", None), state)
 
         # Assume the callee's ensures about the result (inductively sound
         # for recursive calls under partial correctness).
@@ -488,6 +593,64 @@ class Verifier:
                 state.path.append(value)
 
         return result
+
+    def translate_builtin(self, expr: A.Call, args: list, state: State):
+        """Builtins with modeled length semantics. Partial builtins (slice,
+        ord, chr) contribute execution facts: control flow continuing past
+        them is what justifies assuming their bounds held."""
+        name = expr.name
+        ty = getattr(expr, "ty", None)
+
+        if name == "len":
+            length = self.length_of(args[0])
+            if length is not None:
+                return length
+            return self.fresh_int()
+
+        if name == "slice":
+            s, start, end = args
+            self.partial_ops += 1
+            s_len = self.length_of(s)
+            if s_len is not None and is_z3(start) and is_z3(end):
+                state.path.append(start >= 0)
+                state.path.append(end >= start)
+                state.path.append(end <= s_len)
+                return Opaque(end - start)
+            return self.fresh_sized(state)
+
+        if name == "push":
+            length = self.length_of(args[0])
+            if length is not None:
+                return Opaque(length + 1)
+            return self.fresh_sized(state)
+
+        if name == "str":
+            arg_ty = getattr(expr.args[0], "ty", None)
+            if arg_ty == A.TEXT:
+                return args[0]  # str(Text) is the identity
+            # str(Int)/str(Bool) renders at least one character.
+            result = self.fresh_sized(state)
+            state.path.append(result.length >= 1)
+            return result
+
+        if name == "ord":
+            self.partial_ops += 1
+            length = self.length_of(args[0])
+            if length is not None:
+                state.path.append(length == 1)
+            code = self.fresh_int()
+            state.path.append(code >= 0)
+            state.path.append(code <= 0x10FFFF)
+            return code
+
+        if name == "chr":
+            self.partial_ops += 1
+            if is_z3(args[0]):
+                state.path.append(args[0] >= 0)
+                state.path.append(args[0] <= 0x10FFFF)
+            return Opaque(z3.IntVal(1))
+
+        return self.fresh_by_type(ty, state)
 
 
 def verify(program: A.Program) -> Report | None:

@@ -20,12 +20,15 @@ the first run, interpreted and native — but the friction list below is real.
 
 ## Open friction, ranked by pain
 
-1. **The verifier doesn't model `len`.** 6 of this program's 12 contract
-   clauses stay at runtime, and *every single one* is `len`-dependent
-   (`requires i < len(s)`, `ensures len(result) == len(tasks)`...). Modeling
-   `len(Text)`/`len(List)` as an uninterpreted non-negative function — with
-   axioms for `slice`, `push`, and literals — would likely flip most of
-   them to PROVED. Highest-value verifier improvement by far.
+1. ~~**The verifier doesn't model `len`.**~~ **FIXED.** Text/List values now
+   carry symbolic lengths (exact for literals, `slice`, `push`, `+`, `str`,
+   `chr`); partial operations contribute execution facts; short-circuit
+   operands and clause-internal partial ops are soundness-guarded. Result:
+   **all 16 contract clauses and invariants in this program are now PROVED**
+   (was 6/12 before the round; the program gained three strengthening
+   invariants like `invariant len(out) == i` along the way — written, not
+   weakened). Zero runtime contract checks remain in the native binary, and
+   a test pins the program at zero obligations forever.
 2. **No if-expression / ternary.** The `var flag: Text = "0"; if t.done {
    flag = "1"; }` dance appears three times in ~200 lines. Galling in a
    language that prefers `let`. A `cond ? a : b` or if-expression would

@@ -80,6 +80,8 @@ fn set_done(tasks: List[Task], index: Int) -> List[Task]
     var i: Int = 0;
     while i < len(tasks)
         invariant i >= 0
+        invariant i <= len(tasks)
+        invariant len(out) == i
     {
         let t: Task = tasks[i];
         if i == index {

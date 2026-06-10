@@ -525,8 +525,8 @@ class TestEnumVerification(unittest.TestCase):
         """, "measure", "ensures")
         self.assertTrue(clause.proven)
 
-    def test_text_payload_arm_stays_conservative(self):
-        # len(w) is unmodeled, so the ensures keeps its runtime check.
+    def test_text_payload_arm_proves_via_len_modeling(self):
+        # len(w) is modeled as >= 0, so this genuinely holds and proves.
         clause = self.verified_clause("""
             enum Val {
                 Num(Int),
@@ -541,6 +541,32 @@ class TestEnumVerification(unittest.TestCase):
                     }
                     Word(w) => {
                         return len(w);
+                    }
+                }
+            }
+            fn main(console: Console) -> Unit ! {io.write} {
+                print(console, str(score(Num(2))));
+            }
+        """, "score", "ensures")
+        self.assertTrue(clause.proven)
+
+    def test_falsifiable_text_arm_stays_conservative(self):
+        # len(w) - 1 is -1 for empty text: this ensures genuinely may fail
+        # and must keep its runtime check.
+        clause = self.verified_clause("""
+            enum Val {
+                Num(Int),
+                Word(Text),
+            }
+            fn score(v: Val) -> Int
+                ensures result >= 0
+            {
+                match v {
+                    Num(n) => {
+                        return n * n;
+                    }
+                    Word(w) => {
+                        return len(w) - 1;
                     }
                 }
             }
@@ -565,7 +591,7 @@ class TestEnumVerification(unittest.TestCase):
                         return n * n;
                     }
                     Word(w) => {
-                        return len(w);
+                        return len(w) - 1;
                     }
                 }
             }

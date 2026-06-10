@@ -45,11 +45,13 @@ pub fn trim(s: Text) -> Text {
     var end: Int = len(s);
     while start < end and char_at(s, start) == " "
         invariant start >= 0
+        invariant start <= end
     {
         start = start + 1;
     }
     while end > start and char_at(s, end - 1) == " "
         invariant end >= start
+        invariant end <= len(s)
     {
         end = end - 1;
     }

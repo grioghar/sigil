@@ -87,6 +87,18 @@ class TestTasksProgram(unittest.TestCase):
         self.assertIn("1 [x] write the parser", out.getvalue())
         self.assertIn("2 [ ] prove the contracts", out.getvalue())
 
+    def test_program_is_fully_proven(self):
+        # The flagship claim: every contract and invariant in the first real
+        # Sigil program is a compile-time theorem — zero obligations remain.
+        from sigil.verify import HAVE_Z3, verify
+        if not HAVE_Z3:
+            self.skipTest("z3-solver not installed")
+        program = load_program(str(APP))
+        check(program)
+        report = verify(program)
+        unproven = [f for f in report.findings if not f.proven]
+        self.assertEqual(unproven, [])
+
     @unittest.skipUnless(HAVE_RUSTC, "rustc not installed")
     def test_native_matches_interpreter(self):
         with tempfile.TemporaryDirectory() as tmp:
