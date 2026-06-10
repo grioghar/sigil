@@ -1,6 +1,5 @@
 // The classic, the Sigil way: main receives the Console capability from the
 // runtime and threads it explicitly to anything that needs to write.
-
 fn main(console: Console) -> Unit ! {io.write} {
     greet(console, "world");
 }

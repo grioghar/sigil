@@ -4,7 +4,6 @@
 // or str()'d, because its concrete type is unknown inside the function. The
 // native backend monomorphizes: each instantiation compiles to its own
 // zero-overhead Rust function (first__Int, first__Text, ...).
-
 fn first[T](xs: List[T]) -> T
     requires len(xs) > 0
 {
@@ -33,9 +32,7 @@ fn main(console: Console) -> Unit ! {io.write} {
     let words: List[Text] = ["alpha", "beta", "gamma"];
     print(console, "first: " + str(first(nums)) + " / " + first(words));
     print(console, "second: " + str(second(nums)) + " / " + second(words));
-
     // Nested instantiation: T = List[Int].
     let grid: List[List[Int]] = [nums, [7]];
-    print(console, "rows: " + str(len(grid)) + ", first row ends in "
-        + str(first(grid)[2]));
+    print(console, "rows: " + str(len(grid)) + ", first row ends in " + str(first(grid)[2]));
 }

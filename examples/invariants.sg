@@ -2,9 +2,8 @@
 // preserves; the verifier proves it on entry and across an arbitrary
 // iteration, then gets to assume it after the loop — which is what makes
 // loop-carried ensures clauses provable. Try:
-//     python -m sigil verify examples/invariants.sg
+// python -m sigil verify examples/invariants.sg
 // Every clause below is PROVED, so the native build carries no runtime checks.
-
 fn total(n: Int) -> Int
     requires n >= 0
     ensures result >= 0

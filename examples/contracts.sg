@@ -1,6 +1,5 @@
 // Contracts with blame. safe_div states its bargain in the signature;
 // fib's ensures clause documents (and enforces) non-negativity.
-
 fn safe_div(a: Int, b: Int) -> Int
     requires b != 0
 {

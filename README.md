@@ -46,6 +46,12 @@ python -m sigil verify examples\contracts.sg   # prove contracts with Z3
 python -m sigil build examples\hello.sg        # native executable via rustc
 .\hello.exe
 
+python -m sigil fmt --check examples\hello.sg  # THE one canonical rendering
+python -m sigil ast examples\hello.sg          # typed AST as JSON, stable ids
+python -m sigil sdiff old.sg new.sg            # semantic diff (rename-aware)
+python -m sigil serve                          # JSON query API for tools/LLMs
+python -m sigil query '{\"method\": \"obligations\", \"source\": \"...\"}'
+
 # These two are SUPPOSED to fail — rejected programs are the product:
 python -m sigil check examples\bad_sandbox.sg
 python -m sigil check examples\bad_capability.sg
@@ -74,6 +80,8 @@ python -m unittest discover -s tests
 | [sigil/checker.py](sigil/checker.py) | type / effect / capability / contract checker |
 | [sigil/interp.py](sigil/interp.py) | tree-walking interpreter with runtime contracts |
 | [sigil/verify.py](sigil/verify.py) | static contract verifier (Z3 symbolic execution) |
+| [sigil/canon.py](sigil/canon.py) | canonical formatter, AST JSON with stable ids, semantic diff |
+| [sigil/server.py](sigil/server.py) | compiler-as-a-service JSON API (`serve`/`query`) |
 | [sigil/emit_rust.py](sigil/emit_rust.py) | native backend: checked AST → Rust source |
 | [sigil/build.py](sigil/build.py) | build driver: emit + `rustc -O` → executable |
 | [examples/](examples/) | demo programs, good and (deliberately) bad |

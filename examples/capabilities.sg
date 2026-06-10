@@ -1,8 +1,7 @@
 // Capability threading across a small program: main holds Console and Fs,
 // and hands each helper exactly the authority it needs — no more.
 // audit_summary gets NO capabilities, so it provably cannot leak its input.
-
-fn main(console: Console, fs: Fs) -> Unit ! {io.write, fs.write, fs.read} {
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.write} {
     let report: Text = audit_summary([3, 1, 4, 1, 5, 9, 2, 6]);
     save(fs, "report.txt", report);
     let back: Text = read_file(fs, "report.txt");

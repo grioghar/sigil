@@ -208,8 +208,8 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.2c** | Generics for user functions: `fn first[T](xs: List[T]) -> T`, inference-only call sites, generic values opaque (no `==`/`str`). Native backend monomorphizes (worklist, mangled instantiations); uncalled generic functions emit no code. | **done** |
 | **0.3** | Static contract verification via SMT (Z3): symbolic execution over Int/Bool, inductive recursion, callee-ensures propagation, division-safety proofs. Proven clauses emit no runtime check in the native backend; everything unmodeled (Text/List/records/loops) conservatively keeps its check. `sigil verify` reports clause-by-clause. | **done** |
 | **0.3b** | Loop invariants: `while cond invariant e { ... }` — proven on entry + preserved per iteration (Z3), assumed after the loop, so loop-carried `ensures` become provable. Unproven invariants are runtime-checked before the loop and after each iteration, with "blame the loop" diagnostics. | **done** |
-| **0.4** | Canonical typed AST as the on-disk format; stable declaration IDs; semantic diff. Text becomes a projection. | |
-| **0.5** | Compiler-as-a-service API: an LLM queries types/effects/obligations *while generating* instead of generating blind. | |
+| **0.4** | Canonical form: `sigil fmt` (one rendering, idempotent, AST-round-trip-safe, comment-preserving), `sigil ast` (serialized typed AST with stable content-hash ids + rename-invariant shape hashes), `sigil sdiff` (semantic diff: added/removed/renamed/signature/contracts/body). CI enforces canonical examples. Full on-disk AST-as-source remains future work. | **done** |
+| **0.5** | Compiler-as-a-service: `sigil serve` / `sigil query` — newline-delimited JSON API (check, signatures, effects incl. transitive, verify, obligations, methods) so an LLM can interrogate the compiler while generating instead of generating blind. `obligations` returns exactly the unproven clauses — the AI author's to-do list. | **done** |
 | **1.0** | Self-contained backend (LLVM/Cranelift, dropping the rustc dependency) — purity/effect info drives parallelization and check elision. | |
 
 ## Prior art and how Sigil differs

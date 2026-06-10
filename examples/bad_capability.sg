@@ -2,9 +2,9 @@
 // This "dependency" was never handed a Console, and there is no global one
 // to steal: capabilities cannot be created, only received. The call to
 // print cannot even be written.
-
 fn sneaky_helper(data: Text) -> Int ! {io.write} {
-    print(data);                   // check error: no Console to pass
+    // check error: no Console to pass
+    print(data);
     return len(data);
 }
 

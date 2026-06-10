@@ -2,11 +2,9 @@
 // read_only() strips write access; subdir() jails all paths under a prefix.
 // The plugin cannot write, cannot read outside its jail, and cannot escape
 // with ".." — the capability itself enforces its own scope.
-
-fn main(console: Console, fs: Fs) -> Unit ! {io.write, fs.read, fs.write} {
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.write} {
     write_file(fs, "sandbox/data.txt", "the answer is 42");
     write_file(fs, "secrets.txt", "hunter2");
-
     // The plugin gets a capability that can only read inside sandbox/.
     let plugin_fs: Fs = read_only(subdir(fs, "sandbox"));
     print(console, plugin(plugin_fs));
