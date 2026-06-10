@@ -4,6 +4,9 @@
     python -m sigil run <file.sg>      check, then execute main (interpreter)
     python -m sigil verify <file.sg>   prove contracts statically (needs z3)
     python -m sigil build <file.sg>    compile to a native executable
+    python -m sigil serve              JSON query API over stdio (one
+                                       request per line, one response per line)
+    python -m sigil query "<json>"     answer a single JSON request and exit
 """
 
 import argparse
@@ -33,7 +36,19 @@ def main(argv: list[str] | None = None) -> int:
                            help="skip rustc optimizations (faster builds)")
     build_cmd.add_argument("--no-verify", action="store_true",
                            help="skip static verification; keep all runtime checks")
+    sub.add_parser("serve", help="newline-delimited JSON query API over stdio")
+    query_cmd = sub.add_parser("query", help="answer one JSON request and exit")
+    query_cmd.add_argument("request",
+                           help='a JSON object, e.g. {"method": "methods"}')
     args = cli.parse_args(argv)
+
+    if args.command == "serve":
+        from .server import serve
+        return serve()
+
+    if args.command == "query":
+        from .server import query_once
+        return query_once(args.request)
 
     if args.command == "build":
         from .build import build
