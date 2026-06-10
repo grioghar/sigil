@@ -170,8 +170,15 @@ class Parser:
         if tok.kind == "while":
             self.advance()
             cond = self.parse_expr()
+            invariants: list[A.Contract] = []
+            while self.at("invariant"):
+                kw = self.advance()
+                start_tok = self.cur
+                expr = self.parse_expr()
+                src = self.source[start_tok.pos:self.prev.end]
+                invariants.append(A.Contract(kw.kind, expr, src, kw.line, kw.col))
             body = self.parse_block()
-            return A.While(tok.line, tok.col, cond, body)
+            return A.While(tok.line, tok.col, cond, body, invariants)
 
         # assignment or expression statement
         if tok.kind == "IDENT" and self.tokens[self.i + 1].kind == "=":

@@ -157,6 +157,7 @@ class If(Stmt):
 class While(Stmt):
     cond: Expr = None
     body: list[Stmt] = field(default_factory=list)
+    invariants: list["Contract"] = field(default_factory=list)
 
 
 @dataclass
@@ -168,14 +169,16 @@ class ExprStmt(Stmt):
 
 @dataclass
 class Contract:
-    kind: str          # 'requires' | 'ensures'
+    kind: str          # 'requires' | 'ensures' | 'invariant'
     expr: Expr = None
     source: str = ""   # exact source text of the clause, for blame messages
     line: int = 0
     col: int = 0
     # Set by the verifier: a proven clause needs no runtime check. For
     # 'ensures' this means every return site satisfies it; for 'requires'
-    # it means every call site in the program provably satisfies it.
+    # it means every call site in the program provably satisfies it; for
+    # 'invariant' it means the clause holds on loop entry and every
+    # iteration of the body preserves it.
     proven: bool = False
 
 

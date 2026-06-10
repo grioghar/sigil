@@ -230,6 +230,7 @@ class RustEmitter:
         self.program = program
         self.lines: list[str] = []
         self.depth = 0
+        self.fn_name = ""  # for blame in loop invariant messages
 
     # ------------------------------------------------------------ output
 
@@ -298,6 +299,7 @@ class RustEmitter:
     # ------------------------------------------------------------ functions
 
     def emit_fn(self, fn: A.FnDecl) -> None:
+        self.fn_name = fn.name
         params = ", ".join(f"s_{name}: {rust_type(ty)}" for name, ty in fn.params)
         ret = rust_type(fn.ret)
         self.emit_line(f"fn s_{fn.name}({params}) -> {ret} {{")
@@ -356,9 +358,24 @@ class RustEmitter:
         elif isinstance(stmt, A.If):
             self.emit_if(stmt)
         elif isinstance(stmt, A.While):
+            # Unproven invariants keep their runtime checks at every loop
+            # head: once before the loop, once at the end of each iteration.
+            checks = []
+            for inv in stmt.invariants:
+                if inv.proven:
+                    continue
+                cond = self.expr(inv.expr)
+                msg = (f"invariant of while loop in '{self.fn_name}' failed: "
+                       f"`{inv.source}` — blame the loop")
+                checks.append(
+                    f"if !({cond}) {{ rt_contract_fail({rust_string(msg)}); }}")
+            for check in checks:
+                self.emit_line(check)
             self.emit_line(f"while {self.expr(stmt.cond)} {{")
             self.depth += 1
             self.emit_block(stmt.body)
+            for check in checks:
+                self.emit_line(check)
             self.depth -= 1
             self.emit_line("}")
         elif isinstance(stmt, A.ExprStmt):
@@ -391,6 +408,7 @@ class RustEmitter:
         # Simplest correct approach: emit the nested if into a sub-emitter.
         sub = RustEmitter(self.program)
         sub.depth = self.depth
+        sub.fn_name = self.fn_name
         sub.emit_if(stmt)
         rendered = "\n".join(sub.lines)
         # Strip the indentation of the first line; it is glued after "} else ".

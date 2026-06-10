@@ -1,17 +1,18 @@
 """Static contract verification for Sigil via Z3 (roadmap 0.3).
 
 The verifier symbolically executes each function over Int/Bool values and
-tries to discharge three kinds of obligations:
+tries to discharge four kinds of obligations:
 
   * every `requires` clause at every call site (caller obligations)
   * every `ensures` clause at every return site (callee obligations)
+  * every loop `invariant` on entry and across an arbitrary iteration (0.3b)
   * every division/modulo having a nonzero divisor
 
 Proven obligations are stamped onto the AST (Contract.proven, Binary.div_safe)
 and the native backend then emits NO runtime check for them — safety pays for
 speed. Everything the engine cannot model (Text, List, records, capabilities,
-loop-carried state) becomes an opaque unknown, so failure to prove is always
-conservative: the runtime check simply stays.
+loop-carried state not captured by an invariant) becomes an opaque unknown, so
+failure to prove is always conservative: the runtime check simply stays.
 
 Recursion is handled inductively: while proving f's ensures, recursive calls
 to f may assume f's ensures (standard partial-correctness reasoning).
@@ -36,10 +37,13 @@ SOLVER_TIMEOUT_MS = 2000
 @dataclass
 class Finding:
     fn: str
-    kind: str      # 'requires' | 'ensures' | 'division'
+    kind: str      # 'requires' | 'ensures' | 'invariant' | 'division'
     source: str
     proven: bool
     line: int
+
+
+CONTRACT_KINDS = ("requires", "ensures", "invariant")
 
 
 @dataclass
@@ -49,11 +53,11 @@ class Report:
     @property
     def contracts_proven(self) -> int:
         return sum(1 for f in self.findings
-                   if f.proven and f.kind in ("requires", "ensures"))
+                   if f.proven and f.kind in CONTRACT_KINDS)
 
     @property
     def contracts_total(self) -> int:
-        return sum(1 for f in self.findings if f.kind in ("requires", "ensures"))
+        return sum(1 for f in self.findings if f.kind in CONTRACT_KINDS)
 
     @property
     def divisions_proven(self) -> int:
@@ -98,6 +102,7 @@ class Verifier:
         # (fn name, requires clause index) -> any call site seen at all
         self.requires_called: set[tuple[str, int]] = set()
         self.div_findings: list[Finding] = []
+        self.inv_findings: list[Finding] = []
         self.current_fn: str = ""
 
     # ------------------------------------------------------------ utilities
@@ -157,6 +162,7 @@ class Verifier:
                                         proven, contract.line))
                 req_idx += 1
 
+        findings.extend(self.inv_findings)
         findings.extend(self.div_findings)
         return Report(findings)
 
@@ -272,20 +278,50 @@ class Verifier:
         state.path = merged_path
 
     def exec_while(self, stmt: A.While, state: State) -> None:
-        # No loop invariants yet (roadmap): havoc everything the loop body
-        # assigns, verify the body for an arbitrary iteration, and continue
-        # afterward knowing only that the condition is now false.
+        # Loop invariants (0.3b), classic inductive recipe. ENTRY: each
+        # invariant must hold in the state that first reaches the loop.
+        entry_ok: list[bool] = []
+        for inv in stmt.invariants:
+            value = self.translate(inv.expr, state)
+            entry_ok.append(is_z3(value) and self.prove(state, value))
+
+        # Havoc everything the body assigns: from here on the state models
+        # an arbitrary iteration, about which only the invariants are known.
         for name in self.collect_assigned(stmt.body):
             if name in state.vars:
                 state.vars[name] = self.havoc_like(state.vars[name])
 
         cond = self.translate(stmt.cond, state)
+        inv_values = [self.translate(inv.expr, state) for inv in stmt.invariants]
 
+        # The body may assume the invariants and the condition.
         body_state = state.clone()
+        for value in inv_values:
+            if is_z3(value):
+                body_state.path.append(value)
         if is_z3(cond):
             body_state.path.append(cond)
         self.exec_block(stmt.body, body_state)
 
+        # PRESERVATION: an arbitrary iteration must re-establish each
+        # invariant. A body that never falls off the end (every path
+        # returns) preserves vacuously — no next loop head is reached.
+        for ok, inv in zip(entry_ok, stmt.invariants):
+            proven = ok
+            if proven and body_state.alive:
+                value = self.translate(inv.expr, body_state)
+                proven = is_z3(value) and self.prove(body_state, value)
+            inv.proven = proven
+            self.inv_findings.append(Finding(
+                self.current_fn, "invariant", inv.source, proven, inv.line))
+
+        # POST-LOOP: the invariants hold (statically proven, or enforced by
+        # the runtime checks an unproven clause keeps — execution only gets
+        # here if they held) and the condition is now false. This is what
+        # makes loop-carried ensures provable.
+        for value in inv_values:
+            if is_z3(value):
+                state.path.append(value)
         if is_z3(cond):
             state.path.append(z3.Not(cond))
 

@@ -1,8 +1,9 @@
 """Tree-walking interpreter for Sigil v0.1.
 
 Runs only checked programs. Contracts are enforced at runtime with blame:
-a failed `requires` blames the caller, a failed `ensures` blames the callee.
-Capabilities are unforgeable runtime objects injected only into main.
+a failed `requires` blames the caller, a failed `ensures` blames the callee,
+and a failed loop `invariant` blames the loop itself. Capabilities are
+unforgeable runtime objects injected only into main.
 """
 
 import os
@@ -62,8 +63,9 @@ class _ReturnSignal(Exception):
 class Frame:
     """One function activation: a stack of block scopes."""
 
-    def __init__(self, initial: dict[str, Any]):
+    def __init__(self, initial: dict[str, Any], fn_name: str = ""):
         self.scopes: list[dict[str, Any]] = [initial]
+        self.fn_name = fn_name  # for blame in loop invariant violations
 
     def push(self) -> None:
         self.scopes.append({})
@@ -123,7 +125,8 @@ class Interpreter:
             return builtin(args, line, col)
 
         fn = self.functions[name]
-        frame = Frame({pname: value for (pname, _), value in zip(fn.params, args)})
+        frame = Frame({pname: value for (pname, _), value in zip(fn.params, args)},
+                      fn.name)
 
         for contract in fn.contracts:
             if contract.kind != "requires":
@@ -179,13 +182,25 @@ class Interpreter:
             elif stmt.else_body is not None:
                 self.exec_block(stmt.else_body, frame)
         elif isinstance(stmt, A.While):
+            # Reference semantics: invariants hold at every loop head — once
+            # before the first iteration and again after each body execution.
+            self.check_invariants(stmt, frame)
             while self.eval(stmt.cond, frame):
                 self.exec_block(stmt.body, frame)
+                self.check_invariants(stmt, frame)
         elif isinstance(stmt, A.ExprStmt):
             self.eval(stmt.expr, frame)
         else:
             raise RuntimeFault(f"unhandled statement {type(stmt).__name__}",
                                stmt.line, stmt.col)
+
+    def check_invariants(self, stmt: A.While, frame: Frame) -> None:
+        for inv in stmt.invariants:
+            if not self.eval(inv.expr, frame):
+                raise ContractViolation(
+                    f"invariant of while loop in '{frame.fn_name}' failed: "
+                    f"`{inv.source}` — blame the loop (line {stmt.line})",
+                    inv.line, inv.col, blame="loop")
 
     # ------------------------------------------------------------ expressions
 

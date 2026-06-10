@@ -294,6 +294,13 @@ class Checker:
             if ctype != A.BOOL:
                 raise CheckError(f"while condition must be Bool, got {ctype}",
                                  stmt.line, stmt.col)
+            # Invariants see the enclosing scope at the loop, not the body's.
+            for inv in stmt.invariants:
+                itype = self.check_expr(inv.expr, scope, fn, in_contract=True)
+                if itype != A.BOOL:
+                    raise CheckError(
+                        f"invariant clause must be Bool, got {itype}",
+                        inv.line, inv.col)
             self.check_block(stmt.body, Scope(scope), fn)
             return
 
