@@ -353,3 +353,13 @@ class _Rewriter:
         elif isinstance(expr, A.ListLit):
             for item in expr.items:
                 self.rewrite_expr(item)
+        elif isinstance(expr, A.FieldAccess):
+            self.rewrite_expr(expr.base)
+        elif isinstance(expr, A.IfExpr):
+            self.rewrite_expr(expr.cond)
+            self.rewrite_expr(expr.then_expr)
+            self.rewrite_expr(expr.else_expr)
+        elif isinstance(expr, A.RecordUpdate):
+            self.rewrite_expr(expr.base)
+            for _, fexpr in expr.fields:
+                self.rewrite_expr(fexpr)

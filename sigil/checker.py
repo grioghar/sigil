@@ -632,6 +632,63 @@ class Checker:
                         f"got {atype}", fexpr.line, fexpr.col)
             return A.Type("Record", name=expr.name)
 
+        if isinstance(expr, A.IfExpr):
+            ctype = self.check_expr(expr.cond, scope, fn, in_contract)
+            if ctype != A.BOOL:
+                raise CheckError(
+                    f"if-expression condition must be Bool, got {ctype}",
+                    expr.line, expr.col)
+            ttype = self.check_expr(expr.then_expr, scope, fn, in_contract)
+            etype = self.check_expr(expr.else_expr, scope, fn, in_contract)
+            if not (A.compatible(ttype, etype) or A.compatible(etype, ttype)):
+                raise CheckError(
+                    f"if-expression branches must produce one type; got "
+                    f"{ttype} and {etype}", expr.line, expr.col)
+            # Prefer the more specific branch type (a List with a known
+            # element type beats an empty list literal's List[None]).
+            merged = self.merge_binding(ttype, etype)
+            return merged if merged is not None else ttype
+
+        if isinstance(expr, A.RecordUpdate):
+            btype = self.check_expr(expr.base, scope, fn, in_contract)
+            if btype.kind != "Record":
+                raise CheckError(
+                    f"'with' updates a record value; got {btype}",
+                    expr.line, expr.col)
+            rec = self.records[btype.name]
+            if not expr.fields:
+                raise CheckError(
+                    f"a 'with' update must change at least one field of "
+                    f"'{btype.name}'", expr.line, expr.col)
+            declared = [fname for fname, _ in rec.fields]
+            seen: set[str] = set()
+            for fname, fexpr in expr.fields:
+                if fname not in declared:
+                    raise CheckError(
+                        f"record '{btype.name}' has no field '{fname}' "
+                        f"(fields: {', '.join(declared)})",
+                        fexpr.line, fexpr.col)
+                if fname in seen:
+                    raise CheckError(
+                        f"duplicate field '{fname}' in 'with' update",
+                        fexpr.line, fexpr.col)
+                seen.add(fname)
+            written = [fname for fname, _ in expr.fields]
+            in_order = [fname for fname in declared if fname in seen]
+            if written != in_order:
+                raise CheckError(
+                    f"'with' update must list fields in declaration order: "
+                    f"{', '.join(in_order)} (got: {', '.join(written)})",
+                    expr.line, expr.col)
+            ftype_of = dict(rec.fields)
+            for fname, fexpr in expr.fields:
+                atype = self.check_expr(fexpr, scope, fn, in_contract)
+                if not A.compatible(ftype_of[fname], atype):
+                    raise CheckError(
+                        f"field '{fname}' of '{btype.name}' needs "
+                        f"{ftype_of[fname]}, got {atype}", fexpr.line, fexpr.col)
+            return btype
+
         if isinstance(expr, A.FieldAccess):
             btype = self.check_expr(expr.base, scope, fn, in_contract)
             if btype.kind != "Record":

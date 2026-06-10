@@ -203,6 +203,14 @@ def _called_names(stmts: list[A.Stmt]) -> set[str]:
         elif isinstance(expr, A.RecordLit):
             for _, fexpr in expr.fields:
                 walk_expr(fexpr)
+        elif isinstance(expr, A.IfExpr):
+            walk_expr(expr.cond)
+            walk_expr(expr.then_expr)
+            walk_expr(expr.else_expr)
+        elif isinstance(expr, A.RecordUpdate):
+            walk_expr(expr.base)
+            for _, fexpr in expr.fields:
+                walk_expr(fexpr)
 
     def walk_stmt(stmt: A.Stmt) -> None:
         if isinstance(stmt, (A.Let, A.Assign)):

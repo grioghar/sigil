@@ -456,6 +456,15 @@ class Verifier:
             return self.translate_binary(expr, state)
         if isinstance(expr, A.Call):
             return self.translate_call(expr, state)
+        if isinstance(expr, A.IfExpr):
+            return self.translate_if_expr(expr, state)
+        if isinstance(expr, A.RecordUpdate):
+            # Records are structurally unmodeled; base and field expressions
+            # are still translated so their nested obligations are recorded.
+            self.translate(expr.base, state)
+            for _, fexpr in expr.fields:
+                self.translate(fexpr, state)
+            return Opaque()
         # Record literals, field access: structure not modeled.
         for child in self.subexprs(expr):
             self.translate(child, state)  # still record nested obligations
@@ -486,6 +495,40 @@ class Verifier:
         for fact in appended:
             state.path.append(z3.Implies(guard, fact))
         return value
+
+    def translate_if_expr(self, expr: A.IfExpr, state: State):
+        """`if cond then a else b`: each branch only runs when its side of
+        the condition holds, so branch facts are implication-guarded exactly
+        like short-circuit operands. With a modeled condition the branch
+        values merge as z3.If (or by length for sized opaques) — the
+        expression-level mirror of exec_if's variable merge."""
+        cond = self.translate(expr.cond, state)
+        if not is_z3(cond):
+            # The condition is unmodeled, so neither branch's facts may be
+            # kept unconditionally. Guarding with a FRESH unconstrained
+            # boolean is sound: an implication from a free literal can never
+            # strengthen the path (the solver may always pick it false), so
+            # the appended facts are effectively discarded while the
+            # branches' obligations (requires, divisions) are still recorded.
+            guard = self.fresh_bool()
+            self.translate_guarded(expr.then_expr, state, guard)
+            self.translate_guarded(expr.else_expr, state, z3.Not(guard))
+            return self.fresh_by_type(getattr(expr, "ty", None), state)
+
+        then_val = self.translate_guarded(expr.then_expr, state, cond)
+        else_val = self.translate_guarded(expr.else_expr, state, z3.Not(cond))
+        if is_z3(then_val) and is_z3(else_val) \
+                and then_val.sort() == else_val.sort():
+            return z3.If(cond, then_val, else_val)
+        tlen = self.length_of(then_val)
+        elen = self.length_of(else_val)
+        if tlen is not None and elen is not None:
+            # Sized values merge by length: the structure is unknown but the
+            # length is exactly one of the two.
+            merged = self.fresh_sized(state)
+            state.path.append(merged.length == z3.If(cond, tlen, elen))
+            return merged
+        return self.fresh_by_type(getattr(expr, "ty", None), state)
 
     def translate_binary(self, expr: A.Binary, state: State):
         op = expr.op
