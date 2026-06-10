@@ -13,14 +13,15 @@ from typing import Optional, Union
 
 @dataclass(frozen=True)
 class Type:
-    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List | Record
+    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List | Record | Var
     elem: Optional["Type"] = None  # element type when kind == 'List'; None = unknown
-    name: Optional[str] = None     # record name when kind == 'Record'
+    name: Optional[str] = None     # record name when kind == 'Record'; type
+                                   # parameter name when kind == 'Var'
 
     def __str__(self) -> str:
         if self.kind == "List":
             return f"List[{self.elem if self.elem is not None else '?'}]"
-        if self.kind == "Record":
+        if self.kind in ("Record", "Var"):
             return self.name
         return self.kind
 
@@ -44,9 +45,28 @@ def compatible(expected: Type, actual: Type) -> bool:
         if expected.elem is None or actual.elem is None:
             return True
         return compatible(expected.elem, actual.elem)
-    if expected.kind == "Record":
+    if expected.kind in ("Record", "Var"):
         return expected.name == actual.name
     return True
+
+
+def contains_var(ty: Type) -> bool:
+    """True when a type mentions a type variable anywhere (recursively)."""
+    if ty.kind == "Var":
+        return True
+    if ty.kind == "List":
+        return ty.elem is not None and contains_var(ty.elem)
+    return False
+
+
+def substitute(ty: Type, bindings: dict[str, Type]) -> Type:
+    """Replace type variables with their bindings, recursively through List.
+    Variables without a binding are left in place."""
+    if ty.kind == "Var":
+        return bindings.get(ty.name, ty)
+    if ty.kind == "List" and ty.elem is not None:
+        return Type("List", substitute(ty.elem, bindings))
+    return ty
 
 
 # ---------------------------------------------------------------- expressions
@@ -192,6 +212,7 @@ class FnDecl:
     body: list[Stmt]
     line: int = 0
     col: int = 0
+    type_params: list[str] = field(default_factory=list)  # generic functions
 
 
 @dataclass

@@ -76,6 +76,15 @@ class Parser:
     def parse_fn(self) -> A.FnDecl:
         start = self.expect("fn", "'fn' to start a declaration")
         name = self.expect("IDENT", "function name").value
+        # Optional type parameters: fn first[T](xs: List[T]) -> T. There is no
+        # call-site instantiation syntax; types are inferred from arguments.
+        type_params: list[str] = []
+        if self.match("["):
+            while True:
+                type_params.append(self.expect("IDENT", "type parameter name").value)
+                if not self.match(","):
+                    break
+            self.expect("]")
         self.expect("(")
         params: list[tuple[str, A.Type]] = []
         if not self.at(")"):
@@ -108,7 +117,7 @@ class Parser:
 
         body = self.parse_block()
         return A.FnDecl(name, params, ret, frozenset(effects), contracts, body,
-                        start.line, start.col)
+                        start.line, start.col, type_params)
 
     def parse_effect_name(self) -> str:
         first = self.expect("IDENT", "effect name (e.g. io.write)").value
