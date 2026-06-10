@@ -24,16 +24,21 @@ fn main(console: Console) -> Unit ! {io.write} {
    mints a strictly weaker one to hand to code you trust less.
 2. **Effects in the type** — every function declares what it may do (`! {io.write}`);
    undeclared effects are compile errors, and no annotation means provably pure.
-3. **Contracts with blame** — `requires`/`ensures` are part of the signature;
-   violations name the guilty party (caller vs. callee).
+3. **Contracts with blame, proven where possible** — `requires`/`ensures` are
+   part of the signature; violations name the guilty party (caller vs. callee).
+   With `z3-solver` installed, `sigil verify` proves clauses statically
+   (recursion handled inductively) and `sigil build` erases every proven
+   runtime check from the binary. Unproven clauses conservatively stay.
 
 ## Quickstart
 
-Requires Python 3.12+ (no dependencies). `sigil build` additionally needs
-Rust (`rustup.rs`).
+Requires Python 3.12+. `sigil build` needs Rust (`rustup.rs`); the static
+verifier needs `pip install z3-solver` (optional — without it, all contract
+checks simply stay at runtime).
 
 ```
 python -m sigil run examples\hello.sg          # interpreter (reference semantics)
+python -m sigil verify examples\contracts.sg   # prove contracts with Z3
 python -m sigil build examples\hello.sg        # native executable via rustc
 .\hello.exe
 
@@ -64,6 +69,7 @@ python -m unittest discover -s tests
 | [sigil/ast_nodes.py](sigil/ast_nodes.py) | AST + type definitions |
 | [sigil/checker.py](sigil/checker.py) | type / effect / capability / contract checker |
 | [sigil/interp.py](sigil/interp.py) | tree-walking interpreter with runtime contracts |
+| [sigil/verify.py](sigil/verify.py) | static contract verifier (Z3 symbolic execution) |
 | [sigil/emit_rust.py](sigil/emit_rust.py) | native backend: checked AST → Rust source |
 | [sigil/build.py](sigil/build.py) | build driver: emit + `rustc -O` → executable |
 | [examples/](examples/) | demo programs, good and (deliberately) bad |

@@ -304,7 +304,7 @@ class RustEmitter:
         self.depth += 1
 
         for contract in fn.contracts:
-            if contract.kind != "requires":
+            if contract.kind != "requires" or contract.proven:
                 continue
             cond = self.expr(contract.expr)
             msg = (f"requires clause of '{fn.name}' failed: "
@@ -324,6 +324,8 @@ class RustEmitter:
         self.emit_line("})();")
 
         for contract in ensures:
+            if contract.proven:
+                continue
             cond = self.expr(contract.expr)
             msg = (f"ensures clause of '{fn.name}' failed: "
                    f"`{contract.source}` — blame the CALLEE '{fn.name}'")
@@ -442,8 +444,12 @@ class RustEmitter:
                 return f'format!("{{}}{{}}", {left}, {right})'
             return f"({left} + {right})"
         if op == "/":
+            if getattr(expr, "div_safe", False):  # divisor proven nonzero
+                return f"({left} / {right})"
             return f"rt_div({left}, {right})"
         if op == "%":
+            if getattr(expr, "div_safe", False):
+                return f"({left} % {right})"
             return f"rt_mod({left}, {right})"
         return f"({left} {op} {right})"
 

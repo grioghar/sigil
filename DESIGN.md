@@ -176,7 +176,8 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.2a** | Capability *attenuation*: `read_only(fs)`, path-scoped `subdir(fs, p)`; pure, monotonic, enforced by the capability value in both backends. | **done** |
 | **0.2b** | Records: immutable product types, canonical field order, capability-aware equality, recursion via List. Compile to plain Rust structs. | **done** |
 | **0.2c** | Generics for user functions. | |
-| **0.3** | Static contract verification via SMT (Z3); proven contracts erase their runtime checks — in the native backend that means the emitted branches disappear. | |
+| **0.3** | Static contract verification via SMT (Z3): symbolic execution over Int/Bool, inductive recursion, callee-ensures propagation, division-safety proofs. Proven clauses emit no runtime check in the native backend; everything unmodeled (Text/List/records/loops) conservatively keeps its check. `sigil verify` reports clause-by-clause. | **done** |
+| **0.3b** | Loop invariants (`invariant` clauses on while) so loop-carried contracts become provable. | |
 | **0.4** | Canonical typed AST as the on-disk format; stable declaration IDs; semantic diff. Text becomes a projection. | |
 | **0.5** | Compiler-as-a-service API: an LLM queries types/effects/obligations *while generating* instead of generating blind. | |
 | **1.0** | Self-contained backend (LLVM/Cranelift, dropping the rustc dependency) — purity/effect info drives parallelization and check elision. | |

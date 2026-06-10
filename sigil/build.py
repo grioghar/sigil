@@ -23,13 +23,26 @@ def find_rustc() -> str:
 
 
 def build(source_path: str, output: str | None = None,
-          emit_rust_path: str | None = None, optimize: bool = True) -> Path:
+          emit_rust_path: str | None = None, optimize: bool = True,
+          verify_contracts: bool = True, quiet: bool = False) -> Path:
     """Compile a .sg file to a native executable. Returns the binary path."""
     src_file = Path(source_path)
     source = src_file.read_text(encoding="utf-8")
 
     program = parse(source)
     check(program)  # stamps expression types the emitter needs
+
+    if verify_contracts:
+        from .verify import verify
+        report = verify(program)
+        if report is not None and not quiet:
+            print(f"verified: {report.contracts_proven}/{report.contracts_total} "
+                  f"contract checks and {report.divisions_proven}/"
+                  f"{report.divisions_total} division checks eliminated")
+        elif report is None and not quiet:
+            print("verifier unavailable (pip install z3-solver); "
+                  "keeping all runtime checks")
+
     rust_source = emit_rust(program)
 
     if output is None:

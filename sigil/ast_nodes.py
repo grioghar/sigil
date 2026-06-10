@@ -173,6 +173,10 @@ class Contract:
     source: str = ""   # exact source text of the clause, for blame messages
     line: int = 0
     col: int = 0
+    # Set by the verifier: a proven clause needs no runtime check. For
+    # 'ensures' this means every return site satisfies it; for 'requires'
+    # it means every call site in the program provably satisfies it.
+    proven: bool = False
 
 
 @dataclass
