@@ -7,6 +7,9 @@
     python -m sigil fmt <file.sg>      print the canonical rendering
     python -m sigil ast <file.sg>      print the serialized typed AST (JSON)
     python -m sigil sdiff <old> <new>  semantic diff between two programs
+    python -m sigil serve              JSON query API over stdio (one
+                                       request per line, one response per line)
+    python -m sigil query "<json>"     answer a single JSON request and exit
 """
 
 import argparse
@@ -48,7 +51,19 @@ def main(argv: list[str] | None = None) -> int:
     sdiff_cmd = sub.add_parser("sdiff", help="semantic diff between two programs")
     sdiff_cmd.add_argument("old")
     sdiff_cmd.add_argument("new")
+    sub.add_parser("serve", help="newline-delimited JSON query API over stdio")
+    query_cmd = sub.add_parser("query", help="answer one JSON request and exit")
+    query_cmd.add_argument("request",
+                           help='a JSON object, e.g. {"method": "methods"}')
     args = cli.parse_args(argv)
+
+    if args.command == "serve":
+        from .server import serve
+        return serve()
+
+    if args.command == "query":
+        from .server import query_once
+        return query_once(args.request)
 
     if args.command == "fmt":
         from .canon import format_source
