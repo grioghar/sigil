@@ -60,6 +60,12 @@ class _ReturnSignal(Exception):
         self.value = value
 
 
+class _BreakSignal(Exception):
+    """Raised by a `break` statement; caught by the innermost While handler.
+    Block scopes pop on the way out via exec_block's try/finally, exactly
+    like _ReturnSignal."""
+
+
 class Frame:
     """One function activation: a stack of block scopes."""
 
@@ -183,11 +189,17 @@ class Interpreter:
                 self.exec_block(stmt.else_body, frame)
         elif isinstance(stmt, A.While):
             # Reference semantics: invariants hold at every loop head — once
-            # before the first iteration and again after each body execution.
+            # before the first iteration and again after each body execution —
+            # and at every exit, so a break re-checks them on the way out.
             self.check_invariants(stmt, frame)
-            while self.eval(stmt.cond, frame):
-                self.exec_block(stmt.body, frame)
+            try:
+                while self.eval(stmt.cond, frame):
+                    self.exec_block(stmt.body, frame)
+                    self.check_invariants(stmt, frame)
+            except _BreakSignal:
                 self.check_invariants(stmt, frame)
+        elif isinstance(stmt, A.Break):
+            raise _BreakSignal()
         elif isinstance(stmt, A.Match):
             self.exec_match(stmt, frame)
         elif isinstance(stmt, A.ExprStmt):
@@ -381,6 +393,14 @@ class Interpreter:
     def builtin_push(self, args: list[Any], line: int, col: int) -> list:
         xs, x = args
         return xs + [x]
+
+    def builtin_set(self, args: list[Any], line: int, col: int) -> list:
+        xs, i, x = args
+        if i < 0 or i >= len(xs):
+            raise RuntimeFault(
+                f"set index {i} out of range for list of length {len(xs)}",
+                line, col)
+        return xs[:i] + [x] + xs[i + 1:]
 
     def builtin_slice(self, args: list[Any], line: int, col: int) -> str:
         s, start, end = args

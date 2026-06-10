@@ -7,7 +7,7 @@ from .errors import LexError
 
 KEYWORDS = {
     "fn", "record", "enum", "match", "let", "var", "return", "if", "else",
-    "while", "true", "false", "requires", "ensures", "invariant",
+    "while", "break", "true", "false", "requires", "ensures", "invariant",
     "and", "or", "not", "pub", "use", "as",
 }
 

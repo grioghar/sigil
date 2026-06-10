@@ -244,6 +244,11 @@ class Parser:
             self.expect(";")
             return A.Return(tok.line, tok.col, value)
 
+        if tok.kind == "break":
+            self.advance()
+            self.expect(";")
+            return A.Break(tok.line, tok.col)
+
         if tok.kind == "if":
             return self.parse_if()
 

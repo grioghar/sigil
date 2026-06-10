@@ -99,6 +99,18 @@ class State:
         return State(dict(self.vars), list(self.path))
 
 
+class LoopCtx:
+    """Verification context of one lexically enclosing while loop. A `break`
+    is a loop exit, so every break site is an additional proof obligation for
+    each invariant (ANDed into break_ok, like preservation); and a loop whose
+    body can break may NOT assume ¬cond after the loop."""
+
+    def __init__(self, invariants: list):
+        self.invariants = invariants
+        self.break_ok = [True] * len(invariants)
+        self.has_break = False
+
+
 def is_z3(value) -> bool:
     return HAVE_Z3 and isinstance(value, z3.ExprRef)
 
@@ -121,6 +133,8 @@ class Verifier:
         # marked proven if translating it bumped nothing: erasing a check
         # whose own evaluation could fault would silently mask that fault.
         self.partial_ops = 0
+        # Stack of enclosing loops; a Break statement targets the innermost.
+        self.loop_stack: list[LoopCtx] = []
 
     # ------------------------------------------------------------ utilities
 
@@ -262,10 +276,26 @@ class Verifier:
             self.exec_if(stmt, state)
         elif isinstance(stmt, A.While):
             self.exec_while(stmt, state)
+        elif isinstance(stmt, A.Break):
+            self.exec_break(state)
         elif isinstance(stmt, A.Match):
             self.exec_match(stmt, state)
         elif isinstance(stmt, A.ExprStmt):
             self.translate(stmt.expr, state)
+
+    def exec_break(self, state: State) -> None:
+        # A break exits the innermost loop, and invariants must hold at every
+        # loop exit: each invariant becomes an obligation HERE, exactly like
+        # preservation at the end of the body.
+        ctx = self.loop_stack[-1]
+        for idx, inv in enumerate(ctx.invariants):
+            mark = self.partial_ops
+            value = self.translate(inv.expr, state)
+            ok = (self.partial_ops == mark and is_z3(value)
+                  and self.prove(state, value))
+            ctx.break_ok[idx] = ctx.break_ok[idx] and ok
+        ctx.has_break = True
+        state.alive = False  # control leaves the body here
 
     def exec_match(self, stmt: A.Match, state: State) -> None:
         # Enum values are Opaque, so no arm can be ruled out: run every arm
@@ -380,13 +410,17 @@ class Verifier:
         body_state = state.clone()
         if is_z3(cond):
             body_state.path.append(cond)
+        ctx = LoopCtx(stmt.invariants)
+        self.loop_stack.append(ctx)
         self.exec_block(stmt.body, body_state)
+        self.loop_stack.pop()
 
         # PRESERVATION: an arbitrary iteration must re-establish each
         # invariant. A body that never falls off the end (every path
-        # returns) preserves vacuously — no next loop head is reached.
-        for ok, inv in zip(entry_ok, stmt.invariants):
-            proven = ok
+        # returns or breaks) preserves vacuously — no next loop head is
+        # reached. Break sites contributed their own obligations above.
+        for ok, inv, brk in zip(entry_ok, stmt.invariants, ctx.break_ok):
+            proven = ok and brk
             if proven and body_state.alive:
                 mark = self.partial_ops
                 value = self.translate(inv.expr, body_state)
@@ -397,9 +431,9 @@ class Verifier:
                 self.current_fn, "invariant", inv.source, proven, inv.line))
 
         # POST-LOOP: the invariants are already on the path (appended above);
-        # the condition is now false. This is what makes loop-carried
-        # ensures provable.
-        if is_z3(cond):
+        # the condition is false ONLY when no break exists in the body — a
+        # broken exit does not imply the condition turned false.
+        if is_z3(cond) and not ctx.has_break:
             state.path.append(z3.Not(cond))
 
     def collect_assigned(self, stmts: list[A.Stmt]) -> set[str]:
@@ -622,6 +656,18 @@ class Verifier:
             length = self.length_of(args[0])
             if length is not None:
                 return Opaque(length + 1)
+            return self.fresh_sized(state)
+
+        if name == "set":
+            xs, i, _x = args
+            self.partial_ops += 1
+            length = self.length_of(xs)
+            if length is not None and is_z3(i):
+                state.path.append(i >= 0)
+                state.path.append(i < length)
+                # The result is the input list with one element replaced:
+                # structure unknown, length EXACTLY that of the input.
+                return Opaque(length)
             return self.fresh_sized(state)
 
         if name == "str":

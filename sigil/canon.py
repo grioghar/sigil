@@ -242,6 +242,8 @@ class Renderer:
             if stmt.value is None:
                 return [f"{pad}return;"]
             return [f"{pad}return {self.render_expr(stmt.value)};"]
+        if isinstance(stmt, A.Break):
+            return [f"{pad}break;"]
         if isinstance(stmt, A.ExprStmt):
             return [f"{pad}{self.render_expr(stmt.expr)};"]
         if isinstance(stmt, A.If):

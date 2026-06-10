@@ -172,6 +172,16 @@ fn rt_push<T>(mut xs: Vec<T>, x: T) -> Vec<T> {
     xs
 }
 
+fn rt_set<T: Clone>(mut xs: Vec<T>, i: i64, x: T) -> Vec<T> {
+    if i < 0 || (i as usize) >= xs.len() {
+        rt_fault(&format!("set index {} out of range for list of length {}",
+                          i, xs.len()))
+    } else {
+        xs[i as usize] = x;
+        xs
+    }
+}
+
 fn rt_len_text(s: String) -> i64 {
     s.chars().count() as i64
 }
@@ -297,6 +307,9 @@ class RustEmitter:
         self.fn_decls = {fn.name: fn for fn in program.functions}
         self.instantiated: set[tuple[str, tuple[str, ...]]] = set()
         self.pending: list[tuple[A.FnDecl, dict[str, A.Type]]] = []
+        # Per enclosing loop, the rendered runtime checks of its UNPROVEN
+        # invariants: a `break` is a loop exit, so it re-emits them.
+        self.loop_checks: list[list[str]] = []
 
     # ------------------------------------------------------------ output
 
@@ -486,11 +499,20 @@ class RustEmitter:
                 self.emit_line(check)
             self.emit_line(f"while {self.expr(stmt.cond)} {{")
             self.depth += 1
+            self.loop_checks.append(checks)
             self.emit_block(stmt.body)
+            self.loop_checks.pop()
             for check in checks:
                 self.emit_line(check)
             self.depth -= 1
             self.emit_line("}")
+        elif isinstance(stmt, A.Break):
+            # Invariants hold at every loop exit, breaks included: unproven
+            # invariants of the innermost loop keep their runtime check here
+            # (proven ones emit nothing, as everywhere else).
+            for check in self.loop_checks[-1]:
+                self.emit_line(check)
+            self.emit_line("break;")
         elif isinstance(stmt, A.Match):
             self.emit_match(stmt)
         elif isinstance(stmt, A.ExprStmt):
@@ -555,6 +577,9 @@ class RustEmitter:
         sub.subst = self.subst
         sub.instantiated = self.instantiated
         sub.pending = self.pending
+        # Share the loop stack too: a break inside an else-if body must see
+        # the invariant checks of its enclosing loop.
+        sub.loop_checks = self.loop_checks
         sub.emit_if(stmt)
         rendered = "\n".join(sub.lines)
         # Strip the indentation of the first line; it is glued after "} else ".
@@ -647,6 +672,9 @@ class RustEmitter:
             return f"{helper}({self.expr(arg)})"
         if name == "push":
             return f"rt_push({self.expr(args[0])}, {self.expr(args[1])})"
+        if name == "set":
+            return (f"rt_set({self.expr(args[0])}, {self.expr(args[1])}, "
+                    f"{self.expr(args[2])})")
         if name in ("print", "read_line", "read_file", "write_file",
                     "file_exists", "read_only", "subdir", "slice", "ord", "chr"):
             rendered = ", ".join(self.expr(a) for a in args)

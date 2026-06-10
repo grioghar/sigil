@@ -182,6 +182,12 @@ class While(Stmt):
 
 
 @dataclass
+class Break(Stmt):
+    """Exit the innermost enclosing while loop (no labels). The loop's
+    invariants must hold at every exit, so a break is a check/proof site."""
+
+
+@dataclass
 class ExprStmt(Stmt):
     expr: Expr = None
 

@@ -55,13 +55,15 @@ BUILTINS: dict[str, FnSig] = {
                    A.TEXT, PURE),
     "ord": FnSig("ord", [("s", A.TEXT)], A.INT, PURE),
     "chr": FnSig("chr", [("n", A.INT)], A.TEXT, PURE),
-    # len / str / push are polymorphic and special-cased in check_call.
+    # len / str / push / set are polymorphic and special-cased in check_call.
     "len": FnSig("len", [("x", A.Type("List"))], A.INT, PURE),
     "str": FnSig("str", [("x", A.INT)], A.TEXT, PURE),
     "push": FnSig("push", [("xs", A.Type("List")), ("x", A.INT)], A.Type("List"), PURE),
+    "set": FnSig("set", [("xs", A.Type("List")), ("i", A.INT), ("x", A.INT)],
+                 A.Type("List"), PURE),
 }
 
-POLYMORPHIC = {"len", "str", "push"}
+POLYMORPHIC = {"len", "str", "push", "set"}
 
 
 @dataclass
@@ -103,6 +105,10 @@ class Checker:
         # variant name -> (enum name, payload types); variant names are
         # GLOBALLY unique, so a bare uppercase name resolves unambiguously.
         self.variants: dict[str, tuple[str, list[A.Type]]] = {}
+        # How many while loops enclose the statement being checked. `break`
+        # is legal only when this is positive; if/match arms inside a loop
+        # count as inside it.
+        self.loop_depth = 0
 
     # ------------------------------------------------------------ entry
 
@@ -488,7 +494,16 @@ class Checker:
                     raise CheckError(
                         f"invariant clause must be Bool, got {itype}",
                         inv.line, inv.col)
+            self.loop_depth += 1
             self.check_block(stmt.body, Scope(scope), fn)
+            self.loop_depth -= 1
+            return
+
+        if isinstance(stmt, A.Break):
+            if self.loop_depth == 0:
+                raise CheckError(
+                    "break outside of a loop ('break' exits the innermost "
+                    "enclosing while loop)", stmt.line, stmt.col)
             return
 
         if isinstance(stmt, A.Match):
@@ -905,6 +920,18 @@ class Checker:
             if xs.elem is not None and not A.compatible(xs.elem, x):
                 raise CheckError(
                     f"cannot push {x} onto {xs}", expr.line, expr.col)
+            return A.Type("List", xs.elem if xs.elem is not None else x)
+        if name == "set":
+            if len(arg_types) != 3 or arg_types[0].kind != "List":
+                raise CheckError("set takes a List, an Int index, and an element",
+                                 expr.line, expr.col)
+            xs, i, x = arg_types
+            if i != A.INT:
+                raise CheckError(f"set index must be Int, got {i}",
+                                 expr.line, expr.col)
+            if xs.elem is not None and not A.compatible(xs.elem, x):
+                raise CheckError(
+                    f"cannot set {x} into {xs}", expr.line, expr.col)
             return A.Type("List", xs.elem if xs.elem is not None else x)
         raise CheckError(f"unhandled polymorphic builtin '{name}'",
                          expr.line, expr.col)
