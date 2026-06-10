@@ -83,11 +83,19 @@ class Checker:
         self.program = program
         self.sigs: dict[str, FnSig] = dict(BUILTINS)
         self.records: dict[str, A.RecordDecl] = {}
+        self.enums: dict[str, A.EnumDecl] = {}
+        # variant name -> (enum name, payload types); variant names are
+        # GLOBALLY unique, so a bare uppercase name resolves unambiguously.
+        self.variants: dict[str, tuple[str, list[A.Type]]] = {}
 
     # ------------------------------------------------------------ entry
 
     def check(self) -> dict[str, FnSig]:
-        self.check_records()
+        self.declare_records()
+        self.declare_enums()
+        self.check_record_fields()
+        self.check_enum_payloads()
+        self.check_size_cycles()
         for fn in self.program.functions:
             if fn.name in self.sigs:
                 kind = "builtin" if self.sigs[fn.name].decl is None else "function"
@@ -98,6 +106,9 @@ class Checker:
                     raise CheckError(
                         f"unknown effect '{eff}'; known effects: "
                         f"{', '.join(sorted(KNOWN_EFFECTS))}", fn.line, fn.col)
+            fn.params = [(pname, self.resolve_enum_refs(ptype))
+                         for pname, ptype in fn.params]
+            fn.ret = self.resolve_enum_refs(fn.ret)
             if fn.type_params:
                 self.resolve_fn_type_params(fn)
             self.sigs[fn.name] = FnSig(fn.name, fn.params, fn.ret, fn.effects,
@@ -109,7 +120,7 @@ class Checker:
 
     # ------------------------------------------------------------ records
 
-    def check_records(self) -> None:
+    def declare_records(self) -> None:
         for rec in self.program.records:
             if not rec.name[0].isupper():
                 raise CheckError(
@@ -123,40 +134,118 @@ class Checker:
                                  rec.line, rec.col)
             self.records[rec.name] = rec
 
+    def check_record_fields(self) -> None:
         for rec in self.program.records:
             seen: set[str] = set()
+            resolved: list[tuple[str, A.Type]] = []
             for fname, ftype in rec.fields:
                 if fname in seen:
                     raise CheckError(
                         f"duplicate field '{fname}' in record '{rec.name}'",
                         rec.line, rec.col)
                 seen.add(fname)
+                ftype = self.resolve_enum_refs(ftype)
                 self.validate_type(ftype, rec.line, rec.col)
+                resolved.append((fname, ftype))
+            rec.fields = resolved
 
-        # Direct record-in-record cycles have infinite size. Recursion through
-        # List is fine (it is heap-indirected), so trees are expressible.
+    # ------------------------------------------------------------ enums
+
+    def declare_enums(self) -> None:
+        for enum in self.program.enums:
+            if not enum.name[0].isupper():
+                raise CheckError(
+                    f"enum name '{enum.name}' must start with an uppercase "
+                    f"letter (Sigil's one canonical style)", enum.line, enum.col)
+            if enum.name in BUILTIN_TYPE_NAMES:
+                raise CheckError(f"'{enum.name}' is a builtin type",
+                                 enum.line, enum.col)
+            if enum.name in self.records:
+                raise CheckError(
+                    f"enum '{enum.name}' collides with record '{enum.name}'",
+                    enum.line, enum.col)
+            if enum.name in self.enums:
+                raise CheckError(f"enum '{enum.name}' is already defined",
+                                 enum.line, enum.col)
+            self.enums[enum.name] = enum
+
+        for enum in self.program.enums:
+            if not enum.variants:
+                raise CheckError(
+                    f"enum '{enum.name}' must declare at least one variant",
+                    enum.line, enum.col)
+            for vname, _ in enum.variants:
+                if not vname[0].isupper():
+                    raise CheckError(
+                        f"variant name '{vname}' must start with an uppercase "
+                        f"letter (Sigil's one canonical style)",
+                        enum.line, enum.col)
+                if vname in self.records:
+                    raise CheckError(
+                        f"variant '{vname}' of enum '{enum.name}' collides "
+                        f"with record '{vname}'", enum.line, enum.col)
+                if vname in self.variants:
+                    other = self.variants[vname][0]
+                    raise CheckError(
+                        f"variant '{vname}' is already declared in enum "
+                        f"'{other}'; variant names are global", enum.line, enum.col)
+                self.variants[vname] = (enum.name, [])
+
+    def check_enum_payloads(self) -> None:
+        for enum in self.program.enums:
+            resolved: list[tuple[str, list[A.Type]]] = []
+            for vname, payloads in enum.variants:
+                types = [self.resolve_enum_refs(p) for p in payloads]
+                for ptype in types:
+                    self.validate_type(ptype, enum.line, enum.col)
+                self.variants[vname] = (enum.name, types)
+                resolved.append((vname, types))
+            enum.variants = resolved
+
+    def check_size_cycles(self) -> None:
+        # Direct containment cycles (through records AND enums) have infinite
+        # size. Recursion through List is fine (it is heap-indirected), so
+        # trees are expressible.
         def direct_deps(name: str) -> list[str]:
-            return [t.name for _, t in self.records[name].fields
-                    if t.kind == "Record"]
+            if name in self.records:
+                types = [t for _, t in self.records[name].fields]
+            else:
+                types = [t for _, payloads in self.enums[name].variants
+                         for t in payloads]
+            return [t.name for t in types if t.kind in ("Record", "Enum")]
 
-        for start in self.records:
+        for start, decl in {**self.records, **self.enums}.items():
+            what = "record" if start in self.records else "enum"
             stack, visited = [start], set()
             while stack:
                 current = stack.pop()
                 for dep in direct_deps(current):
                     if dep == start:
                         raise CheckError(
-                            f"record '{start}' contains itself (directly or "
-                            f"via other records), which would be infinite; "
-                            f"use List for recursion",
-                            self.records[start].line, self.records[start].col)
+                            f"{what} '{start}' contains itself (directly or "
+                            f"via other records or enums), which would be "
+                            f"infinite; use List for recursion",
+                            decl.line, decl.col)
                     if dep not in visited:
                         visited.add(dep)
                         stack.append(dep)
 
+    # ------------------------------------------------------------ types
+
+    def resolve_enum_refs(self, ty: A.Type) -> A.Type:
+        """The parser cannot tell a record reference from an enum reference;
+        reinterpret parsed Record types whose name is a declared enum."""
+        if ty.kind == "Record" and ty.name in self.enums:
+            return A.Type("Enum", name=ty.name)
+        if ty.kind == "List" and ty.elem is not None:
+            return A.Type("List", self.resolve_enum_refs(ty.elem))
+        return ty
+
     def validate_type(self, ty: A.Type, line: int, col: int) -> None:
         if ty.kind == "Record" and ty.name not in self.records:
             raise CheckError(f"unknown record '{ty.name}'", line, col)
+        if ty.kind == "Enum" and ty.name not in self.enums:
+            raise CheckError(f"unknown enum '{ty.name}'", line, col)
         if ty.kind == "List" and ty.elem is not None:
             self.validate_type(ty.elem, line, col)
 
@@ -166,6 +255,7 @@ class Checker:
             return True
         if ty.kind == "List":
             return ty.elem is not None and self.contains_capability(ty.elem, visiting)
+        # Records and enums share one visited set: their names cannot collide.
         if ty.kind == "Record":
             visiting = visiting or set()
             if ty.name in visiting:
@@ -173,6 +263,14 @@ class Checker:
             visiting.add(ty.name)
             return any(self.contains_capability(ftype, visiting)
                        for _, ftype in self.records[ty.name].fields)
+        if ty.kind == "Enum":
+            visiting = visiting or set()
+            if ty.name in visiting:
+                return False
+            visiting.add(ty.name)
+            return any(self.contains_capability(ptype, visiting)
+                       for _, payloads in self.enums[ty.name].variants
+                       for ptype in payloads)
         return False
 
     # ------------------------------------------------------------ generics
@@ -196,6 +294,10 @@ class Checker:
                 raise CheckError(
                     f"type parameter '{tp}' of '{fn.name}' collides with "
                     f"record '{tp}'; pick another name", fn.line, fn.col)
+            if tp in self.enums:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{fn.name}' collides with "
+                    f"enum '{tp}'; pick another name", fn.line, fn.col)
             if tp in BUILTIN_TYPE_NAMES:
                 raise CheckError(
                     f"type parameter '{tp}' of '{fn.name}' collides with the "
@@ -283,6 +385,11 @@ class Checker:
                 if (self.definitely_returns(stmt.then_body)
                         and self.definitely_returns(stmt.else_body)):
                     return True
+            # A match is exhaustive (the checker enforced it), so it returns
+            # definitely iff every arm's body does.
+            if isinstance(stmt, A.Match) and stmt.arms:
+                if all(self.definitely_returns(arm.body) for arm in stmt.arms):
+                    return True
         return False
 
     # ------------------------------------------------------------ statements
@@ -297,6 +404,7 @@ class Checker:
                 raise CheckError(
                     f"binding '{stmt.name}' must start with a lowercase letter",
                     stmt.line, stmt.col)
+            stmt.declared_type = self.resolve_enum_refs(stmt.declared_type)
             if fn.type_params:
                 stmt.declared_type = self.resolve_type(stmt.declared_type,
                                                        fn.type_params)
@@ -367,12 +475,73 @@ class Checker:
             self.check_block(stmt.body, Scope(scope), fn)
             return
 
+        if isinstance(stmt, A.Match):
+            self.check_match(stmt, scope, fn)
+            return
+
         if isinstance(stmt, A.ExprStmt):
             self.check_expr(stmt.expr, scope, fn)
             return
 
         raise CheckError(f"unhandled statement {type(stmt).__name__}",
                          stmt.line, stmt.col)
+
+    def check_match(self, stmt: A.Match, scope: Scope, fn: A.FnDecl) -> None:
+        stype = self.check_expr(stmt.scrutinee, scope, fn)
+        if stype.kind != "Enum":
+            raise CheckError(f"match needs an enum value, got {stype}",
+                             stmt.line, stmt.col)
+        enum = self.enums[stype.name]
+        payloads_of = dict(enum.variants)
+        covered: set[str] = set()
+        wildcard: Optional[A.MatchArm] = None
+        for arm in stmt.arms:
+            if wildcard is not None:
+                raise CheckError(
+                    "wildcard '_' arm must be the last arm of a match",
+                    arm.line, arm.col)
+            if arm.variant is None:
+                wildcard = arm
+                arm.binder_types = []
+                self.check_block(arm.body, Scope(scope), fn)
+                continue
+            payloads = payloads_of.get(arm.variant)
+            if payloads is None:
+                raise CheckError(
+                    f"'{arm.variant}' is not a variant of enum '{stype.name}'",
+                    arm.line, arm.col)
+            if arm.variant in covered:
+                raise CheckError(f"duplicate arm for variant '{arm.variant}'",
+                                 arm.line, arm.col)
+            covered.add(arm.variant)
+            if len(arm.binders) != len(payloads):
+                raise CheckError(
+                    f"variant '{arm.variant}' has {len(payloads)} payload(s); "
+                    f"this arm binds {len(arm.binders)}", arm.line, arm.col)
+            arm_scope = Scope(scope)
+            for binder, ptype in zip(arm.binders, payloads):
+                if not binder[0].islower():
+                    raise CheckError(
+                        f"binder '{binder}' must start with a lowercase letter",
+                        arm.line, arm.col)
+                arm_scope.declare(binder, Binding(ptype, mutable=False),
+                                  arm.line, arm.col)
+            # Payloads are concrete, but stamp the (trivially) substituted
+            # types so downstream stages never re-derive them.
+            arm.binder_types = list(payloads)
+            self.check_block(arm.body, Scope(arm_scope), fn)
+
+        missing = [vname for vname, _ in enum.variants if vname not in covered]
+        if wildcard is not None and not missing:
+            raise CheckError(
+                "wildcard '_' arm is dead: every variant is already covered",
+                wildcard.line, wildcard.col)
+        if wildcard is None and missing:
+            raise CheckError(
+                f"match on '{stype.name}' is not exhaustive; missing "
+                f"variant(s): {', '.join(missing)} (or add a '_' arm)",
+                stmt.line, stmt.col)
+        stmt.enum_name = stype.name
 
     # ------------------------------------------------------------ expressions
 
@@ -406,7 +575,21 @@ class Checker:
         if isinstance(expr, A.Var):
             binding = scope.lookup(expr.name)
             if binding is None:
-                raise CheckError(f"unknown name '{expr.name}'", expr.line, expr.col)
+                variant = self.variants.get(expr.name)
+                if variant is not None:
+                    enum_name, payloads = variant
+                    if payloads:
+                        raise CheckError(
+                            f"variant '{expr.name}' takes "
+                            f"{len(payloads)} argument(s)", expr.line, expr.col)
+                    # Nullary variant: stamp for the interpreter and emitter.
+                    expr.variant_of = enum_name
+                    return A.Type("Enum", name=enum_name)
+                hint = ""
+                if expr.name[0].isupper() and self.enums:
+                    hint = " (no enum declares a variant with this name)"
+                raise CheckError(f"unknown name '{expr.name}'{hint}",
+                                 expr.line, expr.col)
             return binding.type
 
         if isinstance(expr, A.Call):
@@ -534,6 +717,15 @@ class Checker:
 
     def check_call(self, expr: A.Call, scope: Scope, fn: A.FnDecl,
                    in_contract: bool) -> A.Type:
+        # Variant construction resolves BEFORE function lookup. There is no
+        # ambiguity: function names must start lowercase, variants uppercase.
+        if expr.name in self.variants:
+            return self.check_variant_call(expr, scope, fn, in_contract)
+        if expr.name in self.records:
+            raise CheckError(
+                f"record '{expr.name}' is not callable; use "
+                f"{expr.name} {{ ... }}", expr.line, expr.col)
+
         sig = self.sigs.get(expr.name)
         if sig is None:
             hint = ""
@@ -581,6 +773,26 @@ class Checker:
                     f"argument '{pname}' of '{expr.name}' needs {ptype}, got "
                     f"{atype}{hint}", arg.line, arg.col)
         return sig.ret
+
+    def check_variant_call(self, expr: A.Call, scope: Scope, fn: A.FnDecl,
+                           in_contract: bool) -> A.Type:
+        """Construction of an enum variant. Pure — no effects to cover, so
+        construction is legal anywhere, contracts included."""
+        enum_name, payloads = self.variants[expr.name]
+        arg_types = [self.check_expr(a, scope, fn, in_contract)
+                     for a in expr.args]
+        if len(arg_types) != len(payloads):
+            raise CheckError(
+                f"variant '{expr.name}' takes {len(payloads)} argument(s), "
+                f"got {len(arg_types)}", expr.line, expr.col)
+        for idx, (ptype, atype, arg) in enumerate(zip(payloads, arg_types,
+                                                      expr.args)):
+            if not A.compatible(ptype, atype):
+                raise CheckError(
+                    f"payload {idx + 1} of variant '{expr.name}' needs "
+                    f"{ptype}, got {atype}", arg.line, arg.col)
+        expr.variant_of = enum_name  # the interpreter and emitter read this
+        return A.Type("Enum", name=enum_name)
 
     def check_generic_call(self, expr: A.Call, sig: FnSig,
                            arg_types: list[A.Type]) -> A.Type:

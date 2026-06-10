@@ -6,13 +6,14 @@ from dataclasses import dataclass
 from .errors import LexError
 
 KEYWORDS = {
-    "fn", "record", "let", "var", "return", "if", "else", "while",
-    "true", "false", "requires", "ensures", "invariant", "and", "or", "not",
+    "fn", "record", "enum", "match", "let", "var", "return", "if", "else",
+    "while", "true", "false", "requires", "ensures", "invariant",
+    "and", "or", "not",
 }
 
-# Multi-char operators first so maximal munch works.
+# Multi-char operators first so maximal munch works ("=>" must precede "=").
 OPERATORS = [
-    "->", "==", "!=", "<=", ">=",
+    "->", "=>", "==", "!=", "<=", ">=",
     "+", "-", "*", "/", "%", "<", ">", "=", "!",
     "(", ")", "{", "}", "[", "]", ",", ";", ":", ".",
 ]

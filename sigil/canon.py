@@ -30,6 +30,7 @@ Comment policy (the lexer collects comments; they are not AST nodes):
 import dataclasses
 import hashlib
 import json
+import re
 
 from . import ast_nodes as A
 from .lexer import Comment, lex_with_comments
@@ -46,6 +47,16 @@ _LEVEL = {
 }
 _UNARY_LEVEL = 6
 _POSTFIX_LEVEL = 7
+
+# A match scrutinee whose rendering ends in a bare uppercase identifier (a
+# nullary variant) must keep parentheses: `match x == Empty {` would re-parse
+# with `Empty {` as a record literal that swallows the match body.
+_TRAILING_NAME = re.compile(r"[A-Za-z0-9_]+$")
+
+
+def _scrutinee_needs_parens(text: str) -> bool:
+    tail = _TRAILING_NAME.search(text)
+    return tail is not None and tail.group()[0].isupper()
 
 
 def escape_text(value: str) -> str:
@@ -93,7 +104,7 @@ class Renderer:
         if ty.kind == "List":
             elem = "?" if ty.elem is None else self.render_type(ty.elem)
             return f"List[{elem}]"
-        if ty.kind in ("Record", "Var"):
+        if ty.kind in ("Record", "Enum", "Var"):
             return self._name(ty.name)
         return ty.kind
 
@@ -183,9 +194,24 @@ class Renderer:
         lines.append("}")
         return lines
 
-    def render_decl(self, decl: "A.FnDecl | A.RecordDecl") -> str:
+    def render_enum(self, enum: A.EnumDecl) -> list[str]:
+        if not enum.variants:
+            return [f"enum {self._name(enum.name)} {{}}"]
+        lines = [f"enum {self._name(enum.name)} {{"]
+        for vname, payloads in enum.variants:
+            if payloads:
+                types = ", ".join(self.render_type(p) for p in payloads)
+                lines.append(f"    {vname}({types}),")
+            else:
+                lines.append(f"    {vname},")
+        lines.append("}")
+        return lines
+
+    def render_decl(self, decl: "A.FnDecl | A.RecordDecl | A.EnumDecl") -> str:
         if isinstance(decl, A.RecordDecl):
             return "\n".join(self.render_record(decl))
+        if isinstance(decl, A.EnumDecl):
+            return "\n".join(self.render_enum(decl))
         return "\n".join(self.render_fn(decl))
 
     # ---------------------------------------------------------- statements
@@ -212,6 +238,8 @@ class Renderer:
             return [f"{pad}{self.render_expr(stmt.expr)};"]
         if isinstance(stmt, A.If):
             return self._render_if(stmt, depth)
+        if isinstance(stmt, A.Match):
+            return self._render_match(stmt, depth)
         if isinstance(stmt, A.While):
             lines = []
             if stmt.invariants:
@@ -225,6 +253,26 @@ class Renderer:
             lines.append(f"{pad}}}")
             return lines
         raise TypeError(f"unknown statement node {type(stmt).__name__}")
+
+    def _render_match(self, stmt: A.Match, depth: int) -> list[str]:
+        pad = "    " * depth
+        scrutinee = self.render_expr(stmt.scrutinee)
+        if _scrutinee_needs_parens(scrutinee):
+            scrutinee = f"({scrutinee})"
+        lines = [f"{pad}match {scrutinee} {{"]
+        for arm in stmt.arms:
+            lines.extend(self._flush(arm, depth + 1))
+            if arm.variant is None:
+                pattern = "_"
+            elif arm.binders:
+                pattern = f"{arm.variant}({', '.join(arm.binders)})"
+            else:
+                pattern = arm.variant
+            lines.append(f"{pad}    {pattern} => {{")
+            lines.extend(self.render_stmts(arm.body, depth + 2))
+            lines.append(f"{pad}    }}")
+        lines.append(f"{pad}}}")
+        return lines
 
     def _render_if(self, stmt: A.If, depth: int) -> list[str]:
         pad = "    " * depth
@@ -269,6 +317,9 @@ class _CommentingRenderer(Renderer):
     def render_record(self, rec: A.RecordDecl) -> list[str]:
         return self._flush(rec, 0) + super().render_record(rec)
 
+    def render_enum(self, enum: A.EnumDecl) -> list[str]:
+        return self._flush(enum, 0) + super().render_enum(enum)
+
 
 def _walk_anchors(program: A.Program) -> list[tuple[int, int, object]]:
     """Every construct the formatter emits comments above, in source order:
@@ -284,6 +335,10 @@ def _walk_anchors(program: A.Program) -> list[tuple[int, int, object]]:
                     stmts(stmt.else_body)
             elif isinstance(stmt, A.While):
                 stmts(stmt.body)
+            elif isinstance(stmt, A.Match):
+                for arm in stmt.arms:
+                    anchors.append((arm.line, arm.col, arm))
+                    stmts(arm.body)
 
     for decl in _decls_in_source_order(program):
         anchors.append((decl.line, decl.col, decl))
@@ -294,7 +349,7 @@ def _walk_anchors(program: A.Program) -> list[tuple[int, int, object]]:
 
 
 def _decls_in_source_order(program: A.Program) -> list:
-    decls = list(program.records) + list(program.functions)
+    decls = list(program.records) + list(program.enums) + list(program.functions)
     decls.sort(key=lambda d: (d.line, d.col))
     return decls
 
@@ -413,7 +468,8 @@ def _node_json(node, renderer: Renderer):
 
 def program_json(program: A.Program) -> dict:
     """The serialized typed AST: {"version": 1, "records": [...],
-    "functions": [...]}, every declaration stamped with id + shape."""
+    "enums": [...], "functions": [...]}, every declaration stamped with
+    id + shape."""
     renderer = Renderer()
     records = []
     for rec in program.records:
@@ -423,6 +479,17 @@ def program_json(program: A.Program) -> dict:
             "name": rec.name,
             "fields": [{"name": fname, "type": renderer.render_type(ty)}
                        for fname, ty in rec.fields],
+        })
+    enums = []
+    for enum in program.enums:
+        enums.append({
+            "id": decl_id(enum),
+            "shape": decl_shape(enum),
+            "name": enum.name,
+            "variants": [{"name": vname,
+                          "payloads": [renderer.render_type(p)
+                                       for p in payloads]}
+                         for vname, payloads in enum.variants],
         })
     functions = []
     for fn in program.functions:
@@ -439,7 +506,8 @@ def program_json(program: A.Program) -> dict:
                           for c in fn.contracts],
             "body": [_node_json(stmt, renderer) for stmt in fn.body],
         })
-    return {"version": 1, "records": records, "functions": functions}
+    return {"version": 1, "records": records, "enums": enums,
+            "functions": functions}
 
 
 def program_json_text(program: A.Program) -> str:
@@ -451,7 +519,12 @@ def program_json_text(program: A.Program) -> str:
 def _decl_index(program: A.Program) -> dict[tuple[str, str], object]:
     index: dict[tuple[str, str], object] = {}
     for decl in _decls_in_source_order(program):
-        kind = "record" if isinstance(decl, A.RecordDecl) else "fn"
+        if isinstance(decl, A.RecordDecl):
+            kind = "record"
+        elif isinstance(decl, A.EnumDecl):
+            kind = "enum"
+        else:
+            kind = "fn"
         index[(kind, decl.name)] = decl
     return index
 
@@ -459,8 +532,10 @@ def _decl_index(program: A.Program) -> dict[tuple[str, str], object]:
 def _classify(kind: str, old, new) -> str:
     """Why two same-named declarations differ. Precedence:
     signature > contracts > body (rename is handled by the caller)."""
-    if kind == "record":
-        return "body"   # a record IS its field list; any change is its body
+    if kind in ("record", "enum"):
+        # A record IS its field list (and an enum its variant list); any
+        # change is its body.
+        return "body"
     renderer = Renderer(placeholder_for=old.name)
     new_renderer = Renderer(placeholder_for=new.name)
     if renderer.fn_signature(old) != new_renderer.fn_signature(new):

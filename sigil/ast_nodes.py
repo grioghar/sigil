@@ -13,15 +13,16 @@ from typing import Optional, Union
 
 @dataclass(frozen=True)
 class Type:
-    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List | Record | Var
+    kind: str                      # Int | Bool | Text | Unit | Console | Fs | List | Record | Enum | Var
     elem: Optional["Type"] = None  # element type when kind == 'List'; None = unknown
-    name: Optional[str] = None     # record name when kind == 'Record'; type
-                                   # parameter name when kind == 'Var'
+    name: Optional[str] = None     # record name when kind == 'Record'; enum
+                                   # name when kind == 'Enum'; type parameter
+                                   # name when kind == 'Var'
 
     def __str__(self) -> str:
         if self.kind == "List":
             return f"List[{self.elem if self.elem is not None else '?'}]"
-        if self.kind in ("Record", "Var"):
+        if self.kind in ("Record", "Enum", "Var"):
             return self.name
         return self.kind
 
@@ -45,7 +46,7 @@ def compatible(expected: Type, actual: Type) -> bool:
         if expected.elem is None or actual.elem is None:
             return True
         return compatible(expected.elem, actual.elem)
-    if expected.kind in ("Record", "Var"):
+    if expected.kind in ("Record", "Enum", "Var"):
         return expected.name == actual.name
     return True
 
@@ -185,6 +186,24 @@ class ExprStmt(Stmt):
     expr: Expr = None
 
 
+@dataclass
+class MatchArm:
+    variant: Optional[str]         # None means the wildcard arm '_'
+    binders: list[str] = field(default_factory=list)
+    body: list[Stmt] = field(default_factory=list)
+    line: int = 0
+    col: int = 0
+    # The checker stamps `binder_types` (the payload types each binder
+    # receives) as a plain attribute, like Expr.ty — deliberately NOT a
+    # dataclass field, so structural AST equality ignores it.
+
+
+@dataclass
+class Match(Stmt):
+    scrutinee: Expr = None
+    arms: list[MatchArm] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------- declarations
 
 @dataclass
@@ -224,6 +243,15 @@ class RecordDecl:
 
 
 @dataclass
+class EnumDecl:
+    name: str
+    variants: list[tuple[str, list[Type]]]   # (variant name, payload types)
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
 class Program:
     functions: list[FnDecl]
     records: list[RecordDecl] = field(default_factory=list)
+    enums: list[EnumDecl] = field(default_factory=list)

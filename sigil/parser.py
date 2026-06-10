@@ -52,12 +52,15 @@ class Parser:
     def parse_program(self) -> A.Program:
         functions = []
         records = []
+        enums = []
         while not self.at("EOF"):
             if self.at("record"):
                 records.append(self.parse_record())
+            elif self.at("enum"):
+                enums.append(self.parse_enum())
             else:
                 functions.append(self.parse_fn())
-        return A.Program(functions, records)
+        return A.Program(functions, records, enums)
 
     def parse_record(self) -> A.RecordDecl:
         start = self.expect("record")
@@ -72,6 +75,26 @@ class Parser:
                 self.expect(",", "',' between record fields")
         self.expect("}")
         return A.RecordDecl(name, fields, start.line, start.col)
+
+    def parse_enum(self) -> A.EnumDecl:
+        start = self.expect("enum")
+        name = self.expect("IDENT", "enum name").value
+        self.expect("{")
+        variants: list[tuple[str, list[A.Type]]] = []
+        while not self.at("}"):
+            vname = self.expect("IDENT", "variant name").value
+            payloads: list[A.Type] = []
+            if self.match("("):
+                while True:
+                    payloads.append(self.parse_type())
+                    if not self.match(","):
+                        break
+                self.expect(")")
+            variants.append((vname, payloads))
+            if not self.at("}"):
+                self.expect(",", "',' between enum variants")
+        self.expect("}")
+        return A.EnumDecl(name, variants, start.line, start.col)
 
     def parse_fn(self) -> A.FnDecl:
         start = self.expect("fn", "'fn' to start a declaration")
@@ -137,10 +160,11 @@ class Parser:
         if name in TYPE_NAMES:
             return A.Type(name)
         if name[0].isupper():
-            # A record reference; the checker verifies it is declared.
+            # A record or enum reference; the checker resolves which kind it
+            # is and verifies that it is declared.
             return A.Type("Record", name=name)
-        raise ParseError(f"unknown type '{name}' (record names start with an "
-                         f"uppercase letter)", tok.line, tok.col)
+        raise ParseError(f"unknown type '{name}' (record and enum names start "
+                         f"with an uppercase letter)", tok.line, tok.col)
 
     # ------------------------------------------------------------ statements
 
@@ -176,6 +200,9 @@ class Parser:
         if tok.kind == "if":
             return self.parse_if()
 
+        if tok.kind == "match":
+            return self.parse_match()
+
         if tok.kind == "while":
             self.advance()
             cond = self.parse_expr()
@@ -200,6 +227,31 @@ class Parser:
         expr = self.parse_expr()
         self.expect(";")
         return A.ExprStmt(tok.line, tok.col, expr)
+
+    def parse_match(self) -> A.Match:
+        tok = self.expect("match")
+        scrutinee = self.parse_expr()
+        self.expect("{")
+        arms: list[A.MatchArm] = []
+        while not self.at("}"):
+            if self.at("EOF"):
+                raise ParseError("unterminated match, expected '}'",
+                                 self.cur.line, self.cur.col)
+            arm_tok = self.expect("IDENT", "variant name or '_'")
+            variant = None if arm_tok.value == "_" else arm_tok.value
+            binders: list[str] = []
+            if variant is not None and self.match("("):
+                while True:
+                    binders.append(self.expect("IDENT", "binder name").value)
+                    if not self.match(","):
+                        break
+                self.expect(")")
+            self.expect("=>", "'=>' after the match pattern")
+            body = self.parse_block()
+            arms.append(A.MatchArm(variant, binders, body,
+                                   arm_tok.line, arm_tok.col))
+        self.expect("}")
+        return A.Match(tok.line, tok.col, scrutinee, arms)
 
     def parse_if(self) -> A.If:
         tok = self.expect("if")

@@ -1,0 +1,60 @@
+// Sum types: an enum declares variants with positional payloads; a match
+// statement consumes them. Matches are exhaustive by construction — every
+// variant handled, or a final '_' arm — and a wildcard that covers nothing
+// is rejected as dead code. Binders are immutable and scoped to their arm.
+enum Expr {
+    Num(Int),
+    Sum(List[Expr]),
+}
+
+fn eval(e: Expr) -> Int {
+    match e {
+        Num(n) => {
+            return n;
+        }
+        Sum(parts) => {
+            var total: Int = 0;
+            var i: Int = 0;
+            while i < len(parts) {
+                total = total + eval(parts[i]);
+                i = i + 1;
+            }
+            return total;
+        }
+    }
+}
+
+// The verifier reasons per arm: an Int binder is an arbitrary integer, so
+// both returns prove result >= 0 and the runtime check is erased.
+fn magnitude(e: Expr) -> Int
+    ensures result >= 0
+{
+    match e {
+        Num(n) => {
+            if n < 0 {
+                return 0 - n;
+            }
+            return n;
+        }
+        _ => {
+            return eval_clamped(e);
+        }
+    }
+}
+
+fn eval_clamped(e: Expr) -> Int
+    ensures result >= 0
+{
+    let v: Int = eval(e);
+    if v < 0 {
+        return 0;
+    }
+    return v;
+}
+
+fn main(console: Console) -> Unit ! {io.write} {
+    let e: Expr = Sum([Num(1), Sum([Num(2), Num(3)]), Num(0 - 4)]);
+    print(console, "eval = " + str(eval(e)));
+    print(console, "magnitude = " + str(magnitude(Num(0 - 9))));
+    print(console, "same tree: " + str(e == Sum([Num(1), Sum([Num(2), Num(3)]), Num(0 - 4)])));
+}

@@ -188,11 +188,28 @@ class Interpreter:
             while self.eval(stmt.cond, frame):
                 self.exec_block(stmt.body, frame)
                 self.check_invariants(stmt, frame)
+        elif isinstance(stmt, A.Match):
+            self.exec_match(stmt, frame)
         elif isinstance(stmt, A.ExprStmt):
             self.eval(stmt.expr, frame)
         else:
             raise RuntimeFault(f"unhandled statement {type(stmt).__name__}",
                                stmt.line, stmt.col)
+
+    def exec_match(self, stmt: A.Match, frame: Frame) -> None:
+        tag, payload = self.eval(stmt.scrutinee, frame)
+        arm = next((a for a in stmt.arms if a.variant == tag), None)
+        if arm is None:  # the checker proved a wildcard exists if needed
+            arm = next(a for a in stmt.arms if a.variant is None)
+        frame.push()
+        try:
+            if arm.variant is not None:
+                for binder, value in zip(arm.binders, payload):
+                    frame.declare(binder, value)
+            for inner in arm.body:
+                self.exec_stmt(inner, frame)
+        finally:
+            frame.pop()
 
     def check_invariants(self, stmt: A.While, frame: Frame) -> None:
         for inv in stmt.invariants:
@@ -214,8 +231,14 @@ class Interpreter:
         if isinstance(expr, A.ListLit):
             return [self.eval(item, frame) for item in expr.items]
         if isinstance(expr, A.Var):
+            # A nullary enum variant, stamped by the checker. Variant values
+            # are ('Name', [payloads]) tuples; equality falls out of tuples.
+            if getattr(expr, "variant_of", None) is not None:
+                return (expr.name, [])
             return frame.lookup(expr.name)
         if isinstance(expr, A.Call):
+            if getattr(expr, "variant_of", None) is not None:
+                return (expr.name, [self.eval(a, frame) for a in expr.args])
             args = [self.eval(a, frame) for a in expr.args]
             return self.call(expr.name, args, expr.line, expr.col)
         if isinstance(expr, A.RecordLit):

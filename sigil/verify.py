@@ -229,8 +229,36 @@ class Verifier:
             self.exec_if(stmt, state)
         elif isinstance(stmt, A.While):
             self.exec_while(stmt, state)
+        elif isinstance(stmt, A.Match):
+            self.exec_match(stmt, state)
         elif isinstance(stmt, A.ExprStmt):
             self.translate(stmt.expr, state)
+
+    def exec_match(self, stmt: A.Match, state: State) -> None:
+        # Enum values are Opaque, so no arm can be ruled out: run every arm
+        # on a clone, binders bound to fresh values of their stamped payload
+        # types (Int/Bool binders stay modeled; everything else is Opaque).
+        self.translate(stmt.scrutinee, state)  # record nested obligations
+        arm_states: list[State] = []
+        for arm in stmt.arms:
+            arm_state = state.clone()
+            for binder, btype in zip(arm.binders,
+                                     getattr(arm, "binder_types", [])):
+                arm_state.vars[binder] = self.fresh_by_type(btype)
+            self.exec_block(arm.body, arm_state)
+            arm_states.append(arm_state)
+
+        survivors = [s for s in arm_states if s.alive]
+        if not survivors:
+            state.alive = False  # every arm returned
+            return
+        # Conservative merge: which arm ran is unknown, so any variable whose
+        # value is not identical across all surviving arms is havocked, and
+        # arm-local path facts are dropped (sound — only knowledge is lost).
+        for name in list(state.vars):
+            values = [s.vars[name] for s in survivors]
+            if any(value is not values[0] for value in values):
+                state.vars[name] = self.havoc_like(state.vars[name])
 
     def exec_if(self, stmt: A.If, state: State) -> None:
         cond = self.translate(stmt.cond, state)
@@ -336,6 +364,9 @@ class Verifier:
                     names |= self.collect_assigned(stmt.else_body)
             elif isinstance(stmt, A.While):
                 names |= self.collect_assigned(stmt.body)
+            elif isinstance(stmt, A.Match):
+                for arm in stmt.arms:
+                    names |= self.collect_assigned(arm.body)
         return names
 
     # ------------------------------------------------------------ expressions
@@ -423,7 +454,9 @@ class Verifier:
         arg_values = [self.translate(a, state) for a in expr.args]
 
         if callee is None:
-            # Builtin: no contracts; result unknown.
+            # Builtin or variant construction: no contracts; result unknown
+            # (an enum-typed result is Opaque). Arguments were translated
+            # above, so their nested obligations are already recorded.
             return self.fresh_by_type(getattr(expr, "ty", None))
 
         env = {pname: val for (pname, _), val in zip(callee.params, arg_values)}

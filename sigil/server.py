@@ -25,7 +25,7 @@ from .parser import parse
 
 DESCRIPTIONS = {
     "check": "type/effect/capability-check a program; first diagnostic on failure",
-    "signatures": "every function, record, and builtin signature in a program",
+    "signatures": "every function, record, enum, and builtin signature in a program",
     "effects": "declared, capability, and transitive effects of one function",
     "verify": "prove contracts and divisions statically; all findings + summary",
     "obligations": "unproven findings only — what must still be made true",
@@ -120,9 +120,14 @@ def _method_signatures(source: str) -> dict:
                 "fields": [{"name": fname, "type": str(ftype)}
                            for fname, ftype in rec.fields]}
                for rec in program.records]
+    enums = [{"name": enum.name,
+              "variants": [{"name": vname,
+                            "payloads": [str(ptype) for ptype in payloads]}
+                           for vname, payloads in enum.variants]}
+             for enum in program.enums]
     builtins = [_fn_json(sig) for sig in BUILTINS.values()]
     return {"ok": True, "functions": functions, "records": records,
-            "builtins": builtins}
+            "enums": enums, "builtins": builtins}
 
 
 def _called_names(stmts: list[A.Stmt]) -> set[str]:
@@ -168,6 +173,11 @@ def _called_names(stmts: list[A.Stmt]) -> set[str]:
             walk_expr(stmt.cond)
             for s in stmt.body:
                 walk_stmt(s)
+        elif isinstance(stmt, A.Match):
+            walk_expr(stmt.scrutinee)
+            for arm in stmt.arms:
+                for s in arm.body:
+                    walk_stmt(s)
         elif isinstance(stmt, A.ExprStmt):
             walk_expr(stmt.expr)
 
