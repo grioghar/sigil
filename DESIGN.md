@@ -240,7 +240,7 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.4** | Canonical form: `sigil fmt` (one rendering, idempotent, AST-round-trip-safe, comment-preserving), `sigil ast` (serialized typed AST with stable content-hash ids + rename-invariant shape hashes), `sigil sdiff` (semantic diff: added/removed/renamed/signature/contracts/body). CI enforces canonical examples. Full on-disk AST-as-source remains future work. | **done** |
 | **0.5** | Compiler-as-a-service: `sigil serve` / `sigil query` — newline-delimited JSON API (check, signatures, effects incl. transitive, verify, obligations, methods) so an LLM can interrogate the compiler while generating instead of generating blind. `obligations` returns exactly the unproven clauses — the AI author's to-do list. | **done** |
 | **0.6** | Sum types: `enum` with positional payloads + statically exhaustive `match` (no dead arms), verifier-typed binders, native Rust enums, full canon/server support. | **done** |
-| **0.7** | Modules and imports — multi-file programs with capability-explicit module boundaries. | |
+| **0.7** | Modules: `pub` exports + `use geometry { area, Shape, parse as parse_shape }` explicit imports (no globs — every name that enters scope is written out). Resolver flattens the module graph (cycles, visibility, collisions diagnosed against the offending file) into the single-program pipeline; imports grant zero authority — capabilities still only flow through parameters. | **done** |
 | **1.0** | Self-contained backend (LLVM/Cranelift, dropping the rustc dependency) — purity/effect info drives parallelization and check elision. | |
 
 ## Prior art and how Sigil differs

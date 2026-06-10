@@ -33,8 +33,11 @@ fn main(console: Console) -> Unit ! {io.write} {
 
 Plus records (`record Point { x: Int, y: Int }`), sum types with statically
 exhaustive `match` (`enum Shape { Circle(Int), Empty }` — a missing variant
-is a compile error, a dead arm too), and generic functions
-(`fn first[T](xs: List[T]) -> T`, monomorphized to native code).
+is a compile error, a dead arm too), generic functions
+(`fn first[T](xs: List[T]) -> T`, monomorphized to native code), and modules
+(`pub fn` + `use geometry { area, Shape }` — explicit exports, explicit
+imports, no globs; importing a module grants zero authority, because
+capabilities still only flow through parameters).
 
 ## Quickstart
 
