@@ -262,6 +262,10 @@ def rust_type(ty: A.Type) -> str:
         elem = rust_type(ty.elem) if ty.elem is not None else "i64"
         return f"Vec<{elem}>"
     if ty.kind in ("Record", "Enum"):
+        if ty.args:
+            raise SigilError(
+                f"internal: generic instantiation '{ty}' must render through "
+                f"the emitter's rust_type_for (worklist discovery)", 0, 0)
         return f"s_{sym(ty.name)}"
     if ty.kind == "Var":
         raise SigilError(
@@ -272,14 +276,19 @@ def rust_type(ty: A.Type) -> str:
 
 def mangle_type(ty: A.Type) -> str:
     """One name component of a monomorphized symbol: Int, Text, List_Int,
-    List_List_Text, records by their name. Pathological collisions (a record
-    literally named 'List_Int') are theoretically possible and accepted for
-    now — record names are flat and '_'-joining is unambiguous in practice."""
+    List_List_Text, records by their name, generic instantiations by name
+    plus '__'-joined arguments (Pair__Int_Text). Pathological collisions (a
+    record literally named 'List_Int' or 'Pair__Int_Text') are theoretically
+    possible and accepted for now — record names are flat and '_'-joining is
+    unambiguous in practice."""
     if ty.kind == "List":
         # elem None can only come from an all-empty-literal binding, which the
         # checker rejects as uninferable; defend with the Rust default anyway.
         return f"List_{mangle_type(ty.elem) if ty.elem is not None else 'Int'}"
     if ty.kind in ("Record", "Enum"):
+        if ty.args:
+            return (f"{sym(ty.name)}__"
+                    f"{'_'.join(mangle_type(a) for a in ty.args)}")
         return sym(ty.name)
     return ty.kind
 
@@ -307,6 +316,15 @@ class RustEmitter:
         self.fn_decls = {fn.name: fn for fn in program.functions}
         self.instantiated: set[tuple[str, tuple[str, ...]]] = set()
         self.pending: list[tuple[A.FnDecl, dict[str, A.Type]]] = []
+        # The same worklist idea for generic RECORDS and ENUMS: every concrete
+        # `Type` with arguments reaching type rendering enqueues its
+        # instantiation, keyed by the full mangled struct/enum name. Generic
+        # declarations are never emitted raw; unused instantiations produce
+        # no code.
+        self.record_decls = {rec.name: rec for rec in program.records}
+        self.enum_decls = {enum.name: enum for enum in program.enums}
+        self.type_instantiated: set[str] = set()
+        self.type_pending: list[tuple[object, dict[str, A.Type], str]] = []
         # Per enclosing loop, the rendered runtime checks of its UNPROVEN
         # invariants: a `break` is a loop exit, so it re-emits them.
         self.loop_checks: list[list[str]] = []
@@ -319,21 +337,33 @@ class RustEmitter:
     def emit(self) -> str:
         self.lines = [PRELUDE]
         for enum in self.program.enums:
-            self.emit_enum(enum)
-            self.emit_line()
+            if not enum.type_params:
+                self.emit_enum(enum)
+                self.emit_line()
         for rec in self.program.records:
-            self.emit_record(rec)
-            self.emit_line()
+            if not rec.type_params:
+                self.emit_record(rec)
+                self.emit_line()
         # Generic functions are never emitted as-is: seed with the non-generic
         # functions, then drain the instantiations their bodies demanded.
-        # (An uncalled generic function simply produces no code.)
+        # (An uncalled generic function simply produces no code.) Generic
+        # records and enums work the same way: emitting functions (and other
+        # type instantiations) discovers them, and Rust items need no forward
+        # declarations, so the two worklists simply drain together.
         for fn in self.program.functions:
             if not fn.type_params:
                 self.emit_fn(fn, {})
                 self.emit_line()
-        while self.pending:
-            fn, subst = self.pending.pop(0)
-            self.emit_fn(fn, subst)
+        while self.pending or self.type_pending:
+            if self.pending:
+                fn, subst = self.pending.pop(0)
+                self.emit_fn(fn, subst)
+            else:
+                decl, subst, inst_name = self.type_pending.pop(0)
+                if isinstance(decl, A.EnumDecl):
+                    self.emit_enum(decl, subst, inst_name)
+                else:
+                    self.emit_record(decl, subst, inst_name)
             self.emit_line()
         self.emit_entry()
         return "\n".join(self.lines) + "\n"
@@ -342,7 +372,33 @@ class RustEmitter:
 
     def rtype(self, ty: A.Type) -> str:
         """Render a type under the current substitution."""
-        return rust_type(A.substitute(ty, self.subst))
+        return self.rust_type_for(A.substitute(ty, self.subst))
+
+    def rust_type_for(self, ty: A.Type) -> str:
+        """Render a CONCRETE type, enqueuing the instantiation of any generic
+        record or enum it mentions. Every type the emitter renders routes
+        through here, which is what makes instantiation discovery complete:
+        params, lets, returns, fields, payloads, and stamped expression types
+        all pass by on their way into the output."""
+        if ty.kind == "List":
+            elem = self.rust_type_for(ty.elem) if ty.elem is not None else "i64"
+            return f"Vec<{elem}>"
+        if ty.kind in ("Record", "Enum") and ty.args:
+            return self.type_instance(ty)
+        return rust_type(ty)
+
+    def type_instance(self, ty: A.Type) -> str:
+        """The mangled name of one concrete instantiation of a generic record
+        or enum, enqueued for emission on first sight."""
+        decl = (self.record_decls if ty.kind == "Record"
+                else self.enum_decls)[ty.name]
+        name = self.instance_name(ty.name,
+                                  tuple(mangle_type(a) for a in ty.args))
+        if name not in self.type_instantiated:
+            self.type_instantiated.add(name)
+            self.type_pending.append(
+                (decl, dict(zip(decl.type_params, ty.args)), name))
+        return name
 
     def instance_name(self, name: str, parts: tuple[str, ...]) -> str:
         return (f"s_{sym(name)}__{'_'.join(parts)}" if parts
@@ -352,50 +408,78 @@ class RustEmitter:
 
     def record_has_capability(self, ty: A.Type,
                               visiting: set[str] | None = None) -> bool:
+        # Mirrors the checker's contains_capability exactly (the two must
+        # agree: equality is allowed precisely when PartialEq is derived). A
+        # generic instantiation checks its type ARGUMENTS first — before the
+        # visited bail-out — then its field/payload types under the
+        # instantiating substitution; the visited set is keyed by NAME so
+        # recursion through generics terminates.
         if ty.kind in ("Console", "Fs"):
             return True
         if ty.kind == "List":
             return ty.elem is not None and self.record_has_capability(ty.elem, visiting)
         if ty.kind == "Record":
+            if any(self.record_has_capability(a, visiting) for a in ty.args):
+                return True
             visiting = visiting or set()
             if ty.name in visiting:
                 return False
             visiting.add(ty.name)
-            rec = next(r for r in self.program.records if r.name == ty.name)
-            return any(self.record_has_capability(ftype, visiting)
+            rec = self.record_decls[ty.name]
+            inst = dict(zip(rec.type_params, ty.args))
+            return any(self.record_has_capability(A.substitute(ftype, inst),
+                                                  visiting)
                        for _, ftype in rec.fields)
         if ty.kind == "Enum":
+            if any(self.record_has_capability(a, visiting) for a in ty.args):
+                return True
             visiting = visiting or set()
             if ty.name in visiting:
                 return False
             visiting.add(ty.name)
-            enum = next(e for e in self.program.enums if e.name == ty.name)
-            return any(self.record_has_capability(ptype, visiting)
+            enum = self.enum_decls[ty.name]
+            inst = dict(zip(enum.type_params, ty.args))
+            return any(self.record_has_capability(A.substitute(ptype, inst),
+                                                  visiting)
                        for _, payloads in enum.variants for ptype in payloads)
         return False
 
-    def emit_record(self, rec: A.RecordDecl) -> None:
+    def emit_record(self, rec: A.RecordDecl,
+                    subst: dict[str, A.Type] | None = None,
+                    inst_name: str | None = None) -> None:
         # Records compare by value unless they hold a capability (the checker
-        # forbids comparing those, so the derive can be dropped).
-        has_cap = any(self.record_has_capability(ftype)
-                      for _, ftype in rec.fields)
+        # forbids comparing those, so the derive can be dropped). For a
+        # generic record both decisions are PER INSTANTIATION: the fields are
+        # substituted first, so Pair[Fs, Int] drops PartialEq while
+        # Pair[Int, Text] keeps it.
+        fields = [(fname, A.substitute(ftype, subst) if subst else ftype)
+                  for fname, ftype in rec.fields]
+        has_cap = any(self.record_has_capability(ftype) for _, ftype in fields)
         derives = "Clone" if has_cap else "Clone, PartialEq"
         self.emit_line(f"#[derive({derives})]")
-        self.emit_line(f"struct s_{sym(rec.name)} {{")
-        for fname, ftype in rec.fields:
-            self.emit_line(f"    s_{sym(fname)}: {rust_type(ftype)},")
+        name = inst_name if inst_name is not None else f"s_{sym(rec.name)}"
+        self.emit_line(f"struct {name} {{")
+        for fname, ftype in fields:
+            self.emit_line(f"    s_{sym(fname)}: {self.rust_type_for(ftype)},")
         self.emit_line("}")
 
-    def emit_enum(self, enum: A.EnumDecl) -> None:
-        # Same equality rule as records: PartialEq only when capability-free.
+    def emit_enum(self, enum: A.EnumDecl,
+                  subst: dict[str, A.Type] | None = None,
+                  inst_name: str | None = None) -> None:
+        # Same equality rule as records: PartialEq only when capability-free,
+        # decided per instantiation for generic enums.
+        variants = [(vname,
+                     [A.substitute(p, subst) if subst else p for p in payloads])
+                    for vname, payloads in enum.variants]
         has_cap = any(self.record_has_capability(ptype)
-                      for _, payloads in enum.variants for ptype in payloads)
+                      for _, payloads in variants for ptype in payloads)
         derives = "Clone" if has_cap else "Clone, PartialEq"
         self.emit_line(f"#[derive({derives})]")
-        self.emit_line(f"enum s_{sym(enum.name)} {{")
-        for vname, payloads in enum.variants:
+        name = inst_name if inst_name is not None else f"s_{sym(enum.name)}"
+        self.emit_line(f"enum {name} {{")
+        for vname, payloads in variants:
             if payloads:
-                types = ", ".join(rust_type(p) for p in payloads)
+                types = ", ".join(self.rust_type_for(p) for p in payloads)
                 self.emit_line(f"    s_{sym(vname)}({types}),")
             else:
                 self.emit_line(f"    s_{sym(vname)},")
@@ -527,8 +611,10 @@ class RustEmitter:
         # arbitrary expression anyway. Sigil's exhaustiveness rules coincide
         # with Rust's (and dead wildcards are rejected), so every arm maps
         # one-to-one. Binders take the payloads by value from the (owned,
-        # already-cloned) scrutinee.
-        enum_name = stmt.enum_name  # stamped by the checker
+        # already-cloned) scrutinee. Pattern paths use the scrutinee's
+        # SUBSTITUTED type, so a generic enum names its instantiation.
+        sty = A.substitute(expr_ty(stmt.scrutinee), self.subst)
+        enum_path = self.rust_type_for(sty)
         self.emit_line(f"match ({self.expr(stmt.scrutinee)}) {{")
         self.depth += 1
         for arm in stmt.arms:
@@ -536,9 +622,9 @@ class RustEmitter:
                 pattern = "_"
             elif arm.binders:
                 binders = ", ".join(f"s_{sym(b)}" for b in arm.binders)
-                pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}({binders})"
+                pattern = f"{enum_path}::s_{sym(arm.variant)}({binders})"
             else:
-                pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}"
+                pattern = f"{enum_path}::s_{sym(arm.variant)}"
             self.emit_line(f"{pattern} => {{")
             self.depth += 1
             self.emit_block(arm.body)
@@ -577,6 +663,8 @@ class RustEmitter:
         sub.subst = self.subst
         sub.instantiated = self.instantiated
         sub.pending = self.pending
+        sub.type_instantiated = self.type_instantiated
+        sub.type_pending = self.type_pending
         # Share the loop stack too: a break inside an else-if body must see
         # the invariant checks of its enclosing loop.
         sub.loop_checks = self.loop_checks
@@ -598,9 +686,13 @@ class RustEmitter:
             items = ", ".join(self.expr(item) for item in expr.items)
             return f"vec![{items}]"
         if isinstance(expr, A.Var):
-            # A bare nullary variant, stamped by the checker.
+            # A bare nullary variant, stamped by the checker. Its substituted
+            # type names the enum instantiation (and is just s_Name for a
+            # non-generic enum).
             if getattr(expr, "variant_of", None) is not None:
-                return f"s_{sym(expr.variant_of)}::s_{sym(expr.name)}"
+                enum_path = self.rust_type_for(
+                    A.substitute(expr_ty(expr), self.subst))
+                return f"{enum_path}::s_{sym(expr.name)}"
             name = "s__ret" if expr.name == "result" else f"s_{sym(expr.name)}"
             # The clone decision depends on the SUBSTITUTED type: a T that is
             # Int in this instantiation stays un-cloned; a T that is Text clones.
@@ -608,9 +700,11 @@ class RustEmitter:
                 return name
             return f"{name}.clone()"
         if isinstance(expr, A.RecordLit):
+            struct_name = self.rust_type_for(
+                A.substitute(expr_ty(expr), self.subst))
             fields = ", ".join(f"s_{sym(fname)}: {self.expr(fexpr)}"
                                for fname, fexpr in expr.fields)
-            return f"s_{sym(expr.name)} {{ {fields} }}"
+            return f"{struct_name} {{ {fields} }}"
         if isinstance(expr, A.FieldAccess):
             return f"({self.expr(expr.base)}).s_{sym(expr.field_name)}"
         if isinstance(expr, A.IfExpr):
@@ -624,16 +718,17 @@ class RustEmitter:
             # scrutinee position); arms map one-to-one, and arm expressions
             # route through expr(), so instantiation discovery sees calls
             # inside them under the current substitution.
-            enum_name = expr.enum_name  # stamped by the checker
+            sty = A.substitute(expr_ty(expr.scrutinee), self.subst)
+            enum_path = self.rust_type_for(sty)
             arms = []
             for arm in expr.arms:
                 if arm.variant is None:
                     pattern = "_"
                 elif arm.binders:
                     binders = ", ".join(f"s_{sym(b)}" for b in arm.binders)
-                    pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}({binders})"
+                    pattern = f"{enum_path}::s_{sym(arm.variant)}({binders})"
                 else:
-                    pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}"
+                    pattern = f"{enum_path}::s_{sym(arm.variant)}"
                 arms.append(f"{pattern} => {self.expr(arm.expr)},")
             return (f"(match ({self.expr(expr.scrutinee)}) "
                     f"{{ {' '.join(arms)} }})")
@@ -643,11 +738,12 @@ class RustEmitter:
             # the base in a let restores the reference order (base, then
             # fields left to right). The base routes through the normal
             # expr() path, so a Var base clones like any other read.
-            name = A.substitute(expr_ty(expr), self.subst).name
+            struct_name = self.rust_type_for(
+                A.substitute(expr_ty(expr), self.subst))
             fields = ", ".join(f"s_{sym(fname)}: {self.expr(fexpr)}"
                                for fname, fexpr in expr.fields)
             return (f"{{ let s__base = {self.expr(expr.base)}; "
-                    f"s_{sym(name)} {{ {fields}, ..s__base }} }}")
+                    f"{struct_name} {{ {fields}, ..s__base }} }}")
         if isinstance(expr, A.Index):
             return f"rt_index(&({self.expr(expr.base)}), {self.expr(expr.index)})"
         if isinstance(expr, A.Unary):
@@ -686,10 +782,14 @@ class RustEmitter:
         name = expr.name
         args = expr.args
 
-        # Variant construction, stamped by the checker.
+        # Variant construction, stamped by the checker. The substituted
+        # expression type names the enum instantiation (plain s_Name for a
+        # non-generic enum).
         if getattr(expr, "variant_of", None) is not None:
+            enum_path = self.rust_type_for(
+                A.substitute(expr_ty(expr), self.subst))
             rendered = ", ".join(self.expr(a) for a in args)
-            return f"s_{sym(expr.variant_of)}::s_{sym(name)}({rendered})"
+            return f"{enum_path}::s_{sym(name)}({rendered})"
 
         if name == "len":
             arg = args[0]

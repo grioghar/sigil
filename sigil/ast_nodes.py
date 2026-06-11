@@ -18,11 +18,16 @@ class Type:
     name: Optional[str] = None     # record name when kind == 'Record'; enum
                                    # name when kind == 'Enum'; type parameter
                                    # name when kind == 'Var'
+    args: tuple["Type", ...] = ()  # type arguments when kind == 'Record' or
+                                   # 'Enum' references a generic declaration:
+                                   # Pair[Int, Text]. Empty for everything else.
 
     def __str__(self) -> str:
         if self.kind == "List":
             return f"List[{self.elem if self.elem is not None else '?'}]"
         if self.kind in ("Record", "Enum", "Var"):
+            if self.args:
+                return f"{self.name}[{', '.join(str(a) for a in self.args)}]"
             return self.name
         return self.kind
 
@@ -47,7 +52,10 @@ def compatible(expected: Type, actual: Type) -> bool:
             return True
         return compatible(expected.elem, actual.elem)
     if expected.kind in ("Record", "Enum", "Var"):
-        return expected.name == actual.name
+        if expected.name != actual.name or len(expected.args) != len(actual.args):
+            return False
+        return all(compatible(e, a)
+                   for e, a in zip(expected.args, actual.args))
     return True
 
 
@@ -57,16 +65,20 @@ def contains_var(ty: Type) -> bool:
         return True
     if ty.kind == "List":
         return ty.elem is not None and contains_var(ty.elem)
-    return False
+    return any(contains_var(a) for a in ty.args)
 
 
 def substitute(ty: Type, bindings: dict[str, Type]) -> Type:
-    """Replace type variables with their bindings, recursively through List.
-    Variables without a binding are left in place."""
+    """Replace type variables with their bindings, recursively through List
+    and through generic type arguments. Variables without a binding are left
+    in place."""
     if ty.kind == "Var":
         return bindings.get(ty.name, ty)
     if ty.kind == "List" and ty.elem is not None:
         return Type("List", substitute(ty.elem, bindings))
+    if ty.args:
+        return Type(ty.kind, name=ty.name,
+                    args=tuple(substitute(a, bindings) for a in ty.args))
     return ty
 
 
@@ -295,6 +307,7 @@ class RecordDecl:
     fields: list[tuple[str, Type]]
     line: int = 0
     col: int = 0
+    type_params: list[str] = field(default_factory=list)  # generic records
     public: bool = False
 
 
@@ -304,6 +317,7 @@ class EnumDecl:
     variants: list[tuple[str, list[Type]]]   # (variant name, payload types)
     line: int = 0
     col: int = 0
+    type_params: list[str] = field(default_factory=list)  # generic enums
     public: bool = False
 
 

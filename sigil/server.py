@@ -164,10 +164,12 @@ def _method_signatures(program: A.Program) -> dict:
                               for c in fn.contracts]
         functions.append(entry)
     records = [{"name": rec.name,
+                "type_params": list(rec.type_params),
                 "fields": [{"name": fname, "type": str(ftype)}
                            for fname, ftype in rec.fields]}
                for rec in program.records]
     enums = [{"name": enum.name,
+              "type_params": list(enum.type_params),
               "variants": [{"name": vname,
                             "payloads": [str(ptype) for ptype in payloads]}
                            for vname, payloads in enum.variants]}

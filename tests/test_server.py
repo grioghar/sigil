@@ -96,6 +96,7 @@ class TestSignatures(unittest.TestCase):
 
         self.assertEqual(response["records"],
                          [{"name": "Point",
+                           "type_params": [],
                            "fields": [{"name": "x", "type": "Int"},
                                       {"name": "y", "type": "Int"}]}])
 
