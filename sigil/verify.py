@@ -79,7 +79,8 @@ class Report:
 class Opaque:
     """A value the engine does not model structurally. Text and List opaques
     carry a symbolic LENGTH (a Z3 Int), which is what lets contracts about
-    len() prove; records, enums, and capabilities have length None."""
+    len() prove; records and capabilities have length None. Enum values get
+    their own EnumVal below."""
 
     _next = 0
 
@@ -87,6 +88,33 @@ class Opaque:
         Opaque._next += 1
         self.oid = Opaque._next
         self.length = length
+
+
+class EnumVal:
+    """An enum value modeled algebraically: a symbolic TAG (a Z3 Int saying
+    which variant) plus lazily-created payload SLOTS (the values a variant
+    carries). This is what lets a contract see inside a variant — a `match`
+    learns `tag == k` on each arm and binds that variant's exact payload
+    symbols, so `ensures match result { Done(v, j) => j <= len(s), ... }`
+    proves at return sites and is ASSUMED at call sites: because the slots
+    are memoized on the value, the caller's later `match` reconnects to the
+    very symbols the assumed ensures constrained (the engine of inductive,
+    mutually-recursive proofs over parsers).
+
+    `payload_types[variant]` is the (concrete, substituted) payload type list,
+    used to mint slot symbols on demand. A freshly-constructed variant value
+    instead supplies its real argument values directly."""
+
+    _next = 0
+
+    def __init__(self, enum_name, tag, variant_index, payload_types):
+        EnumVal._next += 1
+        self.oid = EnumVal._next
+        self.enum_name = enum_name
+        self.tag = tag                       # z3 Int
+        self.variant_index = variant_index   # name -> tag value
+        self.payload_types = payload_types   # name -> list[Type]
+        self.slots = {}                      # name -> list of payload values
 
 
 class State:
@@ -119,6 +147,12 @@ class Verifier:
     def __init__(self, program: A.Program):
         self.program = program
         self.fns = {f.name: f for f in program.functions}
+        self.enums = {e.name: e for e in program.enums}
+        # variant name -> (enum name, index, declared payload types)
+        self.variant_info: dict[str, tuple[str, int, list]] = {}
+        for enum in program.enums:
+            for index, (vname, payloads) in enumerate(enum.variants):
+                self.variant_info[vname] = (enum.name, index, payloads)
         self.counter = 0
         # (fn name, requires clause index) -> conjunction of call-site proofs
         self.requires_ok: dict[tuple[str, int], bool] = {}
@@ -153,7 +187,90 @@ class Verifier:
             return self.fresh_bool()
         if ty is not None and ty.kind in ("Text", "List"):
             return self.fresh_sized(state)
+        if ty is not None and ty.kind == "Enum" and ty.name in self.enums:
+            return self.fresh_enum(ty, state)
         return Opaque()
+
+    def payload_types_for(self, ty: A.Type) -> dict:
+        """Each variant's payload type list under this enum reference's type
+        arguments (the identity for a non-generic enum)."""
+        enum = self.enums[ty.name]
+        subst = {tp: arg for tp, arg in zip(enum.type_params, ty.args)}
+        out = {}
+        for vname, payloads in enum.variants:
+            out[vname] = [A.substitute(p, subst) if subst else p
+                          for p in payloads]
+        return out
+
+    def fresh_enum(self, ty: A.Type, state: "State") -> "EnumVal":
+        """An unknown value of an enum type: a fresh tag constrained to a
+        valid variant index, with slots minted lazily on demand."""
+        enum = self.enums[ty.name]
+        tag = self.fresh_int()
+        n = len(enum.variants)
+        state.path.append(tag >= 0)
+        state.path.append(tag < n)
+        index = {vname: i for i, (vname, _) in enumerate(enum.variants)}
+        return EnumVal(ty.name, tag, index, self.payload_types_for(ty))
+
+    def enum_slots(self, val: "EnumVal", variant: str, state: "State") -> list:
+        """The payload values a variant carries — minted fresh on first demand
+        and MEMOIZED, so every consumer of the same value (an assumed ensures
+        and the caller's later match) shares the identical symbols."""
+        if variant not in val.slots:
+            val.slots[variant] = [self.fresh_by_type(pt, state)
+                                  for pt in val.payload_types.get(variant, [])]
+        return val.slots[variant]
+
+    def construct_enum(self, expr: A.Call, arg_values: list,
+                       state: "State") -> "EnumVal":
+        """A constructed variant value: a CONCRETE tag and the real argument
+        values as that variant's slots, so a match on it can drop every other
+        arm and reason with the exact payloads."""
+        vname = expr.name
+        enum_name, index, _ = self.variant_info[vname]
+        ty = getattr(expr, "ty", None)
+        if ty is not None and ty.kind == "Enum" and ty.name in self.enums:
+            payload_types = self.payload_types_for(ty)
+        else:
+            payload_types = {v: list(p)
+                             for v, p in self.enums[enum_name].variants}
+        vindex = {v: i for i, (v, _) in enumerate(self.enums[enum_name].variants)}
+        val = EnumVal(enum_name, z3.IntVal(index), vindex, payload_types)
+        val.slots[vname] = list(arg_values)
+        return val
+
+    def arm_guard(self, val: "EnumVal", arm, covered: list):
+        """The z3 condition under which this arm runs: `tag == index` for a
+        named variant, or `tag != j` for all already-covered variants on the
+        wildcard. Returns (guard, is_dead): is_dead is True when a concrete
+        tag rules the arm out entirely."""
+        if arm.variant is None:  # wildcard
+            covered_idx = [val.variant_index[v] for v in covered]
+            if covered_idx:
+                guard = z3.And(*[val.tag != j for j in covered_idx])
+            else:
+                guard = z3.BoolVal(True)
+        else:
+            guard = (val.tag == val.variant_index[arm.variant])
+        # Concrete tag: simplify to drop dead arms.
+        if isinstance(val.tag, z3.IntNumRef):
+            tagv = val.tag.as_long()
+            if arm.variant is None:
+                is_dead = tagv in [val.variant_index[v] for v in covered]
+            else:
+                is_dead = (tagv != val.variant_index[arm.variant])
+            return guard, is_dead
+        return guard, False
+
+    def bind_arm(self, val: "EnumVal", arm, dest: "State") -> None:
+        """Bind an arm's binders to the scrutinee's payload slots for that
+        variant (the precise payload symbols), in dest.vars."""
+        if arm.variant is None:
+            return
+        slots = self.enum_slots(val, arm.variant, dest)
+        for binder, value in zip(arm.binders, slots):
+            dest.vars[binder] = value
 
     def fresh_sized(self, state: "State") -> Opaque:
         """An unknown Text/List value: the only fact is len >= 0."""
@@ -167,9 +284,18 @@ class Verifier:
                 return self.fresh_int()
             if value.sort() == z3.BoolSort():
                 return self.fresh_bool()
+        if isinstance(value, EnumVal):
+            return self.fresh_enum_like(value, state)
         if isinstance(value, Opaque) and value.length is not None:
             return self.fresh_sized(state)
         return Opaque()
+
+    def fresh_enum_like(self, value: "EnumVal", state: "State") -> "EnumVal":
+        tag = self.fresh_int()
+        state.path.append(tag >= 0)
+        state.path.append(tag < len(value.variant_index))
+        return EnumVal(value.enum_name, tag, value.variant_index,
+                       value.payload_types)
 
     @staticmethod
     def length_of(value):
@@ -298,22 +424,31 @@ class Verifier:
         state.alive = False  # control leaves the body here
 
     def exec_match(self, stmt: A.Match, state: State) -> None:
-        # Enum values are Opaque, so no arm can be ruled out: run every arm
-        # on a clone, binders bound to fresh values of their stamped payload
-        # types (Int/Bool binders stay modeled; everything else is Opaque).
-        self.translate(stmt.scrutinee, state)  # record nested obligations
+        scrutinee = self.translate(stmt.scrutinee, state)
         arm_states: list[State] = []
+        covered: list[str] = []
         for arm in stmt.arms:
-            arm_state = state.clone()
-            for binder, btype in zip(arm.binders,
-                                     getattr(arm, "binder_types", [])):
-                arm_state.vars[binder] = self.fresh_by_type(btype, arm_state)
+            if isinstance(scrutinee, EnumVal):
+                guard, is_dead = self.arm_guard(scrutinee, arm, covered)
+                if arm.variant is not None:
+                    covered.append(arm.variant)
+                if is_dead:
+                    continue  # a concrete tag rules this arm out
+                arm_state = state.clone()
+                arm_state.path.append(guard)
+                self.bind_arm(scrutinee, arm, arm_state)
+            else:
+                # Fallback: scrutinee not modeled as an enum (defensive).
+                arm_state = state.clone()
+                for binder, btype in zip(arm.binders,
+                                         getattr(arm, "binder_types", [])):
+                    arm_state.vars[binder] = self.fresh_by_type(btype, arm_state)
             self.exec_block(arm.body, arm_state)
             arm_states.append(arm_state)
 
         survivors = [s for s in arm_states if s.alive]
         if not survivors:
-            state.alive = False  # every arm returned
+            state.alive = False  # every reachable arm returned
             return
         # Conservative merge: which arm ran is unknown, so any variable whose
         # value is not identical across all surviving arms is havocked, and
@@ -375,6 +510,14 @@ class Verifier:
                 merged = self.fresh_sized(state)
                 state.path.append(merged.length ==
                                   z3.If(cond, tval.length, eval_.length))
+                state.vars[name] = merged
+            elif is_z3(cond) and isinstance(tval, EnumVal) \
+                    and isinstance(eval_, EnumVal) \
+                    and tval.enum_name == eval_.enum_name:
+                # Enum values merge by tag: the payload is dropped at the join
+                # (acceptable) but the variant is exactly one of the two.
+                merged = self.fresh_enum_like(tval, state)
+                state.path.append(merged.tag == z3.If(cond, tval.tag, eval_.tag))
                 state.vars[name] = merged
             else:
                 state.vars[name] = self.havoc_like(tval, state)
@@ -578,30 +721,45 @@ class Verifier:
         under each guard the result equals (or matches the length of) that
         arm's value — which is what lets `ensures result >= 0` prove when
         every arm's value provably is."""
-        self.translate(expr.scrutinee, state)  # record nested obligations
+        scrutinee = self.translate(expr.scrutinee, state)
+        modeled = isinstance(scrutinee, EnumVal)
         guards = []
         arm_values = []
+        covered: list[str] = []
         for arm in expr.arms:
-            guard = self.fresh_bool()
+            if modeled:
+                guard, is_dead = self.arm_guard(scrutinee, arm, covered)
+                if arm.variant is not None:
+                    covered.append(arm.variant)
+                if is_dead:
+                    continue
+            else:
+                # Unmodeled scrutinee: a fresh boolean guard, exactly the old
+                # conservative behavior (sound — facts only weaken).
+                guard = self.fresh_bool()
             shadow = State(dict(state.vars), state.path)
-            for binder, btype in zip(arm.binders,
-                                     getattr(arm, "binder_types", [])):
-                # Binder freshness facts (len >= 0 for sized payloads) are
-                # guarded too: they describe a value that only exists when
-                # this arm runs.
-                base = len(state.path)
-                shadow.vars[binder] = self.fresh_by_type(btype, shadow)
-                for i in range(base, len(state.path)):
-                    state.path[i] = z3.Implies(guard, state.path[i])
+            if modeled:
+                self.bind_arm(scrutinee, arm, shadow)
+            else:
+                for binder, btype in zip(arm.binders,
+                                         getattr(arm, "binder_types", [])):
+                    base = len(state.path)
+                    shadow.vars[binder] = self.fresh_by_type(btype, shadow)
+                    for i in range(base, len(state.path)):
+                        state.path[i] = z3.Implies(guard, state.path[i])
             guards.append(guard)
             arm_values.append(self.translate_guarded(arm.expr, shadow, guard))
 
         result = self.fresh_by_type(getattr(expr, "ty", None), state)
-        state.path.append(z3.Or(guards))
+        if guards:
+            state.path.append(z3.Or(*guards) if len(guards) > 1 else guards[0])
         for guard, value in zip(guards, arm_values):
             if is_z3(result) and is_z3(value) \
                     and result.sort() == value.sort():
                 state.path.append(z3.Implies(guard, result == value))
+            elif isinstance(result, EnumVal) and isinstance(value, EnumVal) \
+                    and result.enum_name == value.enum_name:
+                state.path.append(z3.Implies(guard, result.tag == value.tag))
             else:
                 rlen, vlen = self.length_of(result), self.length_of(value)
                 if rlen is not None and vlen is not None:
@@ -630,6 +788,12 @@ class Verifier:
             if bothz3 and left.sort() == right.sort():
                 eq = left == right
                 return eq if op == "==" else z3.Not(eq)
+            if isinstance(left, EnumVal) and isinstance(right, EnumVal) \
+                    and left.enum_name == right.enum_name:
+                # Structure is unknown, but equal values share a tag.
+                equal = self.fresh_bool()
+                state.path.append(z3.Implies(equal, left.tag == right.tag))
+                return equal if op == "==" else z3.Not(equal)
             llen, rlen = self.length_of(left), self.length_of(right)
             if llen is not None and rlen is not None:
                 # Structure is unknown, but equal values have equal lengths.
@@ -676,7 +840,7 @@ class Verifier:
             # Variant construction or builtin. Arguments were translated
             # above, so their nested obligations are already recorded.
             if getattr(expr, "variant_of", None) is not None:
-                return Opaque()
+                return self.construct_enum(expr, arg_values, state)
             return self.translate_builtin(expr, arg_values, state)
 
         # A user call is partial from a clause's point of view: its body can
