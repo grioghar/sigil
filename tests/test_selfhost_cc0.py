@@ -22,29 +22,30 @@ from sigil.modules import load_program
 REPO = Path(__file__).resolve().parent.parent
 CC0_SG = REPO / "selfhost" / "cc0.sg"
 
-# (expression, expected exit status 0..255)
+# (program block, expected exit status 0..255)
 CASES = [
-    ("42", 42),
-    ("40 + 2", 42),
-    ("6 * 7", 42),
-    ("100 - 58", 42),
-    ("2 * 3 * 7", 42),
-    ("(1 + 2) * 14", 42),
-    ("-5 + 47", 42),
-    ("0", 0),
-    ("255", 255),
-    ("1 + 2 * 3 + 4 * 5 + 15", 42),
-    ("84 / 2", 42),
-    ("85 % 43", 42),
-    ("100 / 7", 14),
-    ("5 < 10", 1),
-    ("10 < 5", 0),
-    ("7 == 7", 1),
-    ("7 != 7", 0),
-    ("3 >= 3 and 4 > 2", 1),
-    ("1 > 2 or 9 <= 9", 1),
-    ("not (2 < 1)", 1),
-    ("(8 - 6) * (10 + 11)", 42),
+    ("{ return 42; }", 42),
+    ("{ return 40 + 2; }", 42),
+    ("{ return (8 - 6) * (10 + 11); }", 42),
+    ("{ return 84 / 2; }", 42),
+    ("{ return 85 % 43; }", 42),
+    ("{ return 5 < 10; }", 1),
+    ("{ return 3 >= 3 and 4 > 2; }", 1),
+    ("{ return not (2 < 1); }", 1),
+    ("{ return 0; }", 0),
+    ("{ return 255; }", 255),
+    ("{ let x: Int = 40; return x + 2; }", 42),
+    ("{ var x: Int = 0; x = 42; return x; }", 42),
+    ("{ let x: Int = 7; let y: Int = 6; return x * y; }", 42),
+    ("{ let a: Int = 5; if a > 3 { return 1; } else { return 0; } }", 1),
+    ("{ let a: Int = 2; if a > 3 { return 1; } else { return 7; } }", 7),
+    ("{ let a: Int = 9; if a > 3 { return 11; } return 22; }", 11),
+    ("{ var s: Int = 0; var i: Int = 1; while i <= 8 invariant i >= 1 "
+     "{ s = s + i; i = i + 1; } return s; }", 36),
+    ("{ var n: Int = 5; var f: Int = 1; while n > 1 invariant n >= 0 "
+     "{ f = f * n; n = n - 1; } return f; }", 120),
+    ("{ var i: Int = 0; var c: Int = 0; while i < 10 invariant i >= 0 "
+     "{ if i % 2 == 0 { c = c + 1; } i = i + 1; } return c; }", 5),
 ]
 
 
@@ -70,7 +71,7 @@ class TestCc0(unittest.TestCase):
 
     def test_elf_structure(self):
         with tempfile.TemporaryDirectory() as t:
-            blob = self.compile(Path(t), "40 + 2")
+            blob = self.compile(Path(t), "{ return 40 + 2; }")
         self.assertEqual(blob[:4], b"\x7fELF")
         self.assertEqual(blob[4], 2)       # ELFCLASS64
         self.assertEqual(blob[18], 62)     # x86-64
@@ -81,7 +82,7 @@ class TestCc0(unittest.TestCase):
 
     def test_unsupported_expression_rejected(self):
         with tempfile.TemporaryDirectory() as t:
-            (Path(t) / "e.sg").write_text("n + xs[0]", encoding="utf-8")
+            (Path(t) / "e.sg").write_text("{ return foo(1); }", encoding="utf-8")
             out = io.StringIO()
             old = os.getcwd()
             os.chdir(t)

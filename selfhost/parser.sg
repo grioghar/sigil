@@ -22,7 +22,7 @@ pub enum Res[T] {
 }
 
 // name + type args; simple types carry []
-enum Ty {
+pub enum Ty {
     TApp(Text, List[Ty]),
 }
 
@@ -48,7 +48,7 @@ pub enum Expr {
 // cond, then-body
 // cond, then, else
 // cond, invariants, body
-enum Stmt {
+pub enum Stmt {
     SLet(Text, Ty, Expr),
     SVar(Text, Ty, Expr),
     SAssign(Text, Expr),
@@ -396,7 +396,7 @@ fn parse_list(toks: List[Token], i: Int, acc: List[Expr]) -> Res[Expr] {
 }
 
 // ---------------------------------------------------------------- statements
-fn parse_block(toks: List[Token], i: Int) -> Res[List[Stmt]] {
+pub fn parse_block(toks: List[Token], i: Int) -> Res[List[Stmt]] {
     if tkind(toks, i) != "{" {
         return RErr("expected {", i);
     }
