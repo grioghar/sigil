@@ -22,30 +22,33 @@ from sigil.modules import load_program
 REPO = Path(__file__).resolve().parent.parent
 CC0_SG = REPO / "selfhost" / "cc0.sg"
 
-# (program block, expected exit status 0..255)
+# (program, expected exit status 0..255). main's return value is the exit code.
 CASES = [
-    ("{ return 42; }", 42),
-    ("{ return 40 + 2; }", 42),
-    ("{ return (8 - 6) * (10 + 11); }", 42),
-    ("{ return 84 / 2; }", 42),
-    ("{ return 85 % 43; }", 42),
-    ("{ return 5 < 10; }", 1),
-    ("{ return 3 >= 3 and 4 > 2; }", 1),
-    ("{ return not (2 < 1); }", 1),
-    ("{ return 0; }", 0),
-    ("{ return 255; }", 255),
-    ("{ let x: Int = 40; return x + 2; }", 42),
-    ("{ var x: Int = 0; x = 42; return x; }", 42),
-    ("{ let x: Int = 7; let y: Int = 6; return x * y; }", 42),
-    ("{ let a: Int = 5; if a > 3 { return 1; } else { return 0; } }", 1),
-    ("{ let a: Int = 2; if a > 3 { return 1; } else { return 7; } }", 7),
-    ("{ let a: Int = 9; if a > 3 { return 11; } return 22; }", 11),
-    ("{ var s: Int = 0; var i: Int = 1; while i <= 8 invariant i >= 1 "
-     "{ s = s + i; i = i + 1; } return s; }", 36),
-    ("{ var n: Int = 5; var f: Int = 1; while n > 1 invariant n >= 0 "
-     "{ f = f * n; n = n - 1; } return f; }", 120),
-    ("{ var i: Int = 0; var c: Int = 0; while i < 10 invariant i >= 0 "
-     "{ if i % 2 == 0 { c = c + 1; } i = i + 1; } return c; }", 5),
+    ("fn main() -> Int { return 42; }", 42),
+    ("fn main() -> Int { return (8 - 6) * (10 + 11); }", 42),
+    ("fn main() -> Int { let a: Int = 9; if a > 3 { return 11; } return 22; }", 11),
+    ("fn main() -> Int { var s: Int = 0; var i: Int = 1; "
+     "while i <= 8 invariant i >= 1 { s = s + i; i = i + 1; } return s; }", 36),
+    # functions, parameters, calls
+    ("fn add(a: Int, b: Int) -> Int { return a + b; }\n"
+     "fn main() -> Int { return add(40, 2); }", 42),
+    ("fn sq(x: Int) -> Int { return x * x; }\n"
+     "fn main() -> Int { return sq(6) + 6; }", 42),
+    ("fn maxi(a: Int, b: Int) -> Int { if a > b { return a; } return b; }\n"
+     "fn main() -> Int { return maxi(17, 42); }", 42),
+    ("fn id(x: Int) -> Int { return x; }\n"
+     "fn twice(x: Int) -> Int { return id(x) + id(x); }\n"
+     "fn main() -> Int { return twice(21); }", 42),
+    # recursion
+    ("fn fib(n: Int) -> Int { if n < 2 { return n; } "
+     "return fib(n - 1) + fib(n - 2); }\n"
+     "fn main() -> Int { return fib(10); }", 55),
+    ("fn fact(n: Int) -> Int { if n <= 1 { return 1; } "
+     "return n * fact(n - 1); }\n"
+     "fn main() -> Int { return fact(5); }", 120),
+    ("fn sum_to(n: Int) -> Int { var s: Int = 0; var i: Int = 1; "
+     "while i <= n invariant i >= 1 { s = s + i; i = i + 1; } return s; }\n"
+     "fn main() -> Int { return sum_to(8); }", 36),
 ]
 
 
@@ -71,7 +74,7 @@ class TestCc0(unittest.TestCase):
 
     def test_elf_structure(self):
         with tempfile.TemporaryDirectory() as t:
-            blob = self.compile(Path(t), "{ return 40 + 2; }")
+            blob = self.compile(Path(t), "fn main() -> Int { return 40 + 2; }")
         self.assertEqual(blob[:4], b"\x7fELF")
         self.assertEqual(blob[4], 2)       # ELFCLASS64
         self.assertEqual(blob[18], 62)     # x86-64
@@ -82,7 +85,8 @@ class TestCc0(unittest.TestCase):
 
     def test_unsupported_expression_rejected(self):
         with tempfile.TemporaryDirectory() as t:
-            (Path(t) / "e.sg").write_text("{ return foo(1); }", encoding="utf-8")
+            (Path(t) / "e.sg").write_text('fn main() -> Text { return "hi"; }',
+                                          encoding="utf-8")
             out = io.StringIO()
             old = os.getcwd()
             os.chdir(t)

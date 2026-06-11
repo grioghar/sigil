@@ -1,22 +1,33 @@
-// cc0 — the Sigil compiler, stage 2: a native compiler written in Sigil that
-// compiles a function BODY (a block of statements with local variables and
-// control flow) to a static x86-64 Linux ELF — no rustc, no linker, no libc.
+// cc0 — the Sigil compiler, stage 3: a native compiler written in Sigil that
+// compiles a whole PROGRAM (multiple functions, parameters, calls, recursion)
+// to a static x86-64 Linux ELF — no rustc, no linker, no libc
 // (docs/SELFHOST.md). The whole pipeline runs in Sigil: lex -> parse ->
 // codegen -> ELF -> a binary that runs.
 //
-// Supported now: a block { ... } using let/var (Int/Bool locals), assignment,
-// if / else, while (+invariants, which codegen ignores), return, expression
-// statements; expressions over int/bool literals, locals, + - * / %,
-// comparisons, and/or/not. The block's `return` sets the process exit status
-// (masked to 8 bits). Grows toward functions, calls, and the heap runtime.
+// Subset: functions over Int/Bool/Unit; let/var locals, assignment, if/else,
+// while (+invariants ignored by codegen), return, expression statements,
+// calls (incl. recursion); expressions over int/bool literals, locals, params,
+// + - * / %, comparisons, and/or/not. The program's `main` is the entry; its
+// returned value becomes the process exit status (masked to 8 bits).
 //
-// Codegen is a stack machine: gen(e) emits code leaving e's value on the CPU
-// stack. Locals live in a frame at [rbp - 8*(slot+1)]; control flow emits
-// conditional/relative jumps whose offsets are computed from block lengths.
+// Codegen is a stack machine. Each function has a frame: parameters sit above
+// the saved rbp at [rbp + 16 + 8*(nparams-1-i)] (the caller pushed them), and
+// locals below at [rbp - 8*(slot+1)] — one signed displacement map per
+// function. Calls use absolute addressing (mov rax, imm64; call rax), so a
+// two-pass layout resolves each function's address before emission.
 //
 // Usage: reads a source path on stdin, then an output path on the next line.
 use lexer { Token, lex }
-use parser { Expr, Res, Stmt, Ty, parse_block }
+use parser { Expr, Fn, Param, Res, Stmt, Ty, parse_program }
+
+// Codegen context: the variable displacement map (this function) and the
+// function-address map (whole program).
+record Ctx {
+    vnames: List[Text],
+    vdisps: List[Int],
+    fnames: List[Text],
+    foffs: List[Int],
+}
 
 // ---------------------------------------------------------------- byte helpers
 fn cat(a: List[Int], b: List[Int]) -> List[Int] {
@@ -31,7 +42,6 @@ fn cat(a: List[Int], b: List[Int]) -> List[Int] {
     return out;
 }
 
-// `n` as `width` little-endian bytes. Non-negative values only.
 fn le(n: Int, width: Int) -> List[Int] {
     var out: List[Int] = [];
     var v: Int = n;
@@ -46,7 +56,6 @@ fn le(n: Int, width: Int) -> List[Int] {
     return out;
 }
 
-// Signed 32-bit little-endian (for negative displacements and back-jumps).
 fn le_s32(n: Int) -> List[Int] {
     var v: Int = n;
     if v < 0 {
@@ -59,22 +68,20 @@ fn round16(n: Int) -> Int {
     return (n + 15) / 16 * 16;
 }
 
-// ---------------------------------------------------------------- locals
-fn find_slot(names: List[Text], x: Text) -> Int {
+// ---------------------------------------------------------------- frame maps
+fn lookup(names: List[Text], vals: List[Int], x: Text) -> Int {
     var i: Int = 0;
     while i < len(names)
         invariant i >= 0
     {
         if names[i] == x {
-            return i;
+            return vals[i];
         }
         i = i + 1;
     }
     return 0;
 }
 
-// Names cannot shadow in Sigil, so every local in a function is distinct: one
-// flat slot per name suffices. Collect them all (recursing into bodies).
 fn collect_locals(stmts: List[Stmt], acc: List[Text]) -> List[Text] {
     var out: List[Text] = acc;
     var i: Int = 0;
@@ -122,9 +129,33 @@ fn collect_stmt_locals(s: Stmt, acc: List[Text]) -> List[Text] {
     }
 }
 
+// Build the per-function variable map: params above rbp, locals below.
+fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int]) -> Ctx {
+    let np: Int = len(f.params);
+    var vn: List[Text] = [];
+    var vd: List[Int] = [];
+    var i: Int = 0;
+    while i < np
+        invariant i >= 0
+    {
+        vn = push(vn, f.params[i].name);
+        vd = push(vd, 16 + 8 * (np - 1 - i));
+        i = i + 1;
+    }
+    let locals: List[Text] = collect_locals(f.body, []);
+    var j: Int = 0;
+    while j < len(locals)
+        invariant j >= 0
+    {
+        vn = push(vn, locals[j]);
+        vd = push(vd, 0 - 8 * (j + 1));
+        j = j + 1;
+    }
+    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs };
+}
+
 // ---------------------------------------------------------------- expr codegen
 fn bin_op(op: Text) -> List[Int] {
-    // pop rbx (right) ; pop rax (left) ; <op> ; push rax
     if op == "+" {
         return [91, 88, 72, 1, 216, 80];
     }
@@ -175,7 +206,7 @@ fn setcc(op: Text) -> List[Int] {
     return [15, 157, 192];
 }
 
-fn gen(e: Expr, names: List[Text]) -> List[Int] {
+fn gen(e: Expr, ctx: Ctx) -> List[Int] {
     match e {
         EInt(n) => {
             return cat([72, 184], cat(le(n, 8), [80]));
@@ -187,23 +218,23 @@ fn gen(e: Expr, names: List[Text]) -> List[Int] {
             return cat([72, 184], cat(le(0, 8), [80]));
         }
         EVar(x) => {
-            // mov rax, [rbp - 8*(slot+1)] ; push rax
-            let off: Int = 8 * (find_slot(names, x) + 1);
-            return cat([72, 139, 133], cat(le_s32(0 - off), [80]));
+            // mov rax, [rbp + disp] ; push rax
+            let disp: Int = lookup(ctx.vnames, ctx.vdisps, x);
+            return cat([72, 139, 133], cat(le_s32(disp), [80]));
         }
         EUn(op, kids) => {
             if op == "not" {
-                return cat(gen(kids[0], names), [88, 72, 131, 240, 1, 80]);
+                return cat(gen(kids[0], ctx), [88, 72, 131, 240, 1, 80]);
             }
-            return cat(gen(kids[0], names), [88, 72, 247, 216, 80]);
+            return cat(gen(kids[0], ctx), [88, 72, 247, 216, 80]);
         }
         EBin(op, kids) => {
-            return cat(gen(kids[0], names), cat(gen(kids[1], names), bin_op(op)));
-        }
-        EText(t) => {
-            return [];
+            return cat(gen(kids[0], ctx), cat(gen(kids[1], ctx), bin_op(op)));
         }
         ECall(name, args) => {
+            return gen_call(name, args, ctx);
+        }
+        EText(t) => {
             return [];
         }
         EIndex(kids) => {
@@ -218,16 +249,38 @@ fn gen(e: Expr, names: List[Text]) -> List[Int] {
     }
 }
 
-// ---------------------------------------------------------------- stmt codegen
-fn store(names: List[Text], n: Text) -> List[Int] {
-    // pop rax ; mov [rbp - 8*(slot+1)], rax
-    let off: Int = 8 * (find_slot(names, n) + 1);
-    return cat([88, 72, 137, 133], le_s32(0 - off));
+fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
+    // push args left-to-right, then: mov rax, imm64(addr); call rax;
+    // add rsp, 8*nargs (drop args); push rax (result).
+    var code: List[Int] = [];
+    var i: Int = 0;
+    while i < len(args)
+        invariant i >= 0
+    {
+        code = cat(code, gen(args[i], ctx));
+        i = i + 1;
+    }
+    let addr: Int = 4194424 + lookup(ctx.fnames, ctx.foffs, name);
+    // mov rax, imm64
+    code = cat(code, cat([72, 184], le(addr, 8)));
+    // call rax
+    code = cat(code, [255, 208]);
+    // add rsp, n
+    code = cat(code, cat([72, 129, 196], le(8 * len(args), 4)));
+    // push rax
+    return cat(code, [80]);
 }
 
-fn cond_test(c: Expr, names: List[Text]) -> List[Int] {
-    // value of c on the stack -> pop rax ; test rax, rax
-    return cat(gen(c, names), [88, 72, 133, 192]);
+// ---------------------------------------------------------------- stmt codegen
+fn store(ctx: Ctx, n: Text) -> List[Int] {
+    // pop rax ; mov [rbp + disp], rax
+    let disp: Int = lookup(ctx.vnames, ctx.vdisps, n);
+    return cat([88, 72, 137, 133], le_s32(disp));
+}
+
+fn cond_test(c: Expr, ctx: Ctx) -> List[Int] {
+    // pop rax ; test rax, rax
+    return cat(gen(c, ctx), [88, 72, 133, 192]);
 }
 
 fn jz(rel: Int) -> List[Int] {
@@ -238,71 +291,135 @@ fn jmp(rel: Int) -> List[Int] {
     return cat([233], le_s32(rel));
 }
 
-fn exit_with_value() -> List[Int] {
-    // pop rdi ; mov eax, 60 ; syscall
-    return [95, 184, 60, 0, 0, 0, 15, 5];
-}
-
-fn gen_block(stmts: List[Stmt], names: List[Text]) -> List[Int] {
+fn gen_block(stmts: List[Stmt], ctx: Ctx) -> List[Int] {
     var out: List[Int] = [];
     var i: Int = 0;
     while i < len(stmts)
         invariant i >= 0
     {
-        out = cat(out, gen_stmt(stmts[i], names));
+        out = cat(out, gen_stmt(stmts[i], ctx));
         i = i + 1;
     }
     return out;
 }
 
-fn gen_stmt(s: Stmt, names: List[Text]) -> List[Int] {
+fn gen_stmt(s: Stmt, ctx: Ctx) -> List[Int] {
     match s {
         SLet(n, t, e) => {
-            return cat(gen(e, names), store(names, n));
+            return cat(gen(e, ctx), store(ctx, n));
         }
         SVar(n, t, e) => {
-            return cat(gen(e, names), store(names, n));
+            return cat(gen(e, ctx), store(ctx, n));
         }
         SAssign(n, e) => {
-            return cat(gen(e, names), store(names, n));
+            return cat(gen(e, ctx), store(ctx, n));
         }
         SReturn(e) => {
-            return cat(gen(e, names), exit_with_value());
+            // value -> pop rax ; leave ; ret
+            return cat(gen(e, ctx), [88, 201, 195]);
         }
         SReturnVoid => {
-            // mov edi, 0 ; mov eax, 60 ; syscall
-            return [191, 0, 0, 0, 0, 184, 60, 0, 0, 0, 15, 5];
+            // leave ; ret
+            return [201, 195];
         }
         SExpr(e) => {
             // discard pushed value
-            return cat(gen(e, names), [88]);
+            return cat(gen(e, ctx), [88]);
         }
         SBreak => {
             return [];
         }
         SIf(c, body) => {
-            let then_code: List[Int] = gen_block(body, names);
-            return cat(cond_test(c, names), cat(jz(len(then_code)), then_code));
+            let then_code: List[Int] = gen_block(body, ctx);
+            return cat(cond_test(c, ctx), cat(jz(len(then_code)), then_code));
         }
         SIfElse(c, t, e) => {
-            let then_code: List[Int] = gen_block(t, names);
-            let else_code: List[Int] = gen_block(e, names);
-            // false -> jump past then-block and its trailing 5-byte jmp.
-            let head: List[Int] = cat(cond_test(c, names), jz(len(then_code) + 5));
+            let then_code: List[Int] = gen_block(t, ctx);
+            let else_code: List[Int] = gen_block(e, ctx);
+            let head: List[Int] = cat(cond_test(c, ctx), jz(len(then_code) + 5));
             let mid: List[Int] = cat(then_code, jmp(len(else_code)));
             return cat(head, cat(mid, else_code));
         }
         SWhile(c, invs, body) => {
-            let test: List[Int] = cond_test(c, names);
-            let body_code: List[Int] = gen_block(body, names);
-            // top: test; jz end(over body + back-jmp); body; jmp top.
+            let test: List[Int] = cond_test(c, ctx);
+            let body_code: List[Int] = gen_block(body, ctx);
             let back: Int = 0 - (len(test) + 6 + len(body_code) + 5);
             return cat(test, cat(jz(len(body_code) + 5), cat(body_code, jmp(back))));
         }
     }
 }
 
+// ---------------------------------------------------------------- function
+fn prologue(frame: Int) -> List[Int] {
+    // push rbp ; mov rbp, rsp ; sub rsp, frame
+    return cat([85, 72, 137, 229, 72, 129, 236], le(frame, 4));
+}
+
+fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int]) -> List[Int] {
+    let ctx: Ctx = build_ctx(f, fnames, foffs);
+    let frame: Int = round16(8 * len(collect_locals(f.body, [])));
+    // fall-through safety: xor eax, eax ; leave ; ret
+    return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
+}
+
+// Entry stub at code offset 0 (ELF entry 0x400078): call main, exit(rax).
+fn entry_stub(main_off: Int) -> List[Int] {
+    let addr: Int = 4194424 + main_off;
+    let call: List[Int] = cat(cat([72, 184], le(addr, 8)), [255, 208]);
+    return cat(call, [72, 137, 199, 184, 60, 0, 0, 0, 15, 5]);
+}
+
+fn fn_offsets(fns: List[Fn]) -> List[Int] {
+    // pass A: lay functions out after the 22-byte entry stub to get offsets.
+    var offs: List[Int] = [];
+    var acc: Int = 22;
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        offs = push(offs, acc);
+        acc = acc + len(gen_fn(fns[i], [], []));
+        i = i + 1;
+    }
+    return offs;
+}
+
+fn fn_names(fns: List[Fn]) -> List[Text] {
+    var ns: List[Text] = [];
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        ns = push(ns, fns[i].name);
+        i = i + 1;
+    }
+    return ns;
+}
+
+fn compile_program(fns: List[Fn]) -> List[Int] {
+    let names: List[Text] = fn_names(fns);
+    let offs: List[Int] = fn_offsets(fns);
+    let main_off: Int = lookup(names, offs, "main");
+    var code: List[Int] = entry_stub(main_off);
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        code = cat(code, gen_fn(fns[i], names, offs));
+        i = i + 1;
+    }
+    return code;
+}
+
 // ---------------------------------------------------------------- support gate
+fn ty_simple(t: Ty) -> Bool {
+    match t {
+        TApp(name, args) => {
+            return len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit");
+        }
+    }
+}
+
 fn supported(e: Expr) -> Bool {
     match e {
         EInt(n) => {
@@ -322,10 +439,10 @@ fn supported(e: Expr) -> Bool {
             let logic: Bool = op == "and" or op == "or";
             return (arith or logic or is_cmp(op)) and supported(kids[0]) and supported(kids[1]);
         }
-        EText(t) => {
-            return false;
-        }
         ECall(name, args) => {
+            return all_supported(args);
+        }
+        EText(t) => {
             return false;
         }
         EIndex(kids) => {
@@ -338,6 +455,19 @@ fn supported(e: Expr) -> Bool {
             return false;
         }
     }
+}
+
+fn all_supported(args: List[Expr]) -> Bool {
+    var i: Int = 0;
+    while i < len(args)
+        invariant i >= 0
+    {
+        if not supported(args[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }
 
 fn supported_block(stmts: List[Stmt]) -> Bool {
@@ -388,12 +518,43 @@ fn supported_stmt(s: Stmt) -> Bool {
     }
 }
 
-// ---------------------------------------------------------------- ELF + frame
-fn prologue(frame: Int) -> List[Int] {
-    // push rbp ; mov rbp, rsp ; sub rsp, frame
-    return cat([85, 72, 137, 229, 72, 129, 236], le(frame, 4));
+fn params_ok(ps: List[Param]) -> Bool {
+    var i: Int = 0;
+    while i < len(ps)
+        invariant i >= 0
+    {
+        if not ty_simple(ps[i].ty) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }
 
+fn supported_program(fns: List[Fn]) -> Bool {
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        let f: Fn = fns[i];
+        if len(f.tparams) != 0 {
+            return false;
+        }
+        if not ty_simple(f.ret) {
+            return false;
+        }
+        if not params_ok(f.params) {
+            return false;
+        }
+        if not supported_block(f.body) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- ELF + main
 fn elf(code: List[Int]) -> List[Int] {
     let total: Int = 120 + len(code);
     var out: List[Int] = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -446,18 +607,14 @@ fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.writ
     let src_path: Text = read_line(console);
     let out_path: Text = read_line(console);
     let toks: List[Token] = lex(read_file(fs, src_path));
-    match parse_block(toks, 0) {
-        ROk(stmts, j) => {
-            if supported_block(stmts) {
-                let names: List[Text] = collect_locals(stmts, []);
-                let frame: Int = round16(8 * len(names));
-                let body: List[Int] = gen_block(stmts, names);
-                // fall-through exit 0 if the block did not return.
-                let code: List[Int] = cat(prologue(frame), cat(body, [191, 0, 0, 0, 0, 184, 60, 0, 0, 0, 15, 5]));
+    match parse_program(toks, 0, []) {
+        ROk(fns, j) => {
+            if supported_program(fns) {
+                let code: List[Int] = compile_program(fns);
                 write_bytes(fs, out_path, elf(code));
-                print(console, "compiled " + str(len(code)) + " bytes of code");
+                print(console, "compiled " + str(len(fns)) + " function(s), " + str(len(code)) + " bytes");
             } else {
-                print(console, "cc0: unsupported construct (stage 2)");
+                print(console, "cc0: unsupported construct (stage 3)");
             }
         }
         RErr(m, p) => {
