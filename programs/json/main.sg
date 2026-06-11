@@ -1,0 +1,23 @@
+// json demo: parse a few hardcoded documents, render them back compactly,
+// and show the parser's error reporting (message + position) on bad input.
+use json { Step, parse, render }
+
+fn main(console: Console) -> Unit ! {io.write} {
+    demo(console, "{ \"name\": \"sigil\",\n  \"verified\": true,\n  \"stars\": 128,\n  \"tags\": [\"json\", \"dogfood\"] }");
+    demo(console, "[1, -20, [true, null, {}], \"line\\nbreak \\\"quoted\\\"\"]");
+    demo(console, "[1, 2,]");
+    demo(console, "{\"pi\": 3.14}");
+    demo(console, "{\"a\": \"\\u0041\"}");
+    demo(console, "{\"a\": 1} trailing");
+}
+
+fn demo(console: Console, doc: Text) -> Unit ! {io.write} {
+    match parse(doc) {
+        Done(v, end) => {
+            print(console, "ok   " + render(v));
+        }
+        Fail(msg, pos) => {
+            print(console, "fail " + msg + " at " + str(pos));
+        }
+    }
+}
