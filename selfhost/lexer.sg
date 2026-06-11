@@ -6,7 +6,7 @@
 // effort will close), reads that file, and prints one line per token:
 // <kind> <line> <col> <escaped-value>
 // The Python harness formats sigil.lexer's tokens identically and compares.
-record Token {
+pub record Token {
     kind: Text,
     value: Text,
     line: Int,

@@ -1,0 +1,407 @@
+// The Sigil parser, written in Sigil — bootstrap component #2 on the road to
+// self-hosting (docs/SELFHOST.md). This first slice is the EXPRESSION grammar
+// (the recursive heart); statements, declarations, contracts, and modules
+// follow. It consumes the real lexer's tokens, so lexer+parser compose.
+//
+// A language gap this surfaces: Sigil rejects direct enum-in-enum recursion
+// (infinite size), so an Expr cannot hold a bare Expr child. Every recursive
+// child is therefore encoded through List[Expr] (heap-indirected) — e.g. a
+// binary node carries [left, right]. It works, but argues for a future Box[T]
+// indirection type. Noted in selfhost/NOTES.md.
+//
+// Usage: reads one expression on stdin, prints its AST as a canonical S-expr
+// (the Python harness dumps sigil.parser's AST in the same form and compares).
+use lexer { Token, lex }
+
+// [left, right]
+// [operand]
+// arguments
+// [base, index]
+// field name; [base]
+// items
+enum Expr {
+    EInt(Int),
+    EBool(Bool),
+    EText(Text),
+    EVar(Text),
+    EBin(Text, List[Expr]),
+    EUn(Text, List[Expr]),
+    ECall(Text, List[Expr]),
+    EIndex(List[Expr]),
+    EField(Text, List[Expr]),
+    EList(List[Expr]),
+}
+
+// Parse result: a node and the index just past it, or a message and position.
+// (The monomorphic Step[T] shape — every parse fn returns one.)
+enum Parse {
+    POk(Expr, Int),
+    PErr(Text, Int),
+}
+
+// ---------------------------------------------------------------- token access
+fn tkind(toks: List[Token], i: Int) -> Text {
+    if i < 0 or i >= len(toks) {
+        return "EOF";
+    }
+    return toks[i].kind;
+}
+
+fn tval(toks: List[Token], i: Int) -> Text {
+    if i < 0 or i >= len(toks) {
+        return "";
+    }
+    return toks[i].value;
+}
+
+fn code_at(s: Text, i: Int) -> Int
+    requires i >= 0 and i < len(s)
+{
+    return ord(slice(s, i, i + 1));
+}
+
+fn digits_to_int(s: Text) -> Int {
+    var v: Int = 0;
+    var i: Int = 0;
+    while i < len(s)
+        invariant i >= 0
+    {
+        v = v * 10 + (code_at(s, i) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn is_cmp(k: Text) -> Bool {
+    return k == "==" or k == "!=" or k == "<" or k == "<=" or k == ">" or k == ">=";
+}
+
+// ---------------------------------------------------------------- expressions
+//
+// Precedence ladder, loosest to tightest, mirroring sigil/parser.py:
+// or > and > comparison > +,- > *,/,% > unary(not,-) > postfix([], .) > primary
+// Each binary level folds left-associatively via a *_rest helper.
+fn parse_expr(toks: List[Token], i: Int) -> Parse {
+    return parse_or(toks, i);
+}
+
+fn parse_or(toks: List[Token], i: Int) -> Parse {
+    match parse_and(toks, i) {
+        POk(left, j) => {
+            return parse_or_rest(toks, left, j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_or_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+    if tkind(toks, i) == "or" {
+        match parse_and(toks, i + 1) {
+            POk(right, j) => {
+                return parse_or_rest(toks, EBin("or", [left, right]), j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    return POk(left, i);
+}
+
+fn parse_and(toks: List[Token], i: Int) -> Parse {
+    match parse_cmp(toks, i) {
+        POk(left, j) => {
+            return parse_and_rest(toks, left, j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_and_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+    if tkind(toks, i) == "and" {
+        match parse_cmp(toks, i + 1) {
+            POk(right, j) => {
+                return parse_and_rest(toks, EBin("and", [left, right]), j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    return POk(left, i);
+}
+
+fn parse_cmp(toks: List[Token], i: Int) -> Parse {
+    match parse_add(toks, i) {
+        POk(left, j) => {
+            return parse_cmp_rest(toks, left, j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_cmp_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+    if is_cmp(tkind(toks, i)) {
+        let op: Text = tkind(toks, i);
+        match parse_add(toks, i + 1) {
+            POk(right, j) => {
+                return parse_cmp_rest(toks, EBin(op, [left, right]), j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    return POk(left, i);
+}
+
+fn parse_add(toks: List[Token], i: Int) -> Parse {
+    match parse_mul(toks, i) {
+        POk(left, j) => {
+            return parse_add_rest(toks, left, j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_add_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+    let k: Text = tkind(toks, i);
+    if k == "+" or k == "-" {
+        match parse_mul(toks, i + 1) {
+            POk(right, j) => {
+                return parse_add_rest(toks, EBin(k, [left, right]), j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    return POk(left, i);
+}
+
+fn parse_mul(toks: List[Token], i: Int) -> Parse {
+    match parse_unary(toks, i) {
+        POk(left, j) => {
+            return parse_mul_rest(toks, left, j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_mul_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+    let k: Text = tkind(toks, i);
+    if k == "*" or k == "/" or k == "%" {
+        match parse_unary(toks, i + 1) {
+            POk(right, j) => {
+                return parse_mul_rest(toks, EBin(k, [left, right]), j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    return POk(left, i);
+}
+
+fn parse_unary(toks: List[Token], i: Int) -> Parse {
+    let k: Text = tkind(toks, i);
+    if k == "not" or k == "-" {
+        match parse_unary(toks, i + 1) {
+            POk(x, j) => {
+                return POk(EUn(k, [x]), j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    return parse_postfix(toks, i);
+}
+
+fn parse_postfix(toks: List[Token], i: Int) -> Parse {
+    match parse_primary(toks, i) {
+        POk(base, j) => {
+            return parse_postfix_rest(toks, base, j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_postfix_rest(toks: List[Token], base: Expr, i: Int) -> Parse {
+    let k: Text = tkind(toks, i);
+    if k == "[" {
+        match parse_expr(toks, i + 1) {
+            POk(idx, j) => {
+                if tkind(toks, j) == "]" {
+                    return parse_postfix_rest(toks, EIndex([base, idx]), j + 1);
+                }
+                return PErr("expected ]", j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    if k == "." {
+        if tkind(toks, i + 1) == "IDENT" {
+            return parse_postfix_rest(toks, EField(tval(toks, i + 1), [base]), i + 2);
+        }
+        return PErr("expected field name", i + 1);
+    }
+    return POk(base, i);
+}
+
+fn parse_primary(toks: List[Token], i: Int) -> Parse {
+    let k: Text = tkind(toks, i);
+    if k == "INT" {
+        return POk(EInt(digits_to_int(tval(toks, i))), i + 1);
+    }
+    if k == "TEXT" {
+        return POk(EText(tval(toks, i)), i + 1);
+    }
+    if k == "true" {
+        return POk(EBool(true), i + 1);
+    }
+    if k == "false" {
+        return POk(EBool(false), i + 1);
+    }
+    if k == "(" {
+        match parse_expr(toks, i + 1) {
+            POk(e, j) => {
+                if tkind(toks, j) == ")" {
+                    return POk(e, j + 1);
+                }
+                return PErr("expected )", j);
+            }
+            PErr(m, p) => {
+                return PErr(m, p);
+            }
+        }
+    }
+    if k == "[" {
+        return parse_list(toks, i + 1, []);
+    }
+    if k == "IDENT" {
+        let name: Text = tval(toks, i);
+        if tkind(toks, i + 1) == "(" {
+            return parse_args(toks, name, i + 2, []);
+        }
+        return POk(EVar(name), i + 1);
+    }
+    return PErr("unexpected token", i);
+}
+
+fn parse_args(toks: List[Token], name: Text, i: Int, acc: List[Expr]) -> Parse {
+    if tkind(toks, i) == ")" {
+        return POk(ECall(name, acc), i + 1);
+    }
+    match parse_expr(toks, i) {
+        POk(e, j) => {
+            let acc2: List[Expr] = push(acc, e);
+            if tkind(toks, j) == "," {
+                return parse_args(toks, name, j + 1, acc2);
+            }
+            if tkind(toks, j) == ")" {
+                return POk(ECall(name, acc2), j + 1);
+            }
+            return PErr("expected , or ) in arguments", j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+fn parse_list(toks: List[Token], i: Int, acc: List[Expr]) -> Parse {
+    if tkind(toks, i) == "]" {
+        return POk(EList(acc), i + 1);
+    }
+    match parse_expr(toks, i) {
+        POk(e, j) => {
+            let acc2: List[Expr] = push(acc, e);
+            if tkind(toks, j) == "," {
+                return parse_list(toks, j + 1, acc2);
+            }
+            if tkind(toks, j) == "]" {
+                return POk(EList(acc2), j + 1);
+            }
+            return PErr("expected , or ] in list", j);
+        }
+        PErr(m, p) => {
+            return PErr(m, p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- dump
+fn dump_expr(e: Expr) -> Text {
+    match e {
+        EInt(n) => {
+            return "(int " + str(n) + ")";
+        }
+        EBool(b) => {
+            return "(bool " + str(b) + ")";
+        }
+        EText(t) => {
+            return "(text " + t + ")";
+        }
+        EVar(x) => {
+            return "(var " + x + ")";
+        }
+        EBin(op, kids) => {
+            return "(bin " + op + " " + dump_expr(kids[0]) + " " + dump_expr(kids[1]) + ")";
+        }
+        EUn(op, kids) => {
+            return "(un " + op + " " + dump_expr(kids[0]) + ")";
+        }
+        ECall(name, args) => {
+            return "(call " + name + dump_list(args) + ")";
+        }
+        EIndex(kids) => {
+            return "(idx " + dump_expr(kids[0]) + " " + dump_expr(kids[1]) + ")";
+        }
+        EField(name, kids) => {
+            return "(field " + dump_expr(kids[0]) + " " + name + ")";
+        }
+        EList(items) => {
+            return "(list" + dump_list(items) + ")";
+        }
+    }
+}
+
+fn dump_list(xs: List[Expr]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(xs)
+        invariant i >= 0
+    {
+        out = out + " " + dump_expr(xs[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main(console: Console) -> Unit ! {io.read, io.write} {
+    let line: Text = read_line(console);
+    let toks: List[Token] = lex(line);
+    match parse_expr(toks, 0) {
+        POk(e, j) => {
+            print(console, dump_expr(e));
+        }
+        PErr(m, p) => {
+            print(console, "ERR " + m + " @ " + str(p));
+        }
+    }
+}
