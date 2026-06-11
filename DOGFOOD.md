@@ -1,4 +1,39 @@
-# Dogfooding report #1 — programs/tasks
+# Dogfooding reports
+
+## Round 2 — programs/json (a real recursive-descent parser)
+
+A JSON parser + compact printer in pure Sigil ([programs/json/](programs/json/)),
+written with the compiler frozen: every pain point became a note instead of
+a patch (full ranked list in [programs/json/NOTES.md](programs/json/NOTES.md)).
+Worked on the first run, interpreted and native. **37/38 contract clauses
+prove**, including index-arithmetic contracts through mutual recursion; a
+test pins the unproven set to exactly the one known clause so any verifier
+improvement surfaces as a failing test.
+
+What round 2 ranked at the top:
+
+1. **The verifier can't see inside enum payloads — and the blindness is
+   contagious.** "Every index a `Step` carries is in bounds" is the parser's
+   real invariant and is inexpressible; an index recovered via `match` is an
+   arbitrary Int to the prover, poisoning downstream clauses program-wide.
+   The workaround (regenerating facts via an unconditional `ensures` on
+   `skip_ws` plus entry guards that double as error reporting) recovered
+   37/38, but payload-aware verification is the next big prover feature:
+   model variant payloads the way lengths are modeled.
+2. **No tuples / multi-value returns.** Every (value, index) pair needs its
+   own nominal enum; the parser carries `Step` (Json+Int) and a structurally
+   identical `TextStep` (Text+Int) with manual cross-enum rebuilds.
+3. **No `?`-style error propagation.** Most match statements exist solely to
+   unpack a step or re-return its failure. Match-expressions (which landed
+   in parallel with this round) help the value cases; a propagation operator
+   for the Fail cases is the real fix and a candidate for the next round.
+
+Honorable mentions: `textutil.sg` is now a drifting copy between programs
+(the stdlib/shared-module-path question is due); no Float (integer-only JSON,
+documented `Fail`s for fractions/exponents); the checker demands a dead
+`return` after `while true { ... break ... }` loops.
+
+## Round 1 — programs/tasks
 
 The first real Sigil program: a multi-module task-tracker CLI
 ([programs/tasks/](programs/tasks/)) — `textutil.sg` (pure text library
