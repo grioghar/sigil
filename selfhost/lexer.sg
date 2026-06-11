@@ -1,0 +1,298 @@
+// The Sigil lexer, written in Sigil — the first bootstrap component on the
+// road to self-hosting (see docs/SELFHOST.md). It mirrors sigil/lexer.py and
+// is conformance-tested against it over the example + program corpus.
+//
+// Usage: reads a source path on stdin (Sigil has no argv yet — a gap this
+// effort will close), reads that file, and prints one line per token:
+// <kind> <line> <col> <escaped-value>
+// The Python harness formats sigil.lexer's tokens identically and compares.
+record Token {
+    kind: Text,
+    value: Text,
+    line: Int,
+    col: Int,
+}
+
+// A lexed value plus the position just past it (Sigil has no tuples; this is
+// the same Step[T] shape the JSON parser uses, specialized to Text).
+enum Scan {
+    SDone(Text, Int),
+    SErr(Text, Int),
+}
+
+fn char_at(s: Text, i: Int) -> Text
+    requires i >= 0 and i < len(s)
+{
+    return slice(s, i, i + 1);
+}
+
+fn code_at(s: Text, i: Int) -> Int
+    requires i >= 0 and i < len(s)
+{
+    return ord(slice(s, i, i + 1));
+}
+
+fn is_digit_code(c: Int) -> Bool {
+    return c >= 48 and c <= 57;
+}
+
+fn is_alpha_code(c: Int) -> Bool {
+    return c >= 65 and c <= 90 or c >= 97 and c <= 122 or c == 95;
+}
+
+fn is_ident_code(c: Int) -> Bool {
+    return is_alpha_code(c) or is_digit_code(c);
+}
+
+fn is_space(c: Text) -> Bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\u{d}";
+}
+
+fn is_keyword(w: Text) -> Bool {
+    return w == "fn" or w == "record" or w == "enum" or w == "match" or w == "let" or w == "var" or w == "return" or w == "if" or w == "else" or w == "while" or w == "break" or w == "true" or w == "false" or w == "requires" or w == "ensures" or w == "invariant" or w == "and" or w == "or" or w == "not" or w == "pub" or w == "use" or w == "as" or w == "then" or w == "with";
+}
+
+fn is_single_op(c: Text) -> Bool {
+    return c == "+" or c == "-" or c == "*" or c == "/" or c == "%" or c == "<" or c == ">" or c == "=" or c == "!" or c == "(" or c == ")" or c == "{" or c == "}" or c == "[" or c == "]" or c == "," or c == ";" or c == ":" or c == ".";
+}
+
+// The longest operator starting at i, or "" if none. Two-char operators are
+// tried first so maximal munch works ("=>" before "=").
+fn match_op(s: Text, i: Int) -> Text
+    requires i >= 0 and i < len(s)
+{
+    if i + 2 <= len(s) {
+        let two: Text = slice(s, i, i + 2);
+        if two == "->" or two == "=>" or two == "==" or two == "!=" or two == "<=" or two == ">=" {
+            return two;
+        }
+    }
+    let one: Text = char_at(s, i);
+    if is_single_op(one) {
+        return one;
+    }
+    return "";
+}
+
+fn hex_val(c: Text) -> Int
+    requires len(c) == 1
+{
+    let n: Int = ord(c);
+    if n >= 48 and n <= 57 {
+        return n - 48;
+    }
+    if n >= 97 and n <= 102 {
+        return n - 87;
+    }
+    if n >= 65 and n <= 70 {
+        return n - 55;
+    }
+    return 0 - 1;
+}
+
+// Scan a \u{HEX} escape whose backslash is at b (so s[b]='\\', s[b+1]='u').
+// Returns the decoded single character and the index just past the '}'.
+fn scan_unicode(s: Text, b: Int) -> Scan
+    requires b >= 0 and b + 1 < len(s)
+{
+    if b + 2 >= len(s) or char_at(s, b + 2) != "{" {
+        return SErr("expected '{' after \\u", b);
+    }
+    var k: Int = b + 3;
+    var code: Int = 0;
+    var any: Bool = false;
+    while k < len(s) and char_at(s, k) != "}"
+        invariant k >= 0
+        invariant code >= 0
+    {
+        let d: Int = hex_val(char_at(s, k));
+        if d < 0 {
+            return SErr("bad hex in \\u{...}", b);
+        }
+        code = code * 16 + d;
+        any = true;
+        k = k + 1;
+    }
+    if not any or k >= len(s) {
+        return SErr("unterminated \\u{...} escape", b);
+    }
+    if code > 1114111 {
+        return SErr("\\u{...} is not a valid codepoint", b);
+    }
+    return SDone(chr(code), k + 1);
+}
+
+// Scan a double-quoted string whose opening quote is at i. Returns the decoded
+// contents and the index just past the closing quote.
+fn scan_string(s: Text, i: Int) -> Scan
+    requires i >= 0 and i < len(s)
+{
+    var out: Text = "";
+    var j: Int = i + 1;
+    while j < len(s)
+        invariant j >= 0
+    {
+        let c: Text = char_at(s, j);
+        if c == "\n" {
+            return SErr("unterminated text literal", i);
+        }
+        if c == "\"" {
+            return SDone(out, j + 1);
+        }
+        if c == "\\" {
+            if j + 1 >= len(s) {
+                return SErr("unterminated escape in text literal", i);
+            }
+            let e: Text = char_at(s, j + 1);
+            if e == "u" {
+                match scan_unicode(s, j) {
+                    SDone(ch, after) => {
+                        out = out + ch;
+                        j = after;
+                    }
+                    SErr(msg, pos) => {
+                        return SErr(msg, pos);
+                    }
+                }
+            } else if e == "n" {
+                out = out + "\n";
+                j = j + 2;
+            } else if e == "t" {
+                out = out + "\t";
+                j = j + 2;
+            } else if e == "\"" {
+                out = out + "\"";
+                j = j + 2;
+            } else if e == "\\" {
+                out = out + "\\";
+                j = j + 2;
+            } else {
+                return SErr("unknown escape", i);
+            }
+        } else {
+            out = out + c;
+            j = j + 1;
+        }
+    }
+    return SErr("unterminated text literal", i);
+}
+
+pub fn lex(s: Text) -> List[Token] {
+    var toks: List[Token] = [];
+    var i: Int = 0;
+    var line: Int = 1;
+    var col: Int = 1;
+    while i < len(s)
+        invariant i >= 0
+        invariant line >= 1
+        invariant col >= 1
+    {
+        let c: Text = char_at(s, i);
+        // Whitespace.
+        if is_space(c) {
+            if c == "\n" {
+                line = line + 1;
+                col = 1;
+            } else {
+                col = col + 1;
+            }
+            i = i + 1;
+        } else if i + 1 < len(s) and c == "/" and char_at(s, i + 1) == "/" {
+            // Line comment: consume to end of line (the newline is handled
+            // on the next iteration).
+            while i < len(s) and char_at(s, i) != "\n"
+                invariant i >= 0
+            {
+                i = i + 1;
+                col = col + 1;
+            }
+        } else if is_digit_code(ord(c)) {
+            let start: Int = i;
+            while i < len(s) and is_digit_code(code_at(s, i))
+                invariant i >= start
+            {
+                i = i + 1;
+            }
+            toks = push(toks, Token { kind: "INT", value: slice(s, start, i), line: line, col: col });
+            col = col + (i - start);
+        } else if is_alpha_code(ord(c)) {
+            let start: Int = i;
+            while i < len(s) and is_ident_code(code_at(s, i))
+                invariant i >= start
+            {
+                i = i + 1;
+            }
+            let word: Text = slice(s, start, i);
+            let kind: Text = if is_keyword(word) then word else "IDENT";
+            toks = push(toks, Token { kind: kind, value: word, line: line, col: col });
+            col = col + (i - start);
+        } else if c == "\"" {
+            let start: Int = i;
+            match scan_string(s, i) {
+                SDone(value, after) => {
+                    toks = push(toks, Token { kind: "TEXT", value: value, line: line, col: col });
+                    col = col + (after - start);
+                    i = after;
+                }
+                SErr(msg, pos) => {
+                    toks = push(toks, Token { kind: "ERROR", value: msg, line: line, col: col });
+                    return toks;
+                }
+            }
+        } else {
+            let op: Text = match_op(s, i);
+            if op == "" {
+                toks = push(toks, Token { kind: "ERROR", value: "unexpected character", line: line, col: col });
+                return toks;
+            }
+            toks = push(toks, Token { kind: op, value: op, line: line, col: col });
+            i = i + len(op);
+            col = col + len(op);
+        }
+    }
+    return push(toks, Token { kind: "EOF", value: "", line: line, col: col });
+}
+
+// Escape a token value so each token dumps on a single line, identically to
+// the Python harness.
+fn esc(s: Text) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(s)
+        invariant i >= 0
+    {
+        let c: Text = char_at(s, i);
+        if c == "\\" {
+            out = out + "\\\\";
+        } else if c == "\n" {
+            out = out + "\\n";
+        } else if c == "\t" {
+            out = out + "\\t";
+        } else if c == "\u{d}" {
+            out = out + "\\r";
+        } else {
+            out = out + c;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+pub fn dump(toks: List[Token]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(toks)
+        invariant i >= 0
+    {
+        let t: Token = toks[i];
+        out = out + t.kind + " " + str(t.line) + " " + str(t.col) + " " + esc(t.value) + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, io.read, io.write} {
+    let path: Text = read_line(console);
+    let src: Text = read_file(fs, path);
+    print(console, dump(lex(src)));
+}
