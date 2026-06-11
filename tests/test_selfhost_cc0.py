@@ -34,6 +34,17 @@ CASES = [
     ("0", 0),
     ("255", 255),
     ("1 + 2 * 3 + 4 * 5 + 15", 42),
+    ("84 / 2", 42),
+    ("85 % 43", 42),
+    ("100 / 7", 14),
+    ("5 < 10", 1),
+    ("10 < 5", 0),
+    ("7 == 7", 1),
+    ("7 != 7", 0),
+    ("3 >= 3 and 4 > 2", 1),
+    ("1 > 2 or 9 <= 9", 1),
+    ("not (2 < 1)", 1),
+    ("(8 - 6) * (10 + 11)", 42),
 ]
 
 
@@ -70,7 +81,7 @@ class TestCc0(unittest.TestCase):
 
     def test_unsupported_expression_rejected(self):
         with tempfile.TemporaryDirectory() as t:
-            (Path(t) / "e.sg").write_text("true and false", encoding="utf-8")
+            (Path(t) / "e.sg").write_text("n + xs[0]", encoding="utf-8")
             out = io.StringIO()
             old = os.getcwd()
             os.chdir(t)

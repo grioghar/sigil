@@ -10,8 +10,9 @@
 // then variables and control flow, then functions, then the heap runtime).
 //
 // Usage: reads a source path on stdin, then an output path on the next line;
-// emits the executable. Supported expressions: integer literals, + - *,
-// unary -, and parentheses. Exit status is the result masked to 8 bits.
+// emits the executable. Supported expressions: integer and boolean literals,
+// + - * / %, comparisons (== != < <= > >=), and / or / not, and parentheses.
+// Exit status is the result masked to 8 bits.
 use lexer { Token, lex }
 use parser { Expr, Res, parse_expr }
 
@@ -61,8 +62,53 @@ fn bin_op(op: Text) -> List[Int] {
         // imul rax, rbx
         return [91, 88, 72, 15, 175, 195, 80];
     }
+    if op == "/" {
+        // cqo ; idiv rbx ; push rax (quotient, truncated toward zero)
+        return [91, 88, 72, 153, 72, 247, 251, 80];
+    }
+    if op == "%" {
+        // cqo ; idiv rbx ; push rdx (remainder)
+        return [91, 88, 72, 153, 72, 247, 251, 82];
+    }
+    if op == "and" {
+        // and rax, rbx (operands are pure 0/1, so eager is exact)
+        return [91, 88, 72, 33, 216, 80];
+    }
+    if op == "or" {
+        // or rax, rbx
+        return [91, 88, 72, 9, 216, 80];
+    }
+    // comparisons: cmp rax, rbx ; setcc al ; movzx eax, al ; push rax
+    if is_cmp(op) {
+        return cat([91, 88, 72, 57, 216], cat(setcc(op), [15, 182, 192, 80]));
+    }
     // unsupported; guarded by `supported` before codegen
     return [];
+}
+
+fn is_cmp(op: Text) -> Bool {
+    return op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=";
+}
+
+fn setcc(op: Text) -> List[Int] {
+    // set<cc> al, signed comparisons (0f 9x c0)
+    if op == "==" {
+        return [15, 148, 192];
+    }
+    if op == "!=" {
+        return [15, 149, 192];
+    }
+    if op == "<" {
+        return [15, 156, 192];
+    }
+    if op == "<=" {
+        return [15, 158, 192];
+    }
+    if op == ">" {
+        return [15, 159, 192];
+    }
+    // >=
+    return [15, 157, 192];
 }
 
 fn gen(e: Expr) -> List[Int] {
@@ -72,6 +118,10 @@ fn gen(e: Expr) -> List[Int] {
             return cat([72, 184], cat(le(n, 8), [80]));
         }
         EUn(op, kids) => {
+            if op == "not" {
+                // pop rax ; xor rax, 1 ; push rax
+                return cat(gen(kids[0]), [88, 72, 131, 240, 1, 80]);
+            }
             // pop rax ; neg rax ; push rax
             return cat(gen(kids[0]), [88, 72, 247, 216, 80]);
         }
@@ -79,7 +129,11 @@ fn gen(e: Expr) -> List[Int] {
             return cat(gen(kids[0]), cat(gen(kids[1]), bin_op(op)));
         }
         EBool(b) => {
-            return [];
+            // mov rax, 0/1 ; push rax
+            if b {
+                return cat([72, 184], cat(le(1, 8), [80]));
+            }
+            return cat([72, 184], cat(le(0, 8), [80]));
         }
         EText(t) => {
             return [];
@@ -110,14 +164,16 @@ fn supported(e: Expr) -> Bool {
             return true;
         }
         EUn(op, kids) => {
-            return op == "-" and supported(kids[0]);
+            return (op == "-" or op == "not") and supported(kids[0]);
         }
         EBin(op, kids) => {
-            let ok_op: Bool = op == "+" or op == "-" or op == "*";
+            let arith: Bool = op == "+" or op == "-" or op == "*" or op == "/" or op == "%";
+            let logic: Bool = op == "and" or op == "or";
+            let ok_op: Bool = arith or logic or is_cmp(op);
             return ok_op and supported(kids[0]) and supported(kids[1]);
         }
         EBool(b) => {
-            return false;
+            return true;
         }
         EText(t) => {
             return false;
