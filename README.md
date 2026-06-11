@@ -33,11 +33,16 @@ fn main(console: Console) -> Unit ! {io.write} {
 
 Plus records (`record Point { x: Int, y: Int }`), sum types with statically
 exhaustive `match` (`enum Shape { Circle(Int), Empty }` — a missing variant
-is a compile error, a dead arm too), generic functions
-(`fn first[T](xs: List[T]) -> T`, monomorphized to native code), and modules
-(`pub fn` + `use geometry { area, Shape }` — explicit exports, explicit
-imports, no globs; importing a module grants zero authority, because
-capabilities still only flow through parameters).
+is a compile error, a dead arm too), generics over functions, records, and
+enums (`fn first[T](xs: List[T]) -> T`, `enum Step[T]` — monomorphized to
+native code), and modules (`pub fn` + `use geometry { area, Shape }` —
+explicit exports, explicit imports, no globs; importing a module grants zero
+authority, because capabilities still only flow through parameters).
+
+The verifier models Text/List lengths and enum payloads, so contracts about
+indexing and about what a variant carries prove statically — the bundled
+[JSON parser](programs/json) verifies all 49 of its clauses, compiling with
+zero runtime contract checks.
 
 ## Quickstart
 

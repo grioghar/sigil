@@ -86,11 +86,22 @@ reordered, and parallelized without analysis.
 ### 3. Contracts: every function states its bargain
 
 `requires` (preconditions) and `ensures` (postconditions, with `result` bound)
-are part of the function header. In v0.1 they are checked at runtime with
-precise **blame**: a `requires` failure blames the caller, an `ensures` failure
-blames the callee. The roadmap moves these to static verification (SMT), at
-which point proven contracts also *delete* runtime checks — safety pays for
-speed instead of costing it.
+are part of the function header, alongside loop `invariant`s. They are checked
+at runtime with precise **blame** — a `requires` failure blames the caller, an
+`ensures` the callee, an `invariant` the loop — and, with Z3 installed,
+**proven statically** by `sigil verify`. A proven clause emits *no* runtime
+check in the native binary: safety pays for speed instead of costing it.
+
+The verifier symbolically executes each function. It models integers and
+booleans exactly; Text and List by their **length** (so `requires i < len(s)`
+proves); and enum values **algebraically** — a tag plus payload slots, so a
+`match` learns the exact value a variant carries. Payload-carrying contracts
+(`ensures match result { Done(v, j) => j <= len(s), ... }`) therefore prove at
+return sites and are assumed at call sites, which is what lets an inductive,
+mutually-recursive parser verify end to end (the bundled JSON parser proves
+all 49 of its clauses). Everything still unmodeled stays conservative: a clause
+the engine cannot discharge simply keeps its runtime check, so erasure is
+always sound.
 
 ```sigil
 fn safe_div(a: Int, b: Int) -> Int
@@ -137,10 +148,14 @@ iteration, then gets to assume it after the loop — which is what makes the
 `ensures` provable. Unproven invariants stay as runtime checks (before the
 loop and after every iteration) that blame the loop.
 
-**Generic functions** (`fn first[T](xs: List[T]) -> T`) infer their type
-arguments at call sites; generic values are opaque (no `==`, no `str`).
-The native backend monomorphizes — each instantiation compiles to its own
-Rust function, so generics cost nothing at runtime.
+**Generics** apply to functions, records, and enums — `fn first[T](xs:
+List[T]) -> T`, `record Pair[A, B]`, `enum Step[T]`. Type arguments are
+inferred from values (call arguments, field and payload values) and from the
+construction context where no value determines them; there is no explicit
+instantiation syntax. The native backend monomorphizes every form — each
+instantiation compiles to its own Rust function or struct/enum, so generics
+cost nothing at runtime. One `Step[T]` replaces the two hand-copied result
+enums a real parser would otherwise need.
 
 **Sum types** close the data-modeling gap:
 
@@ -248,7 +263,10 @@ the root capabilities by type. There is no other way to obtain one.
 | **0.5** | Compiler-as-a-service: `sigil serve` / `sigil query` — newline-delimited JSON API (check, signatures, effects incl. transitive, verify, obligations, methods) so an LLM can interrogate the compiler while generating instead of generating blind. `obligations` returns exactly the unproven clauses — the AI author's to-do list. | **done** |
 | **0.6** | Sum types: `enum` with positional payloads + statically exhaustive `match` (no dead arms), verifier-typed binders, native Rust enums, full canon/server support. | **done** |
 | **0.7** | Modules: `pub` exports + `use geometry { area, Shape, parse as parse_shape }` explicit imports (no globs — every name that enters scope is written out). Resolver flattens the module graph (cycles, visibility, collisions diagnosed against the offending file) into the single-program pipeline; imports grant zero authority — capabilities still only flow through parameters. | **done** |
-| **1.0** | Self-contained backend (LLVM/Cranelift, dropping the rustc dependency) — purity/effect info drives parallelization and check elision. | |
+| **0.8** | Dogfood-driven ergonomics & verifier depth: text primitives (`slice`/`ord`/`chr`) + `file_exists`; if-expressions, `x with { f: v }`, `break` (invariants hold at every exit), `set(xs, i, x)`, match-as-expression; Text/List **length modeling** in the verifier; two real programs (task tracker, JSON parser) proven. | **done** |
+| **0.9** | Generic **records and enums** (`record Pair[A, B]`, `enum Step[T]`) — inference from field/payload values and construction context, native monomorphization. Payload-aware **verification**: an enum value is a tag + payload slots, so payload-carrying `ensures` prove at return sites and are assumed at call sites — proving inductive, mutually-recursive parsers. The JSON parser is now 49/49 clauses proven. | **done** |
+| **1.0** | **Language surface freeze.** The single-file language and its toolchain (interpreter, Z3 verifier, native compilation via rustc, canonical form, JSON API, modules) are stable and conformance-tested. | **this release** |
+| **1.x** | Self-contained native toolchain: port the compiler to a single dependency-free `sigil` binary (Z3 statically linked), then a Cranelift dev backend with reference-counted runtime (immutability makes the heap acyclic, so RC is complete) while keeping rustc/LLVM for release builds. Plus `?`-style error propagation, a shared standard library, and `Float`. | |
 
 ## Prior art and how Sigil differs
 

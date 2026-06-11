@@ -5,20 +5,30 @@ All notable changes to Sigil are recorded here. The format follows
 are grouped by the roadmap phase that introduced them (see
 [DESIGN.md](DESIGN.md)).
 
-## [Unreleased] — toward 1.0
+## [1.0.0] — Language surface freeze
 
-The 1.0 line freezes the single-file language surface. Work landing here:
+The single-file language and its toolchain are stable and conformance-tested
+(390 tests). 1.0 adds the last two surface features and the verifier depth to
+make a real program a compile-time theorem:
 
-- **Payload-aware verification.** The Z3 verifier models enum values
-  algebraically (tag + payload slots), so contracts can reason about what a
+- **Generic records and enums.** `record Pair[A, B]` and `enum Step[T]`, with
+  type arguments inferred from values and from the construction context, and
+  native monomorphization. The nominal answer to the "no tuples" friction: one
+  `Step[T]` replaces two copy-paste result enums.
+- **Payload-aware verification.** The Z3 verifier models an enum value
+  algebraically (tag + payload slots), so contracts reason about what a
   variant carries — `ensures match result { Done(v, j) => j <= len(s), ... }`
-  proves at return sites and is assumed at call sites through mutual
-  recursion.
-- **Generic records and enums.** `record Pair[A, B]` and `enum Step[T]` with
-  call-site inference and native monomorphization — the nominal answer to the
-  "no tuples" friction (one `Step[T]`, not two copy-paste enums).
-- **`let`-else destructuring** for single-variant refutable binding, removing
-  the unpack-and-re-return `match` boilerplate a real parser accumulates.
+  proves at return sites and is assumed at call sites, verifying inductive,
+  mutually-recursive parsers. Adversarial soundness tests pin the guards.
+- **Fully verified JSON parser.** [programs/json](programs/json) consolidated
+  onto `Step[T]` and proven **49/49 clauses** — zero runtime contract checks.
+
+Everything below 1.0 was developed over the preceding milestones, preserved
+here as the project's history.
+
+_Deferred to 1.x: `let`-else destructuring, `?`-style error propagation, a
+shared standard library, `Float`, and the self-contained native toolchain
+(dependency-free `sigil` binary + Cranelift dev backend)._
 
 ## [0.7] — Modules and imports
 
