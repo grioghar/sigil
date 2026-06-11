@@ -325,7 +325,40 @@ class Parser:
         # the `if` keyword before ever reaching parse_expr.
         if self.at("if"):
             return self.parse_if_expr()
+        # A match-EXPRESSION binds equally loose: `match s { V(b) => e, }`.
+        # Same non-clash argument: statement position checks for the `match`
+        # keyword (the statement form, arms with blocks) before ever reaching
+        # parse_expr.
+        if self.at("match"):
+            return self.parse_match_expr()
         return self.parse_or()
+
+    def parse_match_expr(self) -> A.MatchExpr:
+        tok = self.expect("match")
+        scrutinee = self.parse_expr()
+        self.expect("{")
+        arms: list[A.MatchExprArm] = []
+        while not self.at("}"):
+            if self.at("EOF"):
+                raise ParseError("unterminated match, expected '}'",
+                                 self.cur.line, self.cur.col)
+            arm_tok = self.expect("IDENT", "variant name or '_'")
+            variant = None if arm_tok.value == "_" else arm_tok.value
+            binders: list[str] = []
+            if variant is not None and self.match("("):
+                while True:
+                    binders.append(self.expect("IDENT", "binder name").value)
+                    if not self.match(","):
+                        break
+                self.expect(")")
+            self.expect("=>", "'=>' after the match pattern")
+            expr = self.parse_expr()
+            arms.append(A.MatchExprArm(variant, binders, expr,
+                                       arm_tok.line, arm_tok.col))
+            if not self.at("}"):
+                self.expect(",", "',' between match-expression arms")
+        self.expect("}")
+        return A.MatchExpr(tok.line, tok.col, scrutinee, arms)
 
     def parse_if_expr(self) -> A.IfExpr:
         tok = self.expect("if")

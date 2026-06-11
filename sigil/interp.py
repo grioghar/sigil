@@ -263,6 +263,21 @@ class Interpreter:
             if self.eval(expr.cond, frame):
                 return self.eval(expr.then_expr, frame)
             return self.eval(expr.else_expr, frame)
+        if isinstance(expr, A.MatchExpr):
+            # The scrutinee is evaluated once; ONLY the selected arm's
+            # expression runs, its binders bound in a pushed scope.
+            tag, payload = self.eval(expr.scrutinee, frame)
+            arm = next((a for a in expr.arms if a.variant == tag), None)
+            if arm is None:  # the checker proved a wildcard exists if needed
+                arm = next(a for a in expr.arms if a.variant is None)
+            frame.push()
+            try:
+                if arm.variant is not None:
+                    for binder, value in zip(arm.binders, payload):
+                        frame.declare(binder, value)
+                return self.eval(arm.expr, frame)
+            finally:
+                frame.pop()
         if isinstance(expr, A.RecordUpdate):
             # The base is evaluated FIRST, then the fields left to right.
             updated = dict(self.eval(expr.base, frame))

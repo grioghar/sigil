@@ -211,6 +211,10 @@ def _called_names(stmts: list[A.Stmt]) -> set[str]:
             walk_expr(expr.base)
             for _, fexpr in expr.fields:
                 walk_expr(fexpr)
+        elif isinstance(expr, A.MatchExpr):
+            walk_expr(expr.scrutinee)
+            for arm in expr.arms:
+                walk_expr(arm.expr)
 
     def walk_stmt(stmt: A.Stmt) -> None:
         if isinstance(stmt, (A.Let, A.Assign)):

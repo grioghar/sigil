@@ -664,6 +664,9 @@ class Checker:
             merged = self.merge_binding(ttype, etype)
             return merged if merged is not None else ttype
 
+        if isinstance(expr, A.MatchExpr):
+            return self.check_match_expr(expr, scope, fn, in_contract)
+
         if isinstance(expr, A.RecordUpdate):
             btype = self.check_expr(expr.base, scope, fn, in_contract)
             if btype.kind != "Record":
@@ -800,6 +803,85 @@ class Checker:
 
         raise CheckError(f"unhandled expression {type(expr).__name__}",
                          expr.line, expr.col)
+
+    def check_match_expr(self, expr: A.MatchExpr, scope: Scope, fn: A.FnDecl,
+                         in_contract: bool) -> A.Type:
+        """The statement form's rules verbatim — enum scrutinee, each variant
+        at most once, wildcard last, exhaustive, no dead wildcard, binder
+        arity/canon, binders scoped to their arm — plus IfExpr's branch rule:
+        every arm's expression produces ONE type (more-specific-wins merge)."""
+        stype = self.check_expr(expr.scrutinee, scope, fn, in_contract)
+        if stype.kind != "Enum":
+            raise CheckError(f"match needs an enum value, got {stype}",
+                             expr.line, expr.col)
+        enum = self.enums[stype.name]
+        payloads_of = dict(enum.variants)
+        covered: set[str] = set()
+        wildcard: Optional[A.MatchExprArm] = None
+        result: Optional[A.Type] = None
+        for arm in expr.arms:
+            if wildcard is not None:
+                raise CheckError(
+                    "wildcard '_' arm must be the last arm of a match",
+                    arm.line, arm.col)
+            if arm.variant is None:
+                wildcard = arm
+                arm.binder_types = []
+                atype = self.check_expr(arm.expr, Scope(scope), fn, in_contract)
+            else:
+                payloads = payloads_of.get(arm.variant)
+                if payloads is None:
+                    raise CheckError(
+                        f"'{arm.variant}' is not a variant of enum "
+                        f"'{stype.name}'", arm.line, arm.col)
+                if arm.variant in covered:
+                    raise CheckError(
+                        f"duplicate arm for variant '{arm.variant}'",
+                        arm.line, arm.col)
+                covered.add(arm.variant)
+                if len(arm.binders) != len(payloads):
+                    raise CheckError(
+                        f"variant '{arm.variant}' has {len(payloads)} "
+                        f"payload(s); this arm binds {len(arm.binders)}",
+                        arm.line, arm.col)
+                arm_scope = Scope(scope)
+                for binder, ptype in zip(arm.binders, payloads):
+                    if not binder[0].islower():
+                        raise CheckError(
+                            f"binder '{binder}' must start with a lowercase "
+                            f"letter", arm.line, arm.col)
+                    arm_scope.declare(binder, Binding(ptype, mutable=False),
+                                      arm.line, arm.col)
+                arm.binder_types = list(payloads)
+                atype = self.check_expr(arm.expr, arm_scope, fn, in_contract)
+            if result is None:
+                result = atype
+            else:
+                if not (A.compatible(result, atype)
+                        or A.compatible(atype, result)):
+                    raise CheckError(
+                        f"match-expression arms must produce one type; got "
+                        f"{result} and {atype}", arm.line, arm.col)
+                # Prefer the more specific type (a List with a known element
+                # type beats an empty list literal's List[None]) — the same
+                # merge if-expression branches use.
+                merged = self.merge_binding(result, atype)
+                result = merged if merged is not None else result
+
+        missing = [vname for vname, _ in enum.variants if vname not in covered]
+        if wildcard is not None and not missing:
+            raise CheckError(
+                "wildcard '_' arm is dead: every variant is already covered",
+                wildcard.line, wildcard.col)
+        if wildcard is None and missing:
+            raise CheckError(
+                f"match on '{stype.name}' is not exhaustive; missing "
+                f"variant(s): {', '.join(missing)} (or add a '_' arm)",
+                expr.line, expr.col)
+        expr.enum_name = stype.name  # the emitter reads this
+        # An enum has at least one variant, so an armless match was rejected
+        # as non-exhaustive above: result is always set here.
+        return result
 
     # ------------------------------------------------------------ calls
 

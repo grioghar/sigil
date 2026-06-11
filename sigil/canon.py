@@ -97,6 +97,12 @@ class Renderer:
 
     def __init__(self, placeholder_for: str | None = None):
         self.placeholder_for = placeholder_for
+        # Indent depth of the line currently being assembled. Match
+        # EXPRESSIONS are the one multi-line expression form: their arm and
+        # closing-brace lines indent relative to the context line, so every
+        # statement/contract rendering site records its depth here before
+        # rendering expressions.
+        self.expr_depth = 0
 
     def _name(self, name: str) -> str:
         return "@" if name == self.placeholder_for else name
@@ -172,6 +178,29 @@ class Renderer:
             then = self.render_expr(expr.then_expr, _IF_LEVEL + 1)
             els = self.render_expr(expr.else_expr, _IF_LEVEL)
             return f"if {cond} then {then} else {els}", _IF_LEVEL
+        if isinstance(expr, A.MatchExpr):
+            # The canonical rendering is ALWAYS the multi-line form: one arm
+            # per line with a trailing comma, arms one level deeper than the
+            # context line, the closing brace back at the context level. The
+            # scrutinee gets the nullary-variant-before-{ guard, exactly like
+            # the statement form.
+            depth = self.expr_depth
+            pad = "    " * depth
+            scrutinee = _guard_before_block(self.render_expr(expr.scrutinee))
+            lines = [f"match {scrutinee} {{"]
+            self.expr_depth = depth + 1
+            for arm in expr.arms:
+                if arm.variant is None:
+                    pattern = "_"
+                elif arm.binders:
+                    pattern = f"{arm.variant}({', '.join(arm.binders)})"
+                else:
+                    pattern = arm.variant
+                lines.append(f"{pad}    {pattern} => "
+                             f"{self.render_expr(arm.expr)},")
+            self.expr_depth = depth
+            lines.append(f"{pad}}}")
+            return "\n".join(lines), _IF_LEVEL
         if isinstance(expr, A.RecordUpdate):
             # The base is a postfix-chain value: a bare name, call, index, or
             # field access needs no parens; anything looser (an if-expression,
@@ -207,6 +236,7 @@ class Renderer:
             lines.append(header)
             # The lexer is newline-blind, so the LAST clause sits directly
             # before the body's '{' and needs the nullary-variant guard.
+            self.expr_depth = 1
             for index, contract in enumerate(fn.contracts):
                 rendered = self.render_expr(contract.expr)
                 if index == len(fn.contracts) - 1:
@@ -260,6 +290,7 @@ class Renderer:
 
     def render_stmt(self, stmt: A.Stmt, depth: int) -> list[str]:
         pad = "    " * depth
+        self.expr_depth = depth
         if isinstance(stmt, A.Let):
             kw = "var" if stmt.mutable else "let"
             return [f"{pad}{kw} {stmt.name}: {self.render_type(stmt.declared_type)}"
@@ -285,6 +316,7 @@ class Renderer:
             lines = []
             if stmt.invariants:
                 lines.append(f"{pad}while {self.render_expr(stmt.cond)}")
+                self.expr_depth = depth + 1
                 for index, inv in enumerate(stmt.invariants):
                     rendered = self.render_expr(inv.expr)
                     if index == len(stmt.invariants) - 1:
@@ -331,6 +363,9 @@ class Renderer:
             if len(node.else_body) == 1 and isinstance(node.else_body[0], A.If):
                 node = node.else_body[0]
                 lines.extend(self._flush(node, depth))
+                # Rendering the previous branch's body moved expr_depth;
+                # this condition sits back on the chain's own line.
+                self.expr_depth = depth
                 cond = _guard_before_block(self.render_expr(node.cond))
                 lines.append(f"{pad}}} else if {cond} {{")
                 lines.extend(self.render_stmts(node.then_body, depth + 1))

@@ -618,6 +618,25 @@ class RustEmitter:
             return (f"(if {self.expr(expr.cond)} "
                     f"{{ {self.expr(expr.then_expr)} }} "
                     f"else {{ {self.expr(expr.else_expr)} }})")
+        if isinstance(expr, A.MatchExpr):
+            # A parenthesized Rust match expression. The scrutinee keeps the
+            # statement form's parentheses (Rust forbids struct literals in
+            # scrutinee position); arms map one-to-one, and arm expressions
+            # route through expr(), so instantiation discovery sees calls
+            # inside them under the current substitution.
+            enum_name = expr.enum_name  # stamped by the checker
+            arms = []
+            for arm in expr.arms:
+                if arm.variant is None:
+                    pattern = "_"
+                elif arm.binders:
+                    binders = ", ".join(f"s_{sym(b)}" for b in arm.binders)
+                    pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}({binders})"
+                else:
+                    pattern = f"s_{sym(enum_name)}::s_{sym(arm.variant)}"
+                arms.append(f"{pattern} => {self.expr(arm.expr)},")
+            return (f"(match ({self.expr(expr.scrutinee)}) "
+                    f"{{ {' '.join(arms)} }})")
         if isinstance(expr, A.RecordUpdate):
             # Rust struct-update syntax evaluates the listed fields BEFORE
             # the base expression; Sigil evaluates the base first. Binding

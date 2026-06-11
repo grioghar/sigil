@@ -153,6 +153,32 @@ class IfExpr(Expr):
 
 
 @dataclass
+class MatchExprArm:
+    """One arm of a match-EXPRESSION: `pattern => expr`. Patterns are the
+    statement form's exactly: `Variant(b1, b2)`, a nullary `Variant`, or the
+    wildcard `_` (variant None) last."""
+    variant: Optional[str]         # None means the wildcard arm '_'
+    binders: list[str] = field(default_factory=list)
+    expr: Expr = None
+    line: int = 0
+    col: int = 0
+    # The checker stamps `binder_types` as a plain attribute, like the
+    # statement form's MatchArm — deliberately NOT a dataclass field, so
+    # structural AST equality ignores it.
+
+
+@dataclass
+class MatchExpr(Expr):
+    """`match s { Variant(b) => expr, ... }` — an expression, statically
+    exhaustive like the statement form. Only the selected arm's expression
+    is evaluated, and the whole thing has a value; all arm expressions
+    produce one type. Statement position still parses the statement form
+    (arms with blocks), exactly as IfExpr defers to the statement If."""
+    scrutinee: Expr = None
+    arms: list[MatchExprArm] = field(default_factory=list)
+
+
+@dataclass
 class RecordUpdate(Expr):
     """`base with { field: expr, ... }` — functional record update. The base
     is evaluated first, then the field expressions left to right; the result

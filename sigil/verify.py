@@ -492,6 +492,8 @@ class Verifier:
             return self.translate_call(expr, state)
         if isinstance(expr, A.IfExpr):
             return self.translate_if_expr(expr, state)
+        if isinstance(expr, A.MatchExpr):
+            return self.translate_match_expr(expr, state)
         if isinstance(expr, A.RecordUpdate):
             # Records are structurally unmodeled; base and field expressions
             # are still translated so their nested obligations are recorded.
@@ -563,6 +565,48 @@ class Verifier:
             state.path.append(merged.length == z3.If(cond, tlen, elen))
             return merged
         return self.fresh_by_type(getattr(expr, "ty", None), state)
+
+    def translate_match_expr(self, expr: A.MatchExpr, state: State):
+        """`match s { V(b) => e, ... }`: enum values are Opaque, so no arm
+        can be ruled out. Each arm gets a fresh boolean guard g_i; its
+        binders are bound to fresh values of their stamped payload types in
+        a shadow vars dict layered over the current state's, and the arm
+        expression translates under translate_guarded — facts it appends
+        (callee ensures included) become implications, since the arm may
+        not run. The result is a fresh value constrained by exactly-one-arm
+        knowledge: at least one guard holds (sufficient for soundness), and
+        under each guard the result equals (or matches the length of) that
+        arm's value — which is what lets `ensures result >= 0` prove when
+        every arm's value provably is."""
+        self.translate(expr.scrutinee, state)  # record nested obligations
+        guards = []
+        arm_values = []
+        for arm in expr.arms:
+            guard = self.fresh_bool()
+            shadow = State(dict(state.vars), state.path)
+            for binder, btype in zip(arm.binders,
+                                     getattr(arm, "binder_types", [])):
+                # Binder freshness facts (len >= 0 for sized payloads) are
+                # guarded too: they describe a value that only exists when
+                # this arm runs.
+                base = len(state.path)
+                shadow.vars[binder] = self.fresh_by_type(btype, shadow)
+                for i in range(base, len(state.path)):
+                    state.path[i] = z3.Implies(guard, state.path[i])
+            guards.append(guard)
+            arm_values.append(self.translate_guarded(arm.expr, shadow, guard))
+
+        result = self.fresh_by_type(getattr(expr, "ty", None), state)
+        state.path.append(z3.Or(guards))
+        for guard, value in zip(guards, arm_values):
+            if is_z3(result) and is_z3(value) \
+                    and result.sort() == value.sort():
+                state.path.append(z3.Implies(guard, result == value))
+            else:
+                rlen, vlen = self.length_of(result), self.length_of(value)
+                if rlen is not None and vlen is not None:
+                    state.path.append(z3.Implies(guard, rlen == vlen))
+        return result
 
     def translate_binary(self, expr: A.Binary, state: State):
         op = expr.op

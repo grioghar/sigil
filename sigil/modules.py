@@ -363,3 +363,10 @@ class _Rewriter:
             self.rewrite_expr(expr.base)
             for _, fexpr in expr.fields:
                 self.rewrite_expr(fexpr)
+        elif isinstance(expr, A.MatchExpr):
+            self.rewrite_expr(expr.scrutinee)
+            for arm in expr.arms:
+                if arm.variant is not None:
+                    arm.variant = self.resolve(arm.variant, "variant",
+                                               arm.line, arm.col)
+                self.rewrite_expr(arm.expr)
