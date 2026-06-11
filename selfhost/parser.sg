@@ -16,7 +16,7 @@
 use lexer { Token, lex }
 
 // A parsed node plus the index just past it, or a message and position.
-enum Res[T] {
+pub enum Res[T] {
     ROk(T, Int),
     RErr(Text, Int),
 }
@@ -32,7 +32,7 @@ enum Ty {
 // [base, index]
 // field name; [base]
 // items
-enum Expr {
+pub enum Expr {
     EInt(Int),
     EBool(Bool),
     EText(Text),
@@ -131,7 +131,7 @@ fn parse_type_args(toks: List[Token], name: Text, i: Int, acc: List[Ty]) -> Res[
 // ---------------------------------------------------------------- expressions
 //
 // or > and > comparison > +,- > *,/,% > unary(not,-) > postfix([], .) > primary
-fn parse_expr(toks: List[Token], i: Int) -> Res[Expr] {
+pub fn parse_expr(toks: List[Token], i: Int) -> Res[Expr] {
     return parse_or(toks, i);
 }
 

@@ -1,0 +1,216 @@
+// cc0 — the Sigil compiler, stage 0: the first END-TO-END native compiler
+// written in Sigil (docs/SELFHOST.md). It reads an integer-arithmetic
+// expression, generates real x86-64 machine code for it (a stack machine:
+// every subexpression leaves its value on the CPU stack), wraps that code in
+// a complete static Linux ELF whose exit status is the computed value, and
+// writes the runnable binary with write_bytes — no rustc, no linker, no libc.
+//
+// This is the whole pipeline proven on a tiny language: lex -> parse ->
+// codegen -> ELF -> a binary that runs. The subset grows from here (division,
+// then variables and control flow, then functions, then the heap runtime).
+//
+// Usage: reads a source path on stdin, then an output path on the next line;
+// emits the executable. Supported expressions: integer literals, + - *,
+// unary -, and parentheses. Exit status is the result masked to 8 bits.
+use lexer { Token, lex }
+use parser { Expr, Res, parse_expr }
+
+// ---------------------------------------------------------------- byte helpers
+fn cat(a: List[Int], b: List[Int]) -> List[Int] {
+    var out: List[Int] = a;
+    var i: Int = 0;
+    while i < len(b)
+        invariant i >= 0
+    {
+        out = push(out, b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// `n` as `width` little-endian bytes. Non-negative values only (stage 0).
+fn le(n: Int, width: Int) -> List[Int] {
+    var out: List[Int] = [];
+    var v: Int = n;
+    var i: Int = 0;
+    while i < width
+        invariant i >= 0
+    {
+        out = push(out, v % 256);
+        v = v / 256;
+        i = i + 1;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- codegen
+//
+// Stack discipline: gen(e) emits code that pushes e's 64-bit value. Binary
+// ops pop their two operands (right on top), compute in rax, push the result.
+fn bin_op(op: Text) -> List[Int] {
+    // pop rbx (right) ; pop rax (left) ; <op> rax, rbx ; push rax
+    if op == "+" {
+        // add rax, rbx
+        return [91, 88, 72, 1, 216, 80];
+    }
+    if op == "-" {
+        // sub rax, rbx
+        return [91, 88, 72, 41, 216, 80];
+    }
+    if op == "*" {
+        // imul rax, rbx
+        return [91, 88, 72, 15, 175, 195, 80];
+    }
+    // unsupported; guarded by `supported` before codegen
+    return [];
+}
+
+fn gen(e: Expr) -> List[Int] {
+    match e {
+        EInt(n) => {
+            // mov rax, imm64 ; push rax
+            return cat([72, 184], cat(le(n, 8), [80]));
+        }
+        EUn(op, kids) => {
+            // pop rax ; neg rax ; push rax
+            return cat(gen(kids[0]), [88, 72, 247, 216, 80]);
+        }
+        EBin(op, kids) => {
+            return cat(gen(kids[0]), cat(gen(kids[1]), bin_op(op)));
+        }
+        EBool(b) => {
+            return [];
+        }
+        EText(t) => {
+            return [];
+        }
+        EVar(x) => {
+            return [];
+        }
+        ECall(name, args) => {
+            return [];
+        }
+        EIndex(kids) => {
+            return [];
+        }
+        EField(name, kids) => {
+            return [];
+        }
+        EList(items) => {
+            return [];
+        }
+    }
+}
+
+// Stage 0 supports only integer arithmetic. Everything else is rejected up
+// front so codegen never emits a half-formed program.
+fn supported(e: Expr) -> Bool {
+    match e {
+        EInt(n) => {
+            return true;
+        }
+        EUn(op, kids) => {
+            return op == "-" and supported(kids[0]);
+        }
+        EBin(op, kids) => {
+            let ok_op: Bool = op == "+" or op == "-" or op == "*";
+            return ok_op and supported(kids[0]) and supported(kids[1]);
+        }
+        EBool(b) => {
+            return false;
+        }
+        EText(t) => {
+            return false;
+        }
+        EVar(x) => {
+            return false;
+        }
+        ECall(name, args) => {
+            return false;
+        }
+        EIndex(kids) => {
+            return false;
+        }
+        EField(name, kids) => {
+            return false;
+        }
+        EList(items) => {
+            return false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------- ELF wrapping
+fn elf(code: List[Int]) -> List[Int] {
+    let total: Int = 120 + len(code);
+    var out: List[Int] = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // e_type = ET_EXEC
+    out = cat(out, [2, 0]);
+    // e_machine = x86-64
+    out = cat(out, [62, 0]);
+    // e_version
+    out = cat(out, le(1, 4));
+    // e_entry = 0x400078
+    out = cat(out, le(4194424, 8));
+    // e_phoff
+    out = cat(out, le(64, 8));
+    // e_shoff
+    out = cat(out, le(0, 8));
+    // e_flags
+    out = cat(out, le(0, 4));
+    // e_ehsize
+    out = cat(out, le(64, 2));
+    // e_phentsize
+    out = cat(out, le(56, 2));
+    // e_phnum
+    out = cat(out, le(1, 2));
+    // e_shentsize
+    out = cat(out, le(0, 2));
+    // e_shnum
+    out = cat(out, le(0, 2));
+    // e_shstrndx
+    out = cat(out, le(0, 2));
+    // p_type = PT_LOAD
+    out = cat(out, le(1, 4));
+    // p_flags = R+X
+    out = cat(out, le(5, 4));
+    // p_offset
+    out = cat(out, le(0, 8));
+    // p_vaddr = 0x400000
+    out = cat(out, le(4194304, 8));
+    // p_paddr
+    out = cat(out, le(4194304, 8));
+    // p_filesz
+    out = cat(out, le(total, 8));
+    // p_memsz
+    out = cat(out, le(total, 8));
+    // p_align = 0x1000
+    out = cat(out, le(4096, 8));
+    return cat(out, code);
+}
+
+// Epilogue: the expression's value is on the stack — pop it into rdi and
+// exit with it. pop rdi ; mov eax, 60 ; syscall
+fn epilogue() -> List[Int] {
+    return [95, 184, 60, 0, 0, 0, 15, 5];
+}
+
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.write} {
+    let src_path: Text = read_line(console);
+    let out_path: Text = read_line(console);
+    let toks: List[Token] = lex(read_file(fs, src_path));
+    match parse_expr(toks, 0) {
+        ROk(e, j) => {
+            if supported(e) {
+                let code: List[Int] = cat(gen(e), epilogue());
+                write_bytes(fs, out_path, elf(code));
+                print(console, "compiled " + str(len(code)) + " bytes of code");
+            } else {
+                print(console, "cc0: unsupported expression (stage 0 is integer arithmetic only)");
+            }
+        }
+        RErr(m, p) => {
+            print(console, "parse error: " + m + " @ " + str(p));
+        }
+    }
+}
