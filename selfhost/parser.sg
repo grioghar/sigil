@@ -1,17 +1,30 @@
-// The Sigil parser, written in Sigil — bootstrap component #2 on the road to
-// self-hosting (docs/SELFHOST.md). This first slice is the EXPRESSION grammar
-// (the recursive heart); statements, declarations, contracts, and modules
-// follow. It consumes the real lexer's tokens, so lexer+parser compose.
+// The Sigil parser, written in Sigil — bootstrap component #2 toward
+// self-hosting (docs/SELFHOST.md). Covers the expression grammar AND the
+// statement grammar (types, let/var/assign/return/if/while+invariants/break/
+// expression statements). Declarations (fn/record/enum), match, and the
+// fancier expressions (if-expr, match-expr, record literals, `with`) follow.
 //
-// A language gap this surfaces: Sigil rejects direct enum-in-enum recursion
-// (infinite size), so an Expr cannot hold a bare Expr child. Every recursive
-// child is therefore encoded through List[Expr] (heap-indirected) — e.g. a
-// binary node carries [left, right]. It works, but argues for a future Box[T]
-// indirection type. Noted in selfhost/NOTES.md.
+// It consumes the real lexer's tokens (use lexer), so lexer+parser compose.
+// Parse results use a generic Res[T] — one shape for every node kind — which
+// dogfoods generics and keeps the threading uniform. AST recursion is encoded
+// through List (Sigil rejects direct enum-in-enum recursion); see NOTES.md.
 //
-// Usage: reads one expression on stdin, prints its AST as a canonical S-expr
-// (the Python harness dumps sigil.parser's AST in the same form and compares).
+// Usage: reads a source path on stdin, reads that file, and prints the parsed
+// AST as a canonical S-expr. If the file begins with '{' it is parsed as a
+// block, otherwise as a single expression. The Python harness dumps
+// sigil.parser's AST in the same form and compares.
 use lexer { Token, lex }
+
+// A parsed node plus the index just past it, or a message and position.
+enum Res[T] {
+    ROk(T, Int),
+    RErr(Text, Int),
+}
+
+// name + type args; simple types carry []
+enum Ty {
+    TApp(Text, List[Ty]),
+}
 
 // [left, right]
 // [operand]
@@ -32,11 +45,20 @@ enum Expr {
     EList(List[Expr]),
 }
 
-// Parse result: a node and the index just past it, or a message and position.
-// (The monomorphic Step[T] shape — every parse fn returns one.)
-enum Parse {
-    POk(Expr, Int),
-    PErr(Text, Int),
+// cond, then-body
+// cond, then, else
+// cond, invariants, body
+enum Stmt {
+    SLet(Text, Ty, Expr),
+    SVar(Text, Ty, Expr),
+    SAssign(Text, Expr),
+    SReturn(Expr),
+    SReturnVoid,
+    SExpr(Expr),
+    SBreak,
+    SIf(Expr, List[Stmt]),
+    SIfElse(Expr, List[Stmt], List[Stmt]),
+    SWhile(Expr, List[Expr], List[Stmt]),
 }
 
 // ---------------------------------------------------------------- token access
@@ -76,181 +98,209 @@ fn is_cmp(k: Text) -> Bool {
     return k == "==" or k == "!=" or k == "<" or k == "<=" or k == ">" or k == ">=";
 }
 
+// ---------------------------------------------------------------- types
+fn parse_type(toks: List[Token], i: Int) -> Res[Ty] {
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected a type name", i);
+    }
+    let name: Text = tval(toks, i);
+    if tkind(toks, i + 1) == "[" {
+        return parse_type_args(toks, name, i + 2, []);
+    }
+    return ROk(TApp(name, []), i + 1);
+}
+
+fn parse_type_args(toks: List[Token], name: Text, i: Int, acc: List[Ty]) -> Res[Ty] {
+    match parse_type(toks, i) {
+        ROk(t, j) => {
+            let acc2: List[Ty] = push(acc, t);
+            if tkind(toks, j) == "," {
+                return parse_type_args(toks, name, j + 1, acc2);
+            }
+            if tkind(toks, j) == "]" {
+                return ROk(TApp(name, acc2), j + 1);
+            }
+            return RErr("expected , or ] in type arguments", j);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- expressions
 //
-// Precedence ladder, loosest to tightest, mirroring sigil/parser.py:
 // or > and > comparison > +,- > *,/,% > unary(not,-) > postfix([], .) > primary
-// Each binary level folds left-associatively via a *_rest helper.
-fn parse_expr(toks: List[Token], i: Int) -> Parse {
+fn parse_expr(toks: List[Token], i: Int) -> Res[Expr] {
     return parse_or(toks, i);
 }
 
-fn parse_or(toks: List[Token], i: Int) -> Parse {
+fn parse_or(toks: List[Token], i: Int) -> Res[Expr] {
     match parse_and(toks, i) {
-        POk(left, j) => {
+        ROk(left, j) => {
             return parse_or_rest(toks, left, j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_or_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+fn parse_or_rest(toks: List[Token], left: Expr, i: Int) -> Res[Expr] {
     if tkind(toks, i) == "or" {
         match parse_and(toks, i + 1) {
-            POk(right, j) => {
+            ROk(right, j) => {
                 return parse_or_rest(toks, EBin("or", [left, right]), j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
-    return POk(left, i);
+    return ROk(left, i);
 }
 
-fn parse_and(toks: List[Token], i: Int) -> Parse {
+fn parse_and(toks: List[Token], i: Int) -> Res[Expr] {
     match parse_cmp(toks, i) {
-        POk(left, j) => {
+        ROk(left, j) => {
             return parse_and_rest(toks, left, j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_and_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+fn parse_and_rest(toks: List[Token], left: Expr, i: Int) -> Res[Expr] {
     if tkind(toks, i) == "and" {
         match parse_cmp(toks, i + 1) {
-            POk(right, j) => {
+            ROk(right, j) => {
                 return parse_and_rest(toks, EBin("and", [left, right]), j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
-    return POk(left, i);
+    return ROk(left, i);
 }
 
-fn parse_cmp(toks: List[Token], i: Int) -> Parse {
+fn parse_cmp(toks: List[Token], i: Int) -> Res[Expr] {
     match parse_add(toks, i) {
-        POk(left, j) => {
+        ROk(left, j) => {
             return parse_cmp_rest(toks, left, j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_cmp_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+fn parse_cmp_rest(toks: List[Token], left: Expr, i: Int) -> Res[Expr] {
     if is_cmp(tkind(toks, i)) {
         let op: Text = tkind(toks, i);
         match parse_add(toks, i + 1) {
-            POk(right, j) => {
+            ROk(right, j) => {
                 return parse_cmp_rest(toks, EBin(op, [left, right]), j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
-    return POk(left, i);
+    return ROk(left, i);
 }
 
-fn parse_add(toks: List[Token], i: Int) -> Parse {
+fn parse_add(toks: List[Token], i: Int) -> Res[Expr] {
     match parse_mul(toks, i) {
-        POk(left, j) => {
+        ROk(left, j) => {
             return parse_add_rest(toks, left, j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_add_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+fn parse_add_rest(toks: List[Token], left: Expr, i: Int) -> Res[Expr] {
     let k: Text = tkind(toks, i);
     if k == "+" or k == "-" {
         match parse_mul(toks, i + 1) {
-            POk(right, j) => {
+            ROk(right, j) => {
                 return parse_add_rest(toks, EBin(k, [left, right]), j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
-    return POk(left, i);
+    return ROk(left, i);
 }
 
-fn parse_mul(toks: List[Token], i: Int) -> Parse {
+fn parse_mul(toks: List[Token], i: Int) -> Res[Expr] {
     match parse_unary(toks, i) {
-        POk(left, j) => {
+        ROk(left, j) => {
             return parse_mul_rest(toks, left, j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_mul_rest(toks: List[Token], left: Expr, i: Int) -> Parse {
+fn parse_mul_rest(toks: List[Token], left: Expr, i: Int) -> Res[Expr] {
     let k: Text = tkind(toks, i);
     if k == "*" or k == "/" or k == "%" {
         match parse_unary(toks, i + 1) {
-            POk(right, j) => {
+            ROk(right, j) => {
                 return parse_mul_rest(toks, EBin(k, [left, right]), j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
-    return POk(left, i);
+    return ROk(left, i);
 }
 
-fn parse_unary(toks: List[Token], i: Int) -> Parse {
+fn parse_unary(toks: List[Token], i: Int) -> Res[Expr] {
     let k: Text = tkind(toks, i);
     if k == "not" or k == "-" {
         match parse_unary(toks, i + 1) {
-            POk(x, j) => {
-                return POk(EUn(k, [x]), j);
+            ROk(x, j) => {
+                return ROk(EUn(k, [x]), j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
     return parse_postfix(toks, i);
 }
 
-fn parse_postfix(toks: List[Token], i: Int) -> Parse {
+fn parse_postfix(toks: List[Token], i: Int) -> Res[Expr] {
     match parse_primary(toks, i) {
-        POk(base, j) => {
+        ROk(base, j) => {
             return parse_postfix_rest(toks, base, j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_postfix_rest(toks: List[Token], base: Expr, i: Int) -> Parse {
+fn parse_postfix_rest(toks: List[Token], base: Expr, i: Int) -> Res[Expr] {
     let k: Text = tkind(toks, i);
     if k == "[" {
         match parse_expr(toks, i + 1) {
-            POk(idx, j) => {
+            ROk(idx, j) => {
                 if tkind(toks, j) == "]" {
                     return parse_postfix_rest(toks, EIndex([base, idx]), j + 1);
                 }
-                return PErr("expected ]", j);
+                return RErr("expected ]", j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
@@ -258,35 +308,35 @@ fn parse_postfix_rest(toks: List[Token], base: Expr, i: Int) -> Parse {
         if tkind(toks, i + 1) == "IDENT" {
             return parse_postfix_rest(toks, EField(tval(toks, i + 1), [base]), i + 2);
         }
-        return PErr("expected field name", i + 1);
+        return RErr("expected field name", i + 1);
     }
-    return POk(base, i);
+    return ROk(base, i);
 }
 
-fn parse_primary(toks: List[Token], i: Int) -> Parse {
+fn parse_primary(toks: List[Token], i: Int) -> Res[Expr] {
     let k: Text = tkind(toks, i);
     if k == "INT" {
-        return POk(EInt(digits_to_int(tval(toks, i))), i + 1);
+        return ROk(EInt(digits_to_int(tval(toks, i))), i + 1);
     }
     if k == "TEXT" {
-        return POk(EText(tval(toks, i)), i + 1);
+        return ROk(EText(tval(toks, i)), i + 1);
     }
     if k == "true" {
-        return POk(EBool(true), i + 1);
+        return ROk(EBool(true), i + 1);
     }
     if k == "false" {
-        return POk(EBool(false), i + 1);
+        return ROk(EBool(false), i + 1);
     }
     if k == "(" {
         match parse_expr(toks, i + 1) {
-            POk(e, j) => {
+            ROk(e, j) => {
                 if tkind(toks, j) == ")" {
-                    return POk(e, j + 1);
+                    return ROk(e, j + 1);
                 }
-                return PErr("expected )", j);
+                return RErr("expected )", j);
             }
-            PErr(m, p) => {
-                return PErr(m, p);
+            RErr(m, p) => {
+                return RErr(m, p);
             }
         }
     }
@@ -298,54 +348,275 @@ fn parse_primary(toks: List[Token], i: Int) -> Parse {
         if tkind(toks, i + 1) == "(" {
             return parse_args(toks, name, i + 2, []);
         }
-        return POk(EVar(name), i + 1);
+        return ROk(EVar(name), i + 1);
     }
-    return PErr("unexpected token", i);
+    return RErr("unexpected token", i);
 }
 
-fn parse_args(toks: List[Token], name: Text, i: Int, acc: List[Expr]) -> Parse {
+fn parse_args(toks: List[Token], name: Text, i: Int, acc: List[Expr]) -> Res[Expr] {
     if tkind(toks, i) == ")" {
-        return POk(ECall(name, acc), i + 1);
+        return ROk(ECall(name, acc), i + 1);
     }
     match parse_expr(toks, i) {
-        POk(e, j) => {
+        ROk(e, j) => {
             let acc2: List[Expr] = push(acc, e);
             if tkind(toks, j) == "," {
                 return parse_args(toks, name, j + 1, acc2);
             }
             if tkind(toks, j) == ")" {
-                return POk(ECall(name, acc2), j + 1);
+                return ROk(ECall(name, acc2), j + 1);
             }
-            return PErr("expected , or ) in arguments", j);
+            return RErr("expected , or ) in arguments", j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
-fn parse_list(toks: List[Token], i: Int, acc: List[Expr]) -> Parse {
+fn parse_list(toks: List[Token], i: Int, acc: List[Expr]) -> Res[Expr] {
     if tkind(toks, i) == "]" {
-        return POk(EList(acc), i + 1);
+        return ROk(EList(acc), i + 1);
     }
     match parse_expr(toks, i) {
-        POk(e, j) => {
+        ROk(e, j) => {
             let acc2: List[Expr] = push(acc, e);
             if tkind(toks, j) == "," {
                 return parse_list(toks, j + 1, acc2);
             }
             if tkind(toks, j) == "]" {
-                return POk(EList(acc2), j + 1);
+                return ROk(EList(acc2), j + 1);
             }
-            return PErr("expected , or ] in list", j);
+            return RErr("expected , or ] in list", j);
         }
-        PErr(m, p) => {
-            return PErr(m, p);
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- statements
+fn parse_block(toks: List[Token], i: Int) -> Res[List[Stmt]] {
+    if tkind(toks, i) != "{" {
+        return RErr("expected {", i);
+    }
+    return parse_stmts(toks, i + 1, []);
+}
+
+fn parse_stmts(toks: List[Token], i: Int, acc: List[Stmt]) -> Res[List[Stmt]] {
+    if tkind(toks, i) == "}" {
+        return ROk(acc, i + 1);
+    }
+    if tkind(toks, i) == "EOF" {
+        return RErr("unterminated block", i);
+    }
+    match parse_stmt(toks, i) {
+        ROk(s, j) => {
+            return parse_stmts(toks, j, push(acc, s));
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_stmt(toks: List[Token], i: Int) -> Res[Stmt] {
+    let k: Text = tkind(toks, i);
+    if k == "let" or k == "var" {
+        return parse_binding(toks, k, i + 1);
+    }
+    if k == "return" {
+        if tkind(toks, i + 1) == ";" {
+            return ROk(SReturnVoid, i + 2);
+        }
+        match parse_expr(toks, i + 1) {
+            ROk(e, j) => {
+                if tkind(toks, j) == ";" {
+                    return ROk(SReturn(e), j + 1);
+                }
+                return RErr("expected ; after return", j);
+            }
+            RErr(m, p) => {
+                return RErr(m, p);
+            }
+        }
+    }
+    if k == "break" {
+        if tkind(toks, i + 1) == ";" {
+            return ROk(SBreak, i + 2);
+        }
+        return RErr("expected ; after break", i + 1);
+    }
+    if k == "if" {
+        return parse_if(toks, i);
+    }
+    if k == "while" {
+        return parse_while(toks, i);
+    }
+    if k == "IDENT" and tkind(toks, i + 1) == "=" {
+        let name: Text = tval(toks, i);
+        match parse_expr(toks, i + 2) {
+            ROk(e, j) => {
+                if tkind(toks, j) == ";" {
+                    return ROk(SAssign(name, e), j + 1);
+                }
+                return RErr("expected ; after assignment", j);
+            }
+            RErr(m, p) => {
+                return RErr(m, p);
+            }
+        }
+    }
+    match parse_expr(toks, i) {
+        ROk(e, j) => {
+            if tkind(toks, j) == ";" {
+                return ROk(SExpr(e), j + 1);
+            }
+            return RErr("expected ; after expression statement", j);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_binding(toks: List[Token], kw: Text, i: Int) -> Res[Stmt] {
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected a binding name", i);
+    }
+    let name: Text = tval(toks, i);
+    if tkind(toks, i + 1) != ":" {
+        return RErr("expected : and a type", i + 1);
+    }
+    match parse_type(toks, i + 2) {
+        ROk(ty, j) => {
+            if tkind(toks, j) != "=" {
+                return RErr("expected = in binding", j);
+            }
+            match parse_expr(toks, j + 1) {
+                ROk(e, k) => {
+                    if tkind(toks, k) != ";" {
+                        return RErr("expected ; after binding", k);
+                    }
+                    if kw == "let" {
+                        return ROk(SLet(name, ty, e), k + 1);
+                    }
+                    return ROk(SVar(name, ty, e), k + 1);
+                }
+                RErr(m, p) => {
+                    return RErr(m, p);
+                }
+            }
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_if(toks: List[Token], i: Int) -> Res[Stmt] {
+    match parse_expr(toks, i + 1) {
+        ROk(cond, j) => {
+            match parse_block(toks, j) {
+                ROk(then_body, k) => {
+                    if tkind(toks, k) == "else" {
+                        return parse_else(toks, cond, then_body, k + 1);
+                    }
+                    return ROk(SIf(cond, then_body), k);
+                }
+                RErr(m, p) => {
+                    return RErr(m, p);
+                }
+            }
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_else(toks: List[Token], cond: Expr, then_body: List[Stmt], i: Int) -> Res[Stmt] {
+    // `else if` parses as an else-body holding a single nested if statement,
+    // exactly as the reference parser does.
+    if tkind(toks, i) == "if" {
+        match parse_if(toks, i) {
+            ROk(nested, j) => {
+                return ROk(SIfElse(cond, then_body, [nested]), j);
+            }
+            RErr(m, p) => {
+                return RErr(m, p);
+            }
+        }
+    }
+    match parse_block(toks, i) {
+        ROk(else_body, j) => {
+            return ROk(SIfElse(cond, then_body, else_body), j);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_while(toks: List[Token], i: Int) -> Res[Stmt] {
+    match parse_expr(toks, i + 1) {
+        ROk(cond, j) => {
+            return parse_invariants(toks, cond, j, []);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_invariants(toks: List[Token], cond: Expr, i: Int, invs: List[Expr]) -> Res[Stmt] {
+    if tkind(toks, i) == "invariant" {
+        match parse_expr(toks, i + 1) {
+            ROk(e, j) => {
+                return parse_invariants(toks, cond, j, push(invs, e));
+            }
+            RErr(m, p) => {
+                return RErr(m, p);
+            }
+        }
+    }
+    match parse_block(toks, i) {
+        ROk(body, j) => {
+            return ROk(SWhile(cond, invs, body), j);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
         }
     }
 }
 
 // ---------------------------------------------------------------- dump
+fn dump_ty(t: Ty) -> Text {
+    match t {
+        TApp(name, args) => {
+            if len(args) == 0 {
+                return name;
+            }
+            return name + "[" + dump_ty_list(args) + "]";
+        }
+    }
+}
+
+fn dump_ty_list(xs: List[Ty]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(xs)
+        invariant i >= 0
+    {
+        if i > 0 {
+            out = out + ", ";
+        }
+        out = out + dump_ty(xs[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
 fn dump_expr(e: Expr) -> Text {
     match e {
         EInt(n) => {
@@ -367,7 +638,7 @@ fn dump_expr(e: Expr) -> Text {
             return "(un " + op + " " + dump_expr(kids[0]) + ")";
         }
         ECall(name, args) => {
-            return "(call " + name + dump_list(args) + ")";
+            return "(call " + name + dump_expr_list(args) + ")";
         }
         EIndex(kids) => {
             return "(idx " + dump_expr(kids[0]) + " " + dump_expr(kids[1]) + ")";
@@ -376,12 +647,12 @@ fn dump_expr(e: Expr) -> Text {
             return "(field " + dump_expr(kids[0]) + " " + name + ")";
         }
         EList(items) => {
-            return "(list" + dump_list(items) + ")";
+            return "(list" + dump_expr_list(items) + ")";
         }
     }
 }
 
-fn dump_list(xs: List[Expr]) -> Text {
+fn dump_expr_list(xs: List[Expr]) -> Text {
     var out: Text = "";
     var i: Int = 0;
     while i < len(xs)
@@ -393,15 +664,74 @@ fn dump_list(xs: List[Expr]) -> Text {
     return out;
 }
 
-fn main(console: Console) -> Unit ! {io.read, io.write} {
-    let line: Text = read_line(console);
-    let toks: List[Token] = lex(line);
-    match parse_expr(toks, 0) {
-        POk(e, j) => {
-            print(console, dump_expr(e));
+fn dump_block(stmts: List[Stmt]) -> Text {
+    var out: Text = "(block";
+    var i: Int = 0;
+    while i < len(stmts)
+        invariant i >= 0
+    {
+        out = out + " " + dump_stmt(stmts[i]);
+        i = i + 1;
+    }
+    return out + ")";
+}
+
+fn dump_stmt(s: Stmt) -> Text {
+    match s {
+        SLet(n, t, e) => {
+            return "(let " + n + " " + dump_ty(t) + " " + dump_expr(e) + ")";
         }
-        PErr(m, p) => {
-            print(console, "ERR " + m + " @ " + str(p));
+        SVar(n, t, e) => {
+            return "(var " + n + " " + dump_ty(t) + " " + dump_expr(e) + ")";
+        }
+        SAssign(n, e) => {
+            return "(assign " + n + " " + dump_expr(e) + ")";
+        }
+        SReturn(e) => {
+            return "(return " + dump_expr(e) + ")";
+        }
+        SReturnVoid => {
+            return "(return-void)";
+        }
+        SExpr(e) => {
+            return "(expr " + dump_expr(e) + ")";
+        }
+        SBreak => {
+            return "(break)";
+        }
+        SIf(c, body) => {
+            return "(if " + dump_expr(c) + " " + dump_block(body) + ")";
+        }
+        SIfElse(c, t, e) => {
+            return "(if-else " + dump_expr(c) + " " + dump_block(t) + " " + dump_block(e) + ")";
+        }
+        SWhile(c, invs, body) => {
+            return "(while " + dump_expr(c) + " (invs" + dump_expr_list(invs) + ") " + dump_block(body) + ")";
+        }
+    }
+}
+
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, io.read, io.write} {
+    let path: Text = read_line(console);
+    let src: Text = read_file(fs, path);
+    let toks: List[Token] = lex(src);
+    if tkind(toks, 0) == "{" {
+        match parse_block(toks, 0) {
+            ROk(stmts, j) => {
+                print(console, dump_block(stmts));
+            }
+            RErr(m, p) => {
+                print(console, "ERR " + m + " @ " + str(p));
+            }
+        }
+    } else {
+        match parse_expr(toks, 0) {
+            ROk(e, j) => {
+                print(console, dump_expr(e));
+            }
+            RErr(m, p) => {
+                print(console, "ERR " + m + " @ " + str(p));
+            }
         }
     }
 }

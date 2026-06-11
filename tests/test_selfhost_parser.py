@@ -1,11 +1,17 @@
-"""Conformance test for the Sigil-written parser (selfhost/parser.sg): for a
-corpus of expressions, the AST it produces — dumped as a canonical S-expr —
-must byte-match the AST that the reference Python parser (sigil.parser)
-produces, dumped in the same form. This is bootstrap component #2 toward
-self-hosting (docs/SELFHOST.md); it currently covers the expression grammar.
+"""Conformance test for the Sigil-written parser (selfhost/parser.sg): the AST
+it produces — dumped as a canonical S-expr — must byte-match the AST the
+reference Python parser (sigil.parser) produces, dumped in the same form.
+Bootstrap component #2 toward self-hosting (docs/SELFHOST.md). Covers the
+expression grammar and the statement grammar (types, let/var/assign/return/
+if/while+invariants/break/expression statements).
+
+selfhost/parser.sg reads a source path on stdin; if the file begins with '{'
+it parses a block, otherwise a single expression.
 """
 
 import io
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,37 +24,35 @@ from sigil.parser import parse
 REPO = Path(__file__).resolve().parent.parent
 PARSER_SG = REPO / "selfhost" / "parser.sg"
 
-CORPUS = [
-    "1 + 2 * 3",
-    "(1 + 2) * 3",
-    "a - b - c",
-    "a + b - c + d",
-    "2 * 3 + 4 * 5",
-    "not a and b or c",
-    "a == b and c != d",
-    "x < 1 or y >= 2",
-    "0 - 7",
-    "0 - 7 / 2",
-    "f(1, 2, 3)",
-    "g()",
-    "xs[0]",
-    "p.x",
-    "p.items[1].y",
-    "len(xs) > 0 and i < n",
-    "[1, 2, 3]",
-    "[]",
-    "[a, f(b), c[0]]",
-    "not not x",
-    "a * b * c % d",
-    "0 - -5",
-    "true and false",
-    "1 + 2 + 3 + 4",
-    "f(a)[0].b",
-    "-x + y",
+EXPR_CORPUS = [
+    "1 + 2 * 3", "(1 + 2) * 3", "a - b - c", "a + b - c + d",
+    "2 * 3 + 4 * 5", "not a and b or c", "a == b and c != d",
+    "x < 1 or y >= 2", "0 - 7", "0 - 7 / 2", "f(1, 2, 3)", "g()",
+    "xs[0]", "p.x", "p.items[1].y", "len(xs) > 0 and i < n",
+    "[1, 2, 3]", "[]", "[a, f(b), c[0]]", "not not x", "a * b * c % d",
+    "0 - -5", "true and false", "1 + 2 + 3 + 4", "f(a)[0].b", "-x + y",
+]
+
+BLOCK_CORPUS = [
+    "{ let x: Int = 1; return x; }",
+    "{ var y: Int = 2; y = y + 1; return y; }",
+    "{ let xs: List[Int] = [1, 2, 3]; return xs[0]; }",
+    "{ if a > 0 { return 1; } return 0; }",
+    "{ if a > 0 { return 1; } else { return 2; } }",
+    "{ if a > 0 { return 1; } else if b > 0 { return 2; } else { return 3; } }",
+    "{ var i: Int = 0; while i < n invariant i >= 0 { i = i + 1; } return i; }",
+    "{ while i < n invariant i >= 0 invariant i <= n { i = i + 1; } return 0; }",
+    "{ f(x); return; }",
+    "{ break; }",
+    "{ let p: Pair[Int, Text] = q; return 0; }",
+    "{ let t: Text = \"hi\"; return 0; }",
+    "{ let n: Int = - x + len(ys); return n; }",
 ]
 
 
-def reference_dump(e) -> str:
+# --- reference dumpers over the Python AST, matching parser.sg's format -------
+
+def dump_expr(e) -> str:
     if isinstance(e, A.IntLit):
         return f"(int {e.value})"
     if isinstance(e, A.BoolLit):
@@ -58,25 +62,55 @@ def reference_dump(e) -> str:
     if isinstance(e, A.Var):
         return f"(var {e.name})"
     if isinstance(e, A.Binary):
-        return f"(bin {e.op} {reference_dump(e.left)} {reference_dump(e.right)})"
+        return f"(bin {e.op} {dump_expr(e.left)} {dump_expr(e.right)})"
     if isinstance(e, A.Unary):
-        return f"(un {e.op} {reference_dump(e.operand)})"
+        return f"(un {e.op} {dump_expr(e.operand)})"
     if isinstance(e, A.Call):
-        return "(call " + e.name + "".join(" " + reference_dump(a)
-                                            for a in e.args) + ")"
+        return "(call " + e.name + "".join(" " + dump_expr(a) for a in e.args) + ")"
     if isinstance(e, A.Index):
-        return f"(idx {reference_dump(e.base)} {reference_dump(e.index)})"
+        return f"(idx {dump_expr(e.base)} {dump_expr(e.index)})"
     if isinstance(e, A.FieldAccess):
-        return f"(field {reference_dump(e.base)} {e.field_name})"
+        return f"(field {dump_expr(e.base)} {e.field_name})"
     if isinstance(e, A.ListLit):
-        return "(list" + "".join(" " + reference_dump(i)
-                                 for i in e.items) + ")"
-    raise AssertionError(f"unhandled node {type(e).__name__}")
+        return "(list" + "".join(" " + dump_expr(i) for i in e.items) + ")"
+    raise AssertionError(f"unhandled expr {type(e).__name__}")
 
 
-def reference(src: str) -> str:
+def dump_block(stmts) -> str:
+    return "(block" + "".join(" " + dump_stmt(s) for s in stmts) + ")"
+
+
+def dump_stmt(s) -> str:
+    if isinstance(s, A.Let):
+        kw = "var" if s.mutable else "let"
+        return f"({kw} {s.name} {s.declared_type} {dump_expr(s.value)})"
+    if isinstance(s, A.Assign):
+        return f"(assign {s.name} {dump_expr(s.value)})"
+    if isinstance(s, A.Return):
+        return "(return-void)" if s.value is None else f"(return {dump_expr(s.value)})"
+    if isinstance(s, A.ExprStmt):
+        return f"(expr {dump_expr(s.expr)})"
+    if isinstance(s, A.Break):
+        return "(break)"
+    if isinstance(s, A.If):
+        if s.else_body is None:
+            return f"(if {dump_expr(s.cond)} {dump_block(s.then_body)})"
+        return (f"(if-else {dump_expr(s.cond)} {dump_block(s.then_body)} "
+                f"{dump_block(s.else_body)})")
+    if isinstance(s, A.While):
+        invs = "".join(" " + dump_expr(c.expr) for c in s.invariants)
+        return f"(while {dump_expr(s.cond)} (invs{invs}) {dump_block(s.body)})"
+    raise AssertionError(f"unhandled stmt {type(s).__name__}")
+
+
+def ref_expr(src: str) -> str:
     program = parse(f"fn f() -> Int {{ return {src}; }}")
-    return reference_dump(program.functions[0].body[0].value)
+    return dump_expr(program.functions[0].body[0].value)
+
+
+def ref_block(src: str) -> str:
+    program = parse(f"fn f() -> Int {src}")
+    return dump_block(program.functions[0].body)
 
 
 class TestSelfhostParser(unittest.TestCase):
@@ -85,16 +119,28 @@ class TestSelfhostParser(unittest.TestCase):
         cls.program = load_program(str(PARSER_SG))
         cls.sigs = check(cls.program)
 
-    def sigil_parse(self, src: str) -> str:
-        out = io.StringIO()
-        Interpreter(self.program, self.sigs, stdin=io.StringIO(src + "\n"),
-                    stdout=out).run_main()
+    def sigil_parse(self, source: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "src.sg").write_text(source, encoding="utf-8")
+            out = io.StringIO()
+            old = os.getcwd()
+            os.chdir(tmp)
+            try:
+                Interpreter(self.program, self.sigs,
+                            stdin=io.StringIO("src.sg\n"), stdout=out).run_main()
+            finally:
+                os.chdir(old)
         return out.getvalue().strip()
 
-    def test_corpus_matches_reference(self):
-        for src in CORPUS:
+    def test_expression_corpus(self):
+        for src in EXPR_CORPUS:
             with self.subTest(expr=src):
-                self.assertEqual(self.sigil_parse(src), reference(src))
+                self.assertEqual(self.sigil_parse(src), ref_expr(src))
+
+    def test_block_corpus(self):
+        for src in BLOCK_CORPUS:
+            with self.subTest(block=src):
+                self.assertEqual(self.sigil_parse(src), ref_block(src))
 
 
 if __name__ == "__main__":
