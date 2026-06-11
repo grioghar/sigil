@@ -5,11 +5,20 @@ All notable changes to Sigil are recorded here. The format follows
 are grouped by the roadmap phase that introduced them (see
 [DESIGN.md](DESIGN.md)).
 
-## [1.0.0] — Language surface freeze
+## [Unreleased] — toward 1.0 (self-hosting)
+
+1.0 is gated on **self-hosting**: the Sigil compiler written in Sigil,
+compiling itself. A language is not 1.0 until it compiles with its own
+toolchain. Work proceeds component by component in [selfhost/](selfhost),
+each conformance-tested against its Python counterpart. See
+[docs/SELFHOST.md](docs/SELFHOST.md).
+
+## [0.9.0] — Language surface complete
 
 The single-file language and its toolchain are stable and conformance-tested
-(390 tests). 1.0 adds the last two surface features and the verifier depth to
-make a real program a compile-time theorem:
+(390 tests). 0.9 adds the last two surface features and the verifier depth to
+make a real program a compile-time theorem — but the toolchain still runs on
+Python, so this is 0.9, not 1.0:
 
 - **Generic records and enums.** `record Pair[A, B]` and `enum Step[T]`, with
   type arguments inferred from values and from the construction context, and
@@ -23,12 +32,12 @@ make a real program a compile-time theorem:
 - **Fully verified JSON parser.** [programs/json](programs/json) consolidated
   onto `Step[T]` and proven **49/49 clauses** — zero runtime contract checks.
 
-Everything below 1.0 was developed over the preceding milestones, preserved
-here as the project's history.
+Everything below was developed over the preceding milestones, preserved here
+as the project's history.
 
-_Deferred to 1.x: `let`-else destructuring, `?`-style error propagation, a
-shared standard library, `Float`, and the self-contained native toolchain
-(dependency-free `sigil` binary + Cranelift dev backend)._
+_Not yet, on the road past 0.9: self-hosting (the 1.0 gate); `let`-else
+destructuring; `?`-style error propagation; a shared standard library;
+`Float`; and a dependency-free distribution._
 
 ## [0.7] — Modules and imports
 
