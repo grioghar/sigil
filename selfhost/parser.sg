@@ -61,6 +61,26 @@ pub enum Stmt {
     SWhile(Expr, List[Expr], List[Stmt]),
 }
 
+pub record Param {
+    name: Text,
+    ty: Ty,
+}
+
+pub record Contract {
+    kind: Text,
+    cexpr: Expr,
+}
+
+pub record Fn {
+    name: Text,
+    tparams: List[Text],
+    params: List[Param],
+    ret: Ty,
+    effects: List[Text],
+    contracts: List[Contract],
+    body: List[Stmt],
+}
+
 // ---------------------------------------------------------------- token access
 fn tkind(toks: List[Token], i: Int) -> Text {
     if i < 0 or i >= len(toks) {
@@ -590,6 +610,198 @@ fn parse_invariants(toks: List[Token], cond: Expr, i: Int, invs: List[Expr]) -> 
     }
 }
 
+// ---------------------------------------------------------------- declarations
+fn parse_tparams(toks: List[Token], i: Int, acc: List[Text]) -> Res[List[Text]] {
+    if tkind(toks, i) != "[" {
+        return ROk(acc, i);
+    }
+    return parse_tparam_list(toks, i + 1, acc);
+}
+
+fn parse_tparam_list(toks: List[Token], i: Int, acc: List[Text]) -> Res[List[Text]] {
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected type parameter name", i);
+    }
+    let acc2: List[Text] = push(acc, tval(toks, i));
+    if tkind(toks, i + 1) == "," {
+        return parse_tparam_list(toks, i + 2, acc2);
+    }
+    if tkind(toks, i + 1) == "]" {
+        return ROk(acc2, i + 2);
+    }
+    return RErr("expected , or ] in type parameters", i + 1);
+}
+
+fn parse_params(toks: List[Token], i: Int, acc: List[Param]) -> Res[List[Param]] {
+    if tkind(toks, i) == ")" {
+        return ROk(acc, i + 1);
+    }
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected parameter name", i);
+    }
+    let pname: Text = tval(toks, i);
+    if tkind(toks, i + 1) != ":" {
+        return RErr("expected : in parameter", i + 1);
+    }
+    match parse_type(toks, i + 2) {
+        ROk(ty, j) => {
+            let acc2: List[Param] = push(acc, Param { name: pname, ty: ty });
+            if tkind(toks, j) == "," {
+                return parse_params(toks, j + 1, acc2);
+            }
+            if tkind(toks, j) == ")" {
+                return ROk(acc2, j + 1);
+            }
+            return RErr("expected , or ) in parameters", j);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_effect_name(toks: List[Token], i: Int) -> Text {
+    // io.read style: IDENT (. IDENT)?
+    if tkind(toks, i + 1) == "." {
+        return tval(toks, i) + "." + tval(toks, i + 2);
+    }
+    return tval(toks, i);
+}
+
+fn effect_width(toks: List[Token], i: Int) -> Int {
+    if tkind(toks, i + 1) == "." {
+        return 3;
+    }
+    return 1;
+}
+
+fn parse_effects(toks: List[Token], i: Int, acc: List[Text]) -> Res[List[Text]] {
+    // expects to be just past '{'
+    if tkind(toks, i) == "}" {
+        return ROk(acc, i + 1);
+    }
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected effect name", i);
+    }
+    let acc2: List[Text] = push(acc, parse_effect_name(toks, i));
+    let j: Int = i + effect_width(toks, i);
+    if tkind(toks, j) == "," {
+        return parse_effects(toks, j + 1, acc2);
+    }
+    if tkind(toks, j) == "}" {
+        return ROk(acc2, j + 1);
+    }
+    return RErr("expected , or } in effects", j);
+}
+
+fn parse_contracts(toks: List[Token], i: Int, acc: List[Contract]) -> Res[List[Contract]] {
+    let k: Text = tkind(toks, i);
+    if k == "requires" or k == "ensures" {
+        match parse_expr(toks, i + 1) {
+            ROk(e, j) => {
+                let acc2: List[Contract] = push(acc, Contract { kind: k, cexpr: e });
+                return parse_contracts(toks, j, acc2);
+            }
+            RErr(m, p) => {
+                return RErr(m, p);
+            }
+        }
+    }
+    return ROk(acc, i);
+}
+
+fn parse_fn(toks: List[Token], i: Int) -> Res[Fn] {
+    if tkind(toks, i) != "fn" {
+        return RErr("expected fn", i);
+    }
+    if tkind(toks, i + 1) != "IDENT" {
+        return RErr("expected function name", i + 1);
+    }
+    let name: Text = tval(toks, i + 1);
+    match parse_tparams(toks, i + 2, []) {
+        ROk(tps, a) => {
+            if tkind(toks, a) != "(" {
+                return RErr("expected ( for parameters", a);
+            }
+            match parse_params(toks, a + 1, []) {
+                ROk(ps, b) => {
+                    if tkind(toks, b) != "->" {
+                        return RErr("expected -> and a return type", b);
+                    }
+                    match parse_type(toks, b + 1) {
+                        ROk(ret, c) => {
+                            return parse_fn_tail(toks, name, tps, ps, ret, c);
+                        }
+                        RErr(m, p) => {
+                            return RErr(m, p);
+                        }
+                    }
+                }
+                RErr(m, p) => {
+                    return RErr(m, p);
+                }
+            }
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_fn_tail(toks: List[Token], name: Text, tps: List[Text], ps: List[Param], ret: Ty, i: Int) -> Res[Fn] {
+    var effs: List[Text] = [];
+    var c: Int = i;
+    // optional effects: ! { ... }
+    match parse_opt_effects(toks, i) {
+        ROk(es, j) => {
+            effs = es;
+            c = j;
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+    match parse_contracts(toks, c, []) {
+        ROk(cs, d) => {
+            match parse_block(toks, d) {
+                ROk(body, e) => {
+                    return ROk(Fn { name: name, tparams: tps, params: ps, ret: ret, effects: effs, contracts: cs, body: body }, e);
+                }
+                RErr(m, p) => {
+                    return RErr(m, p);
+                }
+            }
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_opt_effects(toks: List[Token], i: Int) -> Res[List[Text]] {
+    if tkind(toks, i) != "!" {
+        return ROk([], i);
+    }
+    if tkind(toks, i + 1) != "{" {
+        return RErr("expected { after !", i + 1);
+    }
+    return parse_effects(toks, i + 2, []);
+}
+
+fn parse_program(toks: List[Token], i: Int, acc: List[Fn]) -> Res[List[Fn]] {
+    if tkind(toks, i) == "EOF" {
+        return ROk(acc, i);
+    }
+    match parse_fn(toks, i) {
+        ROk(f, j) => {
+            return parse_program(toks, j, push(acc, f));
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- dump
 fn dump_ty(t: Ty) -> Text {
     match t {
@@ -711,11 +923,73 @@ fn dump_stmt(s: Stmt) -> Text {
     }
 }
 
+fn dump_str_list(label: Text, xs: List[Text]) -> Text {
+    var out: Text = "(" + label;
+    var i: Int = 0;
+    while i < len(xs)
+        invariant i >= 0
+    {
+        out = out + " " + xs[i];
+        i = i + 1;
+    }
+    return out + ")";
+}
+
+fn dump_params(ps: List[Param]) -> Text {
+    var out: Text = "(params";
+    var i: Int = 0;
+    while i < len(ps)
+        invariant i >= 0
+    {
+        out = out + " (p " + ps[i].name + " " + dump_ty(ps[i].ty) + ")";
+        i = i + 1;
+    }
+    return out + ")";
+}
+
+fn dump_contracts(cs: List[Contract]) -> Text {
+    var out: Text = "(contracts";
+    var i: Int = 0;
+    while i < len(cs)
+        invariant i >= 0
+    {
+        out = out + " (" + cs[i].kind + " " + dump_expr(cs[i].cexpr) + ")";
+        i = i + 1;
+    }
+    return out + ")";
+}
+
+fn dump_fn(f: Fn) -> Text {
+    return "(fn " + f.name + " " + dump_str_list("tparams", f.tparams) + " " + dump_params(f.params) + " " + dump_ty(f.ret) + " " + dump_str_list("effects", f.effects) + " " + dump_contracts(f.contracts) + " " + dump_block(f.body) + ")";
+}
+
+fn dump_program(fns: List[Fn]) -> Text {
+    var out: Text = "(program";
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        out = out + " " + dump_fn(fns[i]);
+        i = i + 1;
+    }
+    return out + ")";
+}
+
 fn main(console: Console, fs: Fs) -> Unit ! {fs.read, io.read, io.write} {
     let path: Text = read_line(console);
     let src: Text = read_file(fs, path);
     let toks: List[Token] = lex(src);
-    if tkind(toks, 0) == "{" {
+    let k: Text = tkind(toks, 0);
+    if k == "fn" {
+        match parse_program(toks, 0, []) {
+            ROk(fns, j) => {
+                print(console, dump_program(fns));
+            }
+            RErr(m, p) => {
+                print(console, "ERR " + m + " @ " + str(p));
+            }
+        }
+    } else if k == "{" {
         match parse_block(toks, 0) {
             ROk(stmts, j) => {
                 print(console, dump_block(stmts));

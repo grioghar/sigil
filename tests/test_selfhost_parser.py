@@ -103,6 +103,30 @@ def dump_stmt(s) -> str:
     raise AssertionError(f"unhandled stmt {type(s).__name__}")
 
 
+def dump_str_list(label, xs) -> str:
+    return "(" + label + "".join(" " + x for x in xs) + ")"
+
+
+def dump_params(ps) -> str:
+    return "(params" + "".join(f" (p {n} {t})" for n, t in ps) + ")"
+
+
+def dump_contracts(cs) -> str:
+    return "(contracts" + "".join(f" ({c.kind} {dump_expr(c.expr)})"
+                                  for c in cs) + ")"
+
+
+def dump_fn(f) -> str:
+    return ("(fn " + f.name + " " + dump_str_list("tparams", f.type_params)
+            + " " + dump_params(f.params) + f" {f.ret} "
+            + dump_str_list("effects", sorted(f.effects)) + " "
+            + dump_contracts(f.contracts) + " " + dump_block(f.body) + ")")
+
+
+def dump_program(fns) -> str:
+    return "(program" + "".join(" " + dump_fn(f) for f in fns) + ")"
+
+
 def ref_expr(src: str) -> str:
     program = parse(f"fn f() -> Int {{ return {src}; }}")
     return dump_expr(program.functions[0].body[0].value)
@@ -111,6 +135,25 @@ def ref_expr(src: str) -> str:
 def ref_block(src: str) -> str:
     program = parse(f"fn f() -> Int {src}")
     return dump_block(program.functions[0].body)
+
+
+def ref_program(src: str) -> str:
+    return dump_program(parse(src).functions)
+
+
+# Programs (each function has at most one effect, since effect-set ordering is
+# not yet expressible in the Sigil dumper — see selfhost/NOTES.md).
+PROGRAM_CORPUS = [
+    "fn add(a: Int, b: Int) -> Int { return a + b; }",
+    "fn id(x: Int) -> Int { return x; }\nfn use_it(y: Int) -> Int { return id(y); }",
+    "fn fib(n: Int) -> Int requires n >= 0 ensures result >= 0 "
+    "{ if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }",
+    "fn shout(c: Console, m: Text) -> Unit ! {io.write} { print(c, m); }",
+    "fn first(xs: List[Int]) -> Int { return xs[0]; }",
+    "fn pick(p: Pair[Int, Text]) -> Int { return 0; }",
+    "fn ident[T](x: T) -> T { return x; }",
+    "fn nothing() -> Unit { return; }",
+]
 
 
 class TestSelfhostParser(unittest.TestCase):
@@ -141,6 +184,11 @@ class TestSelfhostParser(unittest.TestCase):
         for src in BLOCK_CORPUS:
             with self.subTest(block=src):
                 self.assertEqual(self.sigil_parse(src), ref_block(src))
+
+    def test_program_corpus(self):
+        for src in PROGRAM_CORPUS:
+            with self.subTest(program=src):
+                self.assertEqual(self.sigil_parse(src), ref_program(src))
 
 
 if __name__ == "__main__":
