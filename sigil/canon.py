@@ -118,7 +118,11 @@ class Renderer:
             elem = "?" if ty.elem is None else self.render_type(ty.elem)
             return f"List[{elem}]"
         if ty.kind in ("Record", "Enum", "Var"):
-            return self._name(ty.name)
+            name = self._name(ty.name)
+            if ty.args:
+                args = ", ".join(self.render_type(a) for a in ty.args)
+                return f"{name}[{args}]"
+            return name
         return ty.kind
 
     # ---------------------------------------------------------- expressions
@@ -251,9 +255,11 @@ class Renderer:
 
     def render_record(self, rec: A.RecordDecl) -> list[str]:
         pub = "pub " if rec.public else ""
+        tps = f"[{', '.join(rec.type_params)}]" if rec.type_params else ""
+        header = f"{pub}record {self._name(rec.name)}{tps}"
         if not rec.fields:
-            return [f"{pub}record {self._name(rec.name)} {{}}"]
-        lines = [f"{pub}record {self._name(rec.name)} {{"]
+            return [f"{header} {{}}"]
+        lines = [f"{header} {{"]
         for fname, ty in rec.fields:
             lines.append(f"    {fname}: {self.render_type(ty)},")
         lines.append("}")
@@ -261,9 +267,11 @@ class Renderer:
 
     def render_enum(self, enum: A.EnumDecl) -> list[str]:
         pub = "pub " if enum.public else ""
+        tps = f"[{', '.join(enum.type_params)}]" if enum.type_params else ""
+        header = f"{pub}enum {self._name(enum.name)}{tps}"
         if not enum.variants:
-            return [f"{pub}enum {self._name(enum.name)} {{}}"]
-        lines = [f"{pub}enum {self._name(enum.name)} {{"]
+            return [f"{header} {{}}"]
+        lines = [f"{header} {{"]
         for vname, payloads in enum.variants:
             if payloads:
                 types = ", ".join(self.render_type(p) for p in payloads)
@@ -571,6 +579,7 @@ def program_json(program: A.Program) -> dict:
             "shape": decl_shape(rec),
             "name": rec.name,
             "public": rec.public,
+            "type_params": list(rec.type_params),
             "fields": [{"name": fname, "type": renderer.render_type(ty)}
                        for fname, ty in rec.fields],
         })
@@ -581,6 +590,7 @@ def program_json(program: A.Program) -> dict:
             "shape": decl_shape(enum),
             "name": enum.name,
             "public": enum.public,
+            "type_params": list(enum.type_params),
             "variants": [{"name": vname,
                           "payloads": [renderer.render_type(p)
                                        for p in payloads]}

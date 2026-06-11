@@ -109,9 +109,24 @@ class Parser:
                 "(Sigil has no glob imports)", start.line, start.col)
         return A.UseDecl(mod.value, items, start.line, start.col)
 
+    def parse_type_params(self) -> list[str]:
+        """Optional [T, U] after a declaration's name. Shared by fn, record,
+        and enum headers; there is no instantiation syntax at fn call sites
+        (inference) and type REFERENCES carry their arguments instead."""
+        type_params: list[str] = []
+        if self.match("["):
+            while True:
+                type_params.append(
+                    self.expect("IDENT", "type parameter name").value)
+                if not self.match(","):
+                    break
+            self.expect("]")
+        return type_params
+
     def parse_record(self) -> A.RecordDecl:
         start = self.expect("record")
         name = self.expect("IDENT", "record name").value
+        type_params = self.parse_type_params()
         self.expect("{")
         fields: list[tuple[str, A.Type]] = []
         while not self.at("}"):
@@ -121,11 +136,12 @@ class Parser:
             if not self.at("}"):
                 self.expect(",", "',' between record fields")
         self.expect("}")
-        return A.RecordDecl(name, fields, start.line, start.col)
+        return A.RecordDecl(name, fields, start.line, start.col, type_params)
 
     def parse_enum(self) -> A.EnumDecl:
         start = self.expect("enum")
         name = self.expect("IDENT", "enum name").value
+        type_params = self.parse_type_params()
         self.expect("{")
         variants: list[tuple[str, list[A.Type]]] = []
         while not self.at("}"):
@@ -141,20 +157,14 @@ class Parser:
             if not self.at("}"):
                 self.expect(",", "',' between enum variants")
         self.expect("}")
-        return A.EnumDecl(name, variants, start.line, start.col)
+        return A.EnumDecl(name, variants, start.line, start.col, type_params)
 
     def parse_fn(self) -> A.FnDecl:
         start = self.expect("fn", "'fn' to start a declaration")
         name = self.expect("IDENT", "function name").value
         # Optional type parameters: fn first[T](xs: List[T]) -> T. There is no
         # call-site instantiation syntax; types are inferred from arguments.
-        type_params: list[str] = []
-        if self.match("["):
-            while True:
-                type_params.append(self.expect("IDENT", "type parameter name").value)
-                if not self.match(","):
-                    break
-            self.expect("]")
+        type_params = self.parse_type_params()
         self.expect("(")
         params: list[tuple[str, A.Type]] = []
         if not self.at(")"):
@@ -205,11 +215,25 @@ class Parser:
             self.expect("]")
             return A.Type("List", elem)
         if name in TYPE_NAMES:
+            if self.at("["):
+                raise ParseError(
+                    f"type '{name}' does not take type arguments",
+                    self.cur.line, self.cur.col)
             return A.Type(name)
         if name[0].isupper():
-            # A record or enum reference; the checker resolves which kind it
-            # is and verifies that it is declared.
-            return A.Type("Record", name=name)
+            # A record or enum reference, possibly with type arguments
+            # (Pair[Int, Text]); the checker resolves which kind it is,
+            # verifies that it is declared, and checks the arity.
+            args: tuple[A.Type, ...] = ()
+            if self.match("["):
+                arglist: list[A.Type] = []
+                while True:
+                    arglist.append(self.parse_type())
+                    if not self.match(","):
+                        break
+                self.expect("]")
+                args = tuple(arglist)
+            return A.Type("Record", name=name, args=args)
         raise ParseError(f"unknown type '{name}' (record and enum names start "
                          f"with an uppercase letter)", tok.line, tok.col)
 

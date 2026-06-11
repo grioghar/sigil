@@ -115,6 +115,7 @@ class Checker:
     def check(self) -> dict[str, FnSig]:
         self.declare_records()
         self.declare_enums()
+        self.check_decl_type_params()
         self.check_record_fields()
         self.check_enum_payloads()
         self.check_size_cycles()
@@ -167,6 +168,8 @@ class Checker:
                         rec.line, rec.col)
                 seen.add(fname)
                 ftype = self.resolve_enum_refs(ftype)
+                if rec.type_params:
+                    ftype = self.resolve_type(ftype, rec.type_params)
                 self.validate_type(ftype, rec.line, rec.col)
                 resolved.append((fname, ftype))
             rec.fields = resolved
@@ -218,6 +221,9 @@ class Checker:
             resolved: list[tuple[str, list[A.Type]]] = []
             for vname, payloads in enum.variants:
                 types = [self.resolve_enum_refs(p) for p in payloads]
+                if enum.type_params:
+                    types = [self.resolve_type(p, enum.type_params)
+                             for p in types]
                 for ptype in types:
                     self.validate_type(ptype, enum.line, enum.col)
                 self.variants[vname] = (enum.name, types)
@@ -227,14 +233,27 @@ class Checker:
     def check_size_cycles(self) -> None:
         # Direct containment cycles (through records AND enums) have infinite
         # size. Recursion through List is fine (it is heap-indirected), so
-        # trees are expressible.
+        # trees are expressible. A generic declaration is ONE node: every
+        # reference to it depends on it whatever the arguments, and its type
+        # arguments count as direct dependencies too (conservative — a
+        # phantom argument would be finite, but `Pair[Tree, Int]` inline in a
+        # Tree field is not, and the rule must not depend on how the generic
+        # uses its parameters).
+        def type_deps(t: A.Type) -> list[str]:
+            if t.kind not in ("Record", "Enum"):
+                return []   # List indirects; Var and builtins are leaf-sized
+            deps = [t.name]
+            for arg in t.args:
+                deps.extend(type_deps(arg))
+            return deps
+
         def direct_deps(name: str) -> list[str]:
             if name in self.records:
                 types = [t for _, t in self.records[name].fields]
             else:
                 types = [t for _, payloads in self.enums[name].variants
                          for t in payloads]
-            return [t.name for t in types if t.kind in ("Record", "Enum")]
+            return [dep for t in types for dep in type_deps(t)]
 
         for start, decl in {**self.records, **self.enums}.items():
             what = "record" if start in self.records else "enum"
@@ -256,18 +275,42 @@ class Checker:
 
     def resolve_enum_refs(self, ty: A.Type) -> A.Type:
         """The parser cannot tell a record reference from an enum reference;
-        reinterpret parsed Record types whose name is a declared enum."""
-        if ty.kind == "Record" and ty.name in self.enums:
-            return A.Type("Enum", name=ty.name)
+        reinterpret parsed Record types whose name is a declared enum
+        (recursing through List elements and type arguments)."""
+        if ty.kind == "Record":
+            args = tuple(self.resolve_enum_refs(a) for a in ty.args)
+            if ty.name in self.enums:
+                return A.Type("Enum", name=ty.name, args=args)
+            if args != ty.args:
+                return A.Type("Record", name=ty.name, args=args)
+            return ty
         if ty.kind == "List" and ty.elem is not None:
             return A.Type("List", self.resolve_enum_refs(ty.elem))
         return ty
 
     def validate_type(self, ty: A.Type, line: int, col: int) -> None:
-        if ty.kind == "Record" and ty.name not in self.records:
-            raise CheckError(f"unknown record '{ty.name}'", line, col)
-        if ty.kind == "Enum" and ty.name not in self.enums:
-            raise CheckError(f"unknown enum '{ty.name}'", line, col)
+        if ty.kind == "Var" and ty.args:
+            raise CheckError(
+                f"type parameter '{ty.name}' does not take type arguments",
+                line, col)
+        if ty.kind in ("Record", "Enum"):
+            what = "record" if ty.kind == "Record" else "enum"
+            decl = (self.records.get(ty.name) if ty.kind == "Record"
+                    else self.enums.get(ty.name))
+            if decl is None:
+                raise CheckError(f"unknown {what} '{ty.name}'", line, col)
+            want, got = len(decl.type_params), len(ty.args)
+            if want != got:
+                if want == 0:
+                    raise CheckError(
+                        f"{what} '{ty.name}' is not generic; remove the "
+                        f"type arguments", line, col)
+                raise CheckError(
+                    f"generic {what} '{ty.name}' takes {want} type "
+                    f"argument(s) ({', '.join(decl.type_params)}), got {got}",
+                    line, col)
+            for arg in ty.args:
+                self.validate_type(arg, line, col)
         if ty.kind == "List" and ty.elem is not None:
             self.validate_type(ty.elem, line, col)
 
@@ -278,52 +321,87 @@ class Checker:
         if ty.kind == "List":
             return ty.elem is not None and self.contains_capability(ty.elem, visiting)
         # Records and enums share one visited set: their names cannot collide.
+        # A generic instantiation checks its type ARGUMENTS first (before the
+        # visited bail-out, so a capability written anywhere in the type
+        # expression is always seen — conservative for phantom parameters),
+        # then its field/payload types under the instantiating substitution.
+        # The set is keyed by NAME, not by instantiation, so recursion through
+        # generics terminates (the generic declaration is one node).
         if ty.kind == "Record":
+            if any(self.contains_capability(arg, visiting) for arg in ty.args):
+                return True
             visiting = visiting or set()
             if ty.name in visiting:
                 return False
             visiting.add(ty.name)
-            return any(self.contains_capability(ftype, visiting)
-                       for _, ftype in self.records[ty.name].fields)
+            rec = self.records[ty.name]
+            inst = dict(zip(rec.type_params, ty.args))
+            return any(self.contains_capability(A.substitute(ftype, inst),
+                                                visiting)
+                       for _, ftype in rec.fields)
         if ty.kind == "Enum":
+            if any(self.contains_capability(arg, visiting) for arg in ty.args):
+                return True
             visiting = visiting or set()
             if ty.name in visiting:
                 return False
             visiting.add(ty.name)
-            return any(self.contains_capability(ptype, visiting)
-                       for _, payloads in self.enums[ty.name].variants
+            enum = self.enums[ty.name]
+            inst = dict(zip(enum.type_params, ty.args))
+            return any(self.contains_capability(A.substitute(ptype, inst),
+                                                visiting)
+                       for _, payloads in enum.variants
                        for ptype in payloads)
         return False
 
     # ------------------------------------------------------------ generics
 
+    def validate_type_params(self, type_params: list[str], owner: str,
+                             line: int, col: int) -> None:
+        """The naming rules every type parameter list obeys (fn, record, and
+        enum alike): uppercase, distinct, and no collision with a record, an
+        enum, or a builtin type name."""
+        seen: set[str] = set()
+        for tp in type_params:
+            if not tp[0].isupper():
+                raise CheckError(
+                    f"type parameter '{tp}' must start with an uppercase "
+                    f"letter (Sigil's one canonical style)", line, col)
+            if tp in seen:
+                raise CheckError(
+                    f"duplicate type parameter '{tp}' in '{owner}'",
+                    line, col)
+            seen.add(tp)
+            if tp in self.records:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{owner}' collides with "
+                    f"record '{tp}'; pick another name", line, col)
+            if tp in self.enums:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{owner}' collides with "
+                    f"enum '{tp}'; pick another name", line, col)
+            if tp in BUILTIN_TYPE_NAMES:
+                raise CheckError(
+                    f"type parameter '{tp}' of '{owner}' collides with the "
+                    f"builtin type '{tp}'; pick another name", line, col)
+
+    def check_decl_type_params(self) -> None:
+        """Validate the type parameters of generic records and enums. Unlike
+        functions there is NO every-parameter-must-be-used rule: a parameter
+        that no field or payload mentions (`Nothing` in a Maybe[T]) is
+        normal — the construction-site inference rules handle it instead."""
+        for rec in self.program.records:
+            self.validate_type_params(rec.type_params, rec.name,
+                                      rec.line, rec.col)
+        for enum in self.program.enums:
+            self.validate_type_params(enum.type_params, enum.name,
+                                      enum.line, enum.col)
+
     def resolve_fn_type_params(self, fn: A.FnDecl) -> None:
         """Validate a generic function's type parameters and reinterpret the
         parsed types: a Record reference whose name is a type parameter is
         really a type variable."""
-        seen: set[str] = set()
-        for tp in fn.type_params:
-            if not tp[0].isupper():
-                raise CheckError(
-                    f"type parameter '{tp}' must start with an uppercase "
-                    f"letter (Sigil's one canonical style)", fn.line, fn.col)
-            if tp in seen:
-                raise CheckError(
-                    f"duplicate type parameter '{tp}' in '{fn.name}'",
-                    fn.line, fn.col)
-            seen.add(tp)
-            if tp in self.records:
-                raise CheckError(
-                    f"type parameter '{tp}' of '{fn.name}' collides with "
-                    f"record '{tp}'; pick another name", fn.line, fn.col)
-            if tp in self.enums:
-                raise CheckError(
-                    f"type parameter '{tp}' of '{fn.name}' collides with "
-                    f"enum '{tp}'; pick another name", fn.line, fn.col)
-            if tp in BUILTIN_TYPE_NAMES:
-                raise CheckError(
-                    f"type parameter '{tp}' of '{fn.name}' collides with the "
-                    f"builtin type '{tp}'; pick another name", fn.line, fn.col)
+        self.validate_type_params(fn.type_params, fn.name, fn.line, fn.col)
 
         fn.params = [(pname, self.resolve_type(ptype, fn.type_params))
                      for pname, ptype in fn.params]
@@ -343,9 +421,16 @@ class Checker:
 
     def resolve_type(self, ty: A.Type, type_params: list[str]) -> A.Type:
         if ty.kind == "Record" and ty.name in type_params:
-            return A.Type("Var", name=ty.name)
+            # Arguments are kept so validate_type can reject `T[Int]`.
+            return A.Type("Var", name=ty.name,
+                          args=tuple(self.resolve_type(a, type_params)
+                                     for a in ty.args))
         if ty.kind == "List" and ty.elem is not None:
             return A.Type("List", self.resolve_type(ty.elem, type_params))
+        if ty.args:
+            return A.Type(ty.kind, name=ty.name,
+                          args=tuple(self.resolve_type(a, type_params)
+                                     for a in ty.args))
         return ty
 
     def collect_vars(self, ty: A.Type) -> set[str]:
@@ -353,7 +438,10 @@ class Checker:
             return {ty.name}
         if ty.kind == "List" and ty.elem is not None:
             return self.collect_vars(ty.elem)
-        return set()
+        out: set[str] = set()
+        for arg in ty.args:
+            out |= self.collect_vars(arg)
+        return out
 
     # ------------------------------------------------------------ functions
 
@@ -431,7 +519,8 @@ class Checker:
                 stmt.declared_type = self.resolve_type(stmt.declared_type,
                                                        fn.type_params)
             self.validate_type(stmt.declared_type, stmt.line, stmt.col)
-            vtype = self.check_expr(stmt.value, scope, fn)
+            vtype = self.check_expr(stmt.value, scope, fn,
+                                    expected=stmt.declared_type)
             if not A.compatible(stmt.declared_type, vtype):
                 raise CheckError(
                     f"'{stmt.name}' is declared {stmt.declared_type} but its "
@@ -461,7 +550,7 @@ class Checker:
                     raise CheckError(
                         f"'{fn.name}' must return {fn.ret}", stmt.line, stmt.col)
                 return
-            vtype = self.check_expr(stmt.value, scope, fn)
+            vtype = self.check_expr(stmt.value, scope, fn, expected=fn.ret)
             if fn.ret == A.UNIT:
                 raise CheckError(
                     f"'{fn.name}' returns Unit; remove the return value",
@@ -523,7 +612,7 @@ class Checker:
             raise CheckError(f"match needs an enum value, got {stype}",
                              stmt.line, stmt.col)
         enum = self.enums[stype.name]
-        payloads_of = dict(enum.variants)
+        payloads_of = self.instantiated_payloads(enum, stype)
         covered: set[str] = set()
         wildcard: Optional[A.MatchArm] = None
         for arm in stmt.arms:
@@ -557,8 +646,9 @@ class Checker:
                         arm.line, arm.col)
                 arm_scope.declare(binder, Binding(ptype, mutable=False),
                                   arm.line, arm.col)
-            # Payloads are concrete, but stamp the (trivially) substituted
-            # types so downstream stages never re-derive them.
+            # Stamp the SUBSTITUTED payload types (Done(v, n) over a
+            # Step[Json] binds v: Json) so downstream stages never re-derive
+            # them.
             arm.binder_types = list(payloads)
             self.check_block(arm.body, Scope(arm_scope), fn)
 
@@ -574,16 +664,35 @@ class Checker:
                 stmt.line, stmt.col)
         stmt.enum_name = stype.name
 
+    def instantiated_payloads(self, enum: A.EnumDecl,
+                              stype: A.Type) -> dict[str, list[A.Type]]:
+        """Each variant's payload types under the scrutinee's type arguments
+        (the identity for a non-generic enum)."""
+        inst = dict(zip(enum.type_params, stype.args))
+        if not inst:
+            return dict(enum.variants)
+        return {vname: [A.substitute(p, inst) for p in payloads]
+                for vname, payloads in enum.variants}
+
     # ------------------------------------------------------------ expressions
 
     def check_expr(self, expr: A.Expr, scope: Scope, fn: A.FnDecl,
-                   in_contract: bool = False) -> A.Type:
-        ty = self._infer_expr(expr, scope, fn, in_contract)
+                   in_contract: bool = False,
+                   expected: Optional[A.Type] = None) -> A.Type:
+        """`expected` is the construction-context hint: ONLY a let with this
+        expression as its immediate initializer (the declared type) or a
+        return with this expression as its immediate value (the declared
+        return type) supply it, and ONLY a record literal or a variant
+        construction of a generic type consumes it — for type parameters its
+        fields/payloads do not determine. It never propagates into
+        subexpressions; everything else infers from values alone."""
+        ty = self._infer_expr(expr, scope, fn, in_contract, expected)
         expr.ty = ty  # stamp for backends (the Rust emitter reads this)
         return ty
 
     def _infer_expr(self, expr: A.Expr, scope: Scope, fn: A.FnDecl,
-                    in_contract: bool = False) -> A.Type:
+                    in_contract: bool = False,
+                    expected: Optional[A.Type] = None) -> A.Type:
         if isinstance(expr, A.IntLit):
             return A.INT
         if isinstance(expr, A.BoolLit):
@@ -615,6 +724,16 @@ class Checker:
                             f"{len(payloads)} argument(s)", expr.line, expr.col)
                     # Nullary variant: stamp for the interpreter and emitter.
                     expr.variant_of = enum_name
+                    enum = self.enums[enum_name]
+                    if enum.type_params:
+                        # No payloads, so only the context can determine the
+                        # type arguments.
+                        bindings = self.infer_construction(
+                            {}, enum, expected, "Enum",
+                            expr.name, expr.line, expr.col)
+                        return A.Type("Enum", name=enum_name,
+                                      args=tuple(bindings[tp]
+                                                 for tp in enum.type_params))
                     return A.Type("Enum", name=enum_name)
                 hint = ""
                 if last_segment(expr.name)[0].isupper() and self.enums:
@@ -624,7 +743,7 @@ class Checker:
             return binding.type
 
         if isinstance(expr, A.Call):
-            return self.check_call(expr, scope, fn, in_contract)
+            return self.check_call(expr, scope, fn, in_contract, expected)
 
         if isinstance(expr, A.RecordLit):
             rec = self.records.get(expr.name)
@@ -639,13 +758,47 @@ class Checker:
                     f"declaration order: {', '.join(declared)} (got: "
                     f"{', '.join(written) if written else 'none'})",
                     expr.line, expr.col)
-            for (fname, fexpr), (_, ftype) in zip(expr.fields, rec.fields):
-                atype = self.check_expr(fexpr, scope, fn, in_contract)
-                if not A.compatible(ftype, atype):
+            if not rec.type_params:
+                # Field types are concrete, so each is its value's expected-type
+                # hint (lets `content: Nothing` infer through Maybe[Int]).
+                for (fname, fexpr), (_, ftype) in zip(expr.fields, rec.fields):
+                    atype = self.check_expr(fexpr, scope, fn, in_contract, ftype)
+                    if not A.compatible(ftype, atype):
+                        raise CheckError(
+                            f"field '{fname}' of '{expr.name}' needs {ftype}, "
+                            f"got {atype}", fexpr.line, fexpr.col)
+                return A.Type("Record", name=expr.name)
+            # A generic record literal infers its type arguments from the field
+            # values, falling back to the construction context for parameters no
+            # field mentions. Seed bindings from the expected type FIRST so a
+            # field that needs a hint (`content: Nothing`) sees a concrete type.
+            bindings: dict[str, A.Type] = {}
+            if (expected is not None and expected.kind == "Record"
+                    and expected.name == expr.name
+                    and len(expected.args) == len(rec.type_params)):
+                for tp, arg in zip(rec.type_params, expected.args):
+                    bindings[tp] = arg
+            atypes = []
+            for (_, fexpr), (_, ftype) in zip(expr.fields, rec.fields):
+                hint = A.substitute(ftype, bindings)
+                if not self.fully_known(hint):
+                    hint = None
+                atypes.append(self.check_expr(fexpr, scope, fn, in_contract, hint))
+            for (_, ftype), atype in zip(rec.fields, atypes):
+                self.unify(ftype, atype, bindings,
+                           f"this '{expr.name}' literal", expr.line, expr.col)
+            bindings = self.infer_construction(bindings, rec, expected,
+                                               "Record", expr.name,
+                                               expr.line, expr.col)
+            for (fname, fexpr), (_, ftype), atype in zip(expr.fields,
+                                                         rec.fields, atypes):
+                concrete = A.substitute(ftype, bindings)
+                if not A.compatible(concrete, atype):
                     raise CheckError(
-                        f"field '{fname}' of '{expr.name}' needs {ftype}, "
+                        f"field '{fname}' of '{expr.name}' needs {concrete}, "
                         f"got {atype}", fexpr.line, fexpr.col)
-            return A.Type("Record", name=expr.name)
+            return A.Type("Record", name=expr.name,
+                          args=tuple(bindings[tp] for tp in rec.type_params))
 
         if isinstance(expr, A.IfExpr):
             ctype = self.check_expr(expr.cond, scope, fn, in_contract)
@@ -698,7 +851,9 @@ class Checker:
                     f"'with' update must list fields in declaration order: "
                     f"{', '.join(in_order)} (got: {', '.join(written)})",
                     expr.line, expr.col)
-            ftype_of = dict(rec.fields)
+            inst = dict(zip(rec.type_params, btype.args))
+            ftype_of = {fname: A.substitute(ftype, inst)
+                        for fname, ftype in rec.fields}
             for fname, fexpr in expr.fields:
                 atype = self.check_expr(fexpr, scope, fn, in_contract)
                 if not A.compatible(ftype_of[fname], atype):
@@ -714,9 +869,11 @@ class Checker:
                     f"only record values have fields; got {btype}",
                     expr.line, expr.col)
             rec = self.records[btype.name]
+            inst = dict(zip(rec.type_params, btype.args))
             for fname, ftype in rec.fields:
                 if fname == expr.field_name:
-                    return ftype
+                    # Stamp the SUBSTITUTED type: Pair[Int, Text].first is Int.
+                    return A.substitute(ftype, inst) if inst else ftype
             raise CheckError(
                 f"record '{btype.name}' has no field '{expr.field_name}' "
                 f"(fields: {', '.join(f for f, _ in rec.fields)})",
@@ -815,7 +972,7 @@ class Checker:
             raise CheckError(f"match needs an enum value, got {stype}",
                              expr.line, expr.col)
         enum = self.enums[stype.name]
-        payloads_of = dict(enum.variants)
+        payloads_of = self.instantiated_payloads(enum, stype)
         covered: set[str] = set()
         wildcard: Optional[A.MatchExprArm] = None
         result: Optional[A.Type] = None
@@ -886,11 +1043,13 @@ class Checker:
     # ------------------------------------------------------------ calls
 
     def check_call(self, expr: A.Call, scope: Scope, fn: A.FnDecl,
-                   in_contract: bool) -> A.Type:
+                   in_contract: bool,
+                   expected: Optional[A.Type] = None) -> A.Type:
         # Variant construction resolves BEFORE function lookup. There is no
         # ambiguity: function names must start lowercase, variants uppercase.
         if expr.name in self.variants:
-            return self.check_variant_call(expr, scope, fn, in_contract)
+            return self.check_variant_call(expr, scope, fn, in_contract,
+                                           expected)
         if expr.name in self.records:
             raise CheckError(
                 f"record '{expr.name}' is not callable; use "
@@ -920,7 +1079,19 @@ class Checker:
                 f"contract clauses must be pure; '{expr.name}' performs "
                 f"{{{', '.join(sorted(sig.effects))}}}", expr.line, expr.col)
 
-        arg_types = [self.check_expr(a, scope, fn, in_contract) for a in expr.args]
+        # For a NON-generic callee every parameter type is fully concrete, so
+        # it serves as the expected-type hint for its argument — this is what
+        # lets a payload-less / parameter-free variant construction (Nothing,
+        # or Fail(m, p) for Step[T]) infer its type arguments from the position
+        # it flows into. Generic callees still carry unbound variables in their
+        # parameter types and builtins are special-cased, so those check plain.
+        if (expr.name not in POLYMORPHIC and not sig.type_params
+                and len(expr.args) == len(sig.params)):
+            arg_types = [self.check_expr(a, scope, fn, in_contract, ptype)
+                         for (_, ptype), a in zip(sig.params, expr.args)]
+        else:
+            arg_types = [self.check_expr(a, scope, fn, in_contract)
+                         for a in expr.args]
 
         if expr.name in POLYMORPHIC:
             return self.check_polymorphic(expr, arg_types)
@@ -945,9 +1116,13 @@ class Checker:
         return sig.ret
 
     def check_variant_call(self, expr: A.Call, scope: Scope, fn: A.FnDecl,
-                           in_contract: bool) -> A.Type:
+                           in_contract: bool,
+                           expected: Optional[A.Type] = None) -> A.Type:
         """Construction of an enum variant. Pure — no effects to cover, so
-        construction is legal anywhere, contracts included."""
+        construction is legal anywhere, contracts included. For a generic
+        enum the type arguments are inferred from the payload values, falling
+        back to the construction context for parameters no payload mentions
+        (`Fail(msg, pos)` of a Step[T])."""
         enum_name, payloads = self.variants[expr.name]
         arg_types = [self.check_expr(a, scope, fn, in_contract)
                      for a in expr.args]
@@ -955,14 +1130,66 @@ class Checker:
             raise CheckError(
                 f"variant '{expr.name}' takes {len(payloads)} argument(s), "
                 f"got {len(arg_types)}", expr.line, expr.col)
+        enum = self.enums[enum_name]
+        if not enum.type_params:
+            for idx, (ptype, atype, arg) in enumerate(zip(payloads, arg_types,
+                                                          expr.args)):
+                if not A.compatible(ptype, atype):
+                    raise CheckError(
+                        f"payload {idx + 1} of variant '{expr.name}' needs "
+                        f"{ptype}, got {atype}", arg.line, arg.col)
+            expr.variant_of = enum_name  # the interpreter and emitter read this
+            return A.Type("Enum", name=enum_name)
+        bindings: dict[str, A.Type] = {}
+        for ptype, atype in zip(payloads, arg_types):
+            self.unify(ptype, atype, bindings,
+                       f"this construction of '{expr.name}'",
+                       expr.line, expr.col)
+        bindings = self.infer_construction(bindings, enum, expected, "Enum",
+                                           expr.name, expr.line, expr.col)
         for idx, (ptype, atype, arg) in enumerate(zip(payloads, arg_types,
                                                       expr.args)):
-            if not A.compatible(ptype, atype):
+            concrete = A.substitute(ptype, bindings)
+            if not A.compatible(concrete, atype):
                 raise CheckError(
                     f"payload {idx + 1} of variant '{expr.name}' needs "
-                    f"{ptype}, got {atype}", arg.line, arg.col)
+                    f"{concrete}, got {atype}", arg.line, arg.col)
         expr.variant_of = enum_name  # the interpreter and emitter read this
-        return A.Type("Enum", name=enum_name)
+        return A.Type("Enum", name=enum_name,
+                      args=tuple(bindings[tp] for tp in enum.type_params))
+
+    def infer_construction(self, bindings: dict[str, A.Type], decl,
+                           expected: Optional[A.Type], kind: str, what: str,
+                           line: int, col: int) -> dict[str, A.Type]:
+        """Complete a generic construction's type-argument bindings. Values
+        bind first (the caller unified them); any parameter they leave
+        unknown (or only partially known, an empty list literal) must come
+        from the construction CONTEXT — the declared type of the let this
+        construction immediately initializes, or the declared return type of
+        the fn it is immediately returned from. Those two positions are the
+        whole rule; anywhere else an undetermined parameter is an error."""
+        if (expected is not None and expected.kind == kind
+                and expected.name == decl.name
+                and len(expected.args) == len(decl.type_params)):
+            for tp, arg in zip(decl.type_params, expected.args):
+                bound = bindings.get(tp)
+                if bound is None:
+                    bindings[tp] = arg
+                    continue
+                if not self.fully_known(bound):
+                    merged = self.merge_binding(bound, arg)
+                    if merged is not None:
+                        bindings[tp] = merged
+        for tp in decl.type_params:
+            bound = bindings.get(tp)
+            if bound is None or not self.fully_known(bound):
+                raise CheckError(
+                    f"cannot infer {tp} for '{what}': no value here "
+                    f"determines it; construct it as the immediate "
+                    f"initializer of a let whose declared type fixes {tp}, "
+                    f"or return it directly from a fn whose declared return "
+                    f"type does", line, col)
+        return bindings
 
     def check_generic_call(self, expr: A.Call, sig: FnSig,
                            arg_types: list[A.Type]) -> A.Type:
@@ -972,7 +1199,8 @@ class Checker:
         (expr.type_bindings) for the monomorphizing native backend."""
         bindings: dict[str, A.Type] = {}
         for (pname, ptype), atype in zip(sig.params, arg_types):
-            self.unify(ptype, atype, bindings, expr)
+            self.unify(ptype, atype, bindings,
+                       f"this call of '{expr.name}'", expr.line, expr.col)
 
         for (pname, ptype), atype, arg in zip(sig.params, arg_types, expr.args):
             concrete = A.substitute(ptype, bindings)
@@ -992,10 +1220,11 @@ class Checker:
         expr.type_bindings = bindings
         return A.substitute(sig.ret, bindings)
 
-    def unify(self, ptype: A.Type, atype: A.Type,
-              bindings: dict[str, A.Type], expr: A.Call) -> None:
+    def unify(self, ptype: A.Type, atype: A.Type, bindings: dict[str, A.Type],
+              what: str, line: int, col: int) -> None:
         """Bind type variables in a declared parameter type against the actual
-        argument type. Only binding conflicts are raised here; plain type
+        argument type, recursing through List elements and generic type
+        arguments. Only binding conflicts are raised here; plain type
         mismatches get the standard argument error from the caller."""
         if ptype.kind == "Var":
             existing = bindings.get(ptype.name)
@@ -1005,14 +1234,18 @@ class Checker:
             merged = self.merge_binding(existing, atype)
             if merged is None:
                 raise CheckError(
-                    f"conflicting types for {ptype.name} in this call of "
-                    f"'{expr.name}': {existing} and {atype}",
-                    expr.line, expr.col)
+                    f"conflicting types for {ptype.name} in {what}: "
+                    f"{existing} and {atype}", line, col)
             bindings[ptype.name] = merged
             return
         if ptype.kind == "List" and atype.kind == "List":
             if ptype.elem is not None and atype.elem is not None:
-                self.unify(ptype.elem, atype.elem, bindings, expr)
+                self.unify(ptype.elem, atype.elem, bindings, what, line, col)
+            return
+        if (ptype.kind in ("Record", "Enum") and atype.kind == ptype.kind
+                and atype.name == ptype.name):
+            for parg, aarg in zip(ptype.args, atype.args):
+                self.unify(parg, aarg, bindings, what, line, col)
 
     def merge_binding(self, a: A.Type, b: A.Type) -> Optional[A.Type]:
         """The more specific of two bindings for one type parameter, or None
@@ -1027,8 +1260,15 @@ class Checker:
             return A.Type("List", elem) if elem is not None else None
         if a.kind != b.kind:
             return None
-        if a.kind in ("Record", "Var"):
-            return a if a.name == b.name else None
+        if a.kind in ("Record", "Enum", "Var"):
+            if a.name != b.name or len(a.args) != len(b.args):
+                return None
+            if not a.args:
+                return a
+            merged = [self.merge_binding(x, y) for x, y in zip(a.args, b.args)]
+            if any(m is None for m in merged):
+                return None
+            return A.Type(a.kind, name=a.name, args=tuple(merged))
         return a
 
     def fully_known(self, ty: A.Type) -> bool:
@@ -1036,7 +1276,7 @@ class Checker:
         list literal) cannot drive monomorphization."""
         if ty.kind == "List":
             return ty.elem is not None and self.fully_known(ty.elem)
-        return True
+        return all(self.fully_known(a) for a in ty.args)
 
     def check_polymorphic(self, expr: A.Call, arg_types: list[A.Type]) -> A.Type:
         name = expr.name

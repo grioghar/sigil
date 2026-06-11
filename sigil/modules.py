@@ -252,25 +252,37 @@ class _Rewriter:
 
     # ------------------------------------------------------------ traversal
 
+    def check_type_params(self, type_params: list[str], owner: str,
+                          line: int, col: int) -> None:
+        for tp in type_params:
+            if tp in self.import_map:
+                raise ModuleError(
+                    f"type parameter '{tp}' of '{owner}' collides with "
+                    f"imported '{self.import_map[tp]}'; pick another name",
+                    line, col, self.path)
+
     def run(self, program: A.Program) -> None:
         for rec in program.records:
+            self.type_params = set(rec.type_params)
+            self.check_type_params(rec.type_params, rec.name,
+                                   rec.line, rec.col)
             rec.fields = [(fname, self.rewrite_type(ftype, rec.line, rec.col))
                           for fname, ftype in rec.fields]
             rec.name = self.qualify(rec.name)
+            self.type_params = set()
         for enum in program.enums:
+            self.type_params = set(enum.type_params)
+            self.check_type_params(enum.type_params, enum.name,
+                                   enum.line, enum.col)
             enum.variants = [
                 (self.qualify(vname),
                  [self.rewrite_type(p, enum.line, enum.col) for p in payloads])
                 for vname, payloads in enum.variants]
             enum.name = self.qualify(enum.name)
+            self.type_params = set()
         for fn in program.functions:
             self.type_params = set(fn.type_params)
-            for tp in fn.type_params:
-                if tp in self.import_map:
-                    raise ModuleError(
-                        f"type parameter '{tp}' of '{fn.name}' collides with "
-                        f"imported '{self.import_map[tp]}'; pick another name",
-                        fn.line, fn.col, self.path)
+            self.check_type_params(fn.type_params, fn.name, fn.line, fn.col)
             fn.params = [(pname, self.rewrite_type(ptype, fn.line, fn.col))
                          for pname, ptype in fn.params]
             fn.ret = self.rewrite_type(fn.ret, fn.line, fn.col)
@@ -285,11 +297,15 @@ class _Rewriter:
         if ty.kind == "List" and ty.elem is not None:
             return A.Type("List", self.rewrite_type(ty.elem, line, col))
         # The parser produces kind 'Record' for every user type name; a name
-        # bound by the enclosing fn's type parameters is a type variable and
-        # never module-qualified.
-        if ty.kind == "Record" and ty.name not in self.type_params:
-            return A.Type("Record",
-                          name=self.resolve(ty.name, "type", line, col))
+        # bound by the enclosing declaration's type parameters is a type
+        # variable and never module-qualified. Type ARGUMENTS are ordinary
+        # type references and qualify recursively: Pair[Int, geometry.Shape].
+        if ty.kind == "Record":
+            args = tuple(self.rewrite_type(a, line, col) for a in ty.args)
+            name = (ty.name if ty.name in self.type_params
+                    else self.resolve(ty.name, "type", line, col))
+            if name != ty.name or args != ty.args:
+                return A.Type("Record", name=name, args=args)
         return ty
 
     def rewrite_block(self, stmts: list[A.Stmt]) -> None:

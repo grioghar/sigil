@@ -806,6 +806,7 @@ class TestEnumServer(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["enums"], [
             {"name": "Shape",
+             "type_params": [],
              "variants": [{"name": "Circle", "payloads": ["Int"]},
                           {"name": "Rect", "payloads": ["Int", "Int"]},
                           {"name": "Empty", "payloads": []}]},
