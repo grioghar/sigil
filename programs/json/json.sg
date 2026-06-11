@@ -8,6 +8,14 @@
 // * Duplicate object keys are allowed and kept in order; a consumer
 // that wants last-wins can scan the member list itself.
 // Trailing commas are rejected; junk after the top-level value is a Fail.
+//
+// Every parse step returns a Step[T]: the parsed value plus the index just
+// past it, or a message plus the offending position. One generic Step[T]
+// (a Json step or a Text step) replaces the two hand-copied enums round 1
+// needed — generics, friction #2. The payload-carrying ensures below say
+// the returned index stays within bounds; the verifier reasons through them
+// to discharge every index obligation in the parser (payload verification),
+// so `python -m sigil verify` reports this file fully proven.
 use textutil { char_at, has_at, is_digit }
 
 pub enum Json {
@@ -25,24 +33,14 @@ pub record Member {
     value: Json,
 }
 
-// Sigil has no tuples, so every parsing function returns a Step: the value
-// plus the index just past it, or a message plus the offending position.
-pub enum Step {
-    Done(Json, Int),
+pub enum Step[T] {
+    Done(T, Int),
     Fail(Text, Int),
 }
 
-// The same shape again for string scanning (object keys and JStr bodies),
-// because Step's payload is hard-wired to Json. See NOTES.md.
-enum TextStep {
-    TDone(Text, Int),
-    TFail(Text, Int),
-}
-
 // Parse a complete document: one JSON value, then only trailing whitespace.
-pub fn parse(s: Text) -> Step {
-    let step: Step = parse_value(s, skip_ws(s, 0));
-    match step {
+pub fn parse(s: Text) -> Step[Json] {
+    match parse_value(s, skip_ws(s, 0)) {
         Done(v, i) => {
             let end: Int = skip_ws(s, i);
             if end < len(s) {
@@ -50,8 +48,8 @@ pub fn parse(s: Text) -> Step {
             }
             return Done(v, end);
         }
-        _ => {
-            return step;
+        Fail(m, p) => {
+            return Fail(m, p);
         }
     }
 }
@@ -77,8 +75,14 @@ pub fn skip_ws(s: Text, i: Int) -> Int
 }
 
 // Parse one JSON value starting exactly at i (callers skip whitespace).
-fn parse_value(s: Text, i: Int) -> Step {
-    if i < 0 or i >= len(s) {
+fn parse_value(s: Text, i: Int) -> Step[Json]
+    requires i >= 0
+    ensures match result {
+        Done(v, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
+{
+    if i >= len(s) {
         return Fail("unexpected end of input", i);
     }
     let c: Text = char_at(s, i);
@@ -106,8 +110,12 @@ fn parse_value(s: Text, i: Int) -> Step {
     return Fail("expected a JSON value", i);
 }
 
-fn parse_literal(s: Text, i: Int, lit: Text, value: Json) -> Step
+fn parse_literal(s: Text, i: Int, lit: Text, value: Json) -> Step[Json]
     requires i >= 0
+    ensures match result {
+        Done(v, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
 {
     if has_at(s, i, lit) {
         return Done(value, i + len(lit));
@@ -115,36 +123,45 @@ fn parse_literal(s: Text, i: Int, lit: Text, value: Json) -> Step
     return Fail("expected '" + lit + "'", i);
 }
 
-fn parse_text(s: Text, i: Int) -> Step
+fn parse_text(s: Text, i: Int) -> Step[Json]
     requires i >= 0 and i < len(s)
+    ensures match result {
+        Done(v, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
 {
     match scan_string(s, i) {
-        TDone(t, j) => {
+        Done(t, j) => {
             return Done(JStr(t), j);
         }
-        TFail(msg, pos) => {
+        Fail(msg, pos) => {
             return Fail(msg, pos);
         }
     }
 }
 
 // Scan a double-quoted string starting at the opening quote. Supported
-// escapes: \" \\ \n \t \/ — anything else (including \u) is a TFail.
-fn scan_string(s: Text, i: Int) -> TextStep
+// escapes: \" \\ \n \t \/ — anything else (including \u) is a Fail.
+fn scan_string(s: Text, i: Int) -> Step[Text]
     requires i >= 0 and i < len(s)
+    ensures match result {
+        Done(t, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
 {
     var out: Text = "";
     var j: Int = i + 1;
     while j < len(s)
         invariant j >= 0
+        invariant j <= len(s)
     {
         let c: Text = char_at(s, j);
         if c == "\"" {
-            return TDone(out, j + 1);
+            return Done(out, j + 1);
         }
         if c == "\\" {
             if j + 1 >= len(s) {
-                return TFail("unterminated escape", j);
+                return Fail("unterminated escape", j);
             }
             let e: Text = char_at(s, j + 1);
             if e == "\"" {
@@ -158,9 +175,9 @@ fn scan_string(s: Text, i: Int) -> TextStep
             } else if e == "/" {
                 out = out + "/";
             } else if e == "u" {
-                return TFail("\\u escapes are not supported", j);
+                return Fail("\\u escapes are not supported", j);
             } else {
-                return TFail("unsupported escape '\\" + e + "'", j);
+                return Fail("unsupported escape '\\" + e + "'", j);
             }
             j = j + 2;
         } else {
@@ -168,13 +185,17 @@ fn scan_string(s: Text, i: Int) -> TextStep
             j = j + 1;
         }
     }
-    return TFail("unterminated string", i);
+    return Fail("unterminated string", i);
 }
 
 // Integers only: optional '-', then digits. A fraction or exponent is a
 // Fail — Sigil has no Float, and this parser says so instead of guessing.
-fn parse_number(s: Text, i: Int) -> Step
+fn parse_number(s: Text, i: Int) -> Step[Json]
     requires i >= 0 and i < len(s)
+    ensures match result {
+        Done(v, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
 {
     var j: Int = i;
     var neg: Bool = false;
@@ -186,6 +207,7 @@ fn parse_number(s: Text, i: Int) -> Step
     var value: Int = 0;
     while j < len(s)
         invariant j >= 0
+        invariant j <= len(s)
         invariant value >= 0
     {
         let code: Int = ord(char_at(s, j));
@@ -208,8 +230,12 @@ fn parse_number(s: Text, i: Int) -> Step
     return Done(JNum(n), j);
 }
 
-fn parse_array(s: Text, i: Int) -> Step
+fn parse_array(s: Text, i: Int) -> Step[Json]
     requires i >= 0 and i < len(s)
+    ensures match result {
+        Done(v, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
 {
     var j: Int = skip_ws(s, i + 1);
     if j < len(s) and char_at(s, j) == "]" {
@@ -220,14 +246,13 @@ fn parse_array(s: Text, i: Int) -> Step
         invariant j >= 0
         invariant j <= len(s)
     {
-        let step: Step = parse_value(s, j);
-        match step {
+        match parse_value(s, j) {
             Done(v, after) => {
                 items = push(items, v);
                 j = skip_ws(s, after);
             }
-            _ => {
-                return step;
+            Fail(m, p) => {
+                return Fail(m, p);
             }
         }
         if j >= len(s) {
@@ -248,8 +273,12 @@ fn parse_array(s: Text, i: Int) -> Step
     return Fail("unreachable: the array loop always returns", j);
 }
 
-fn parse_object(s: Text, i: Int) -> Step
+fn parse_object(s: Text, i: Int) -> Step[Json]
     requires i >= 0 and i < len(s)
+    ensures match result {
+        Done(v, j) => j >= 0 and j <= len(s),
+        Fail(m, p) => true,
+    }
 {
     var j: Int = skip_ws(s, i + 1);
     if j < len(s) and char_at(s, j) == "}" {
@@ -264,23 +293,22 @@ fn parse_object(s: Text, i: Int) -> Step
             return Fail("expected '\"' to start an object key", j);
         }
         match scan_string(s, j) {
-            TDone(key, after_key) => {
+            Done(key, after_key) => {
                 let colon: Int = skip_ws(s, after_key);
                 if colon >= len(s) or char_at(s, colon) != ":" {
                     return Fail("expected ':' after object key", colon);
                 }
-                let step: Step = parse_value(s, skip_ws(s, colon + 1));
-                match step {
+                match parse_value(s, skip_ws(s, colon + 1)) {
                     Done(v, after) => {
                         members = push(members, Member { key: key, value: v });
                         j = skip_ws(s, after);
                     }
-                    _ => {
-                        return step;
+                    Fail(m, p) => {
+                        return Fail(m, p);
                     }
                 }
             }
-            TFail(msg, pos) => {
+            Fail(msg, pos) => {
                 return Fail(msg, pos);
             }
         }

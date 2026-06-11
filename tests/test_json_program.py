@@ -140,11 +140,12 @@ class TestJsonLibrary(unittest.TestCase):
         finally:
             sys.setrecursionlimit(old)
 
-    def test_verification_obligations_pinned(self):
-        # 37 of 38 contract clauses prove; the single runtime check left is
-        # skip_ws's requires, because indices recovered from Step payloads
-        # carry no facts (the verifier cannot see inside enum payloads).
-        # If the language ever fixes that, this test should start failing.
+    def test_verification_fully_proven(self):
+        # Every contract clause in the parser proves. Round 2 left one runtime
+        # check (skip_ws's requires) because indices recovered from a Step
+        # payload carried no facts; payload-aware verification plus the generic
+        # Step[T]'s payload-carrying ensures now discharge the whole chain, so
+        # the parser is a compile-time theorem with zero runtime checks.
         from sigil.verify import HAVE_Z3, verify
         if not HAVE_Z3:
             self.skipTest("z3-solver not installed")
@@ -153,7 +154,7 @@ class TestJsonLibrary(unittest.TestCase):
         report = verify(program)
         unproven = sorted((f.fn, f.kind) for f in report.findings
                           if not f.proven)
-        self.assertEqual(unproven, [("skip_ws", "requires")])
+        self.assertEqual(unproven, [])
 
 
 class TestJsonDemo(unittest.TestCase):

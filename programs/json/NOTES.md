@@ -8,6 +8,27 @@ native, and **37 of 38 contract clauses prove** (`python -m sigil verify
 programs/json/json.sg`). The one runtime check left is structural, not
 accidental — see item 1. Friction below, ranked by pain.
 
+## Postscript (resolved for 1.0)
+
+Friction #1 and #2 are now closed, and the parser is **49/49 clauses proven**
+— a fully verified JSON parser with zero runtime contract checks:
+
+- **#1 (verifier blind to enum payloads) — fixed by payload-aware
+  verification.** An enum value is now modeled as a tag plus payload slots,
+  so a `match` learns the exact index a `Done` carries. Each parse function
+  gained `ensures match result { Done(v, j) => j >= 0 and j <= len(s),
+  Fail(m, p) => true }`; the verifier proves these at the return sites and
+  assumes them at call sites, so the index threaded back into `skip_ws`
+  arrives bounded and its `requires` — the lone holdout — now proves.
+- **#2 (no tuples; two copy-paste step enums) — fixed by generic types.**
+  `Step` and `TextStep` collapsed into one `enum Step[T]`; `parse_value`
+  returns `Step[Json]`, `scan_string` returns `Step[Text]`, and the
+  cross-enum rebuild (`TFail(m, p) => Fail(m, p)`) is gone.
+
+The remaining items (no `?`-propagation, the `textutil` copy / stdlib
+question, no Float) stand as 1.x candidates. The list below is preserved as
+the historical round-2 record.
+
 ## Open friction, ranked by pain
 
 1. **The verifier cannot see inside enum payloads.** The contract this

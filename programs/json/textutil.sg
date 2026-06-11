@@ -29,9 +29,11 @@ pub fn starts_with(s: Text, prefix: Text) -> Bool {
     return slice(s, 0, len(prefix)) == prefix;
 }
 
-// True when lit occurs in s starting exactly at position i.
+// True when lit occurs in s starting exactly at position i. The ensures lets
+// callers conclude that a match means lit actually fit: i + len(lit) <= len(s).
 pub fn has_at(s: Text, i: Int, lit: Text) -> Bool
     requires i >= 0
+    ensures not result or i + len(lit) <= len(s)
 {
     if i + len(lit) > len(s) {
         return false;
