@@ -1,0 +1,54 @@
+// Feasibility proof for the dependency-free backend (docs/SELFHOST.md): a
+// Sigil program that emits the bytes of a complete static x86-64 Linux ELF
+// executable which calls exit(42) via a raw syscall — no libc, no linker, no
+// assembler. If Sigil can produce a runnable dependency-free binary at all,
+// the road to a self-hosting native compiler is open; the rest is large but
+// known engineering (instruction selection, register allocation, an mmap
+// allocator, a syscall runtime).
+//
+// Layout: ELF64 header (64 bytes) + one PT_LOAD program header (56 bytes) +
+// 12 bytes of code, loaded at 0x400000, entry 0x400078. The code is:
+// mov edi, 42      ; exit status
+// mov eax, 60      ; syscall number for exit
+// syscall
+//
+// Reads the output path on stdin (Sigil has no argv yet), writes the 132
+// bytes with write_bytes (which marks the file executable), and reports.
+fn elf_bytes() -> List[Int] {
+    // e_ident
+    // e_type = ET_EXEC
+    // e_machine = x86-64
+    // e_version
+    // e_entry = 0x400078
+    // e_phoff = 64
+    // e_shoff = 0
+    // e_flags
+    // e_ehsize = 64
+    // e_phentsize = 56
+    // e_phnum = 1
+    // e_shentsize
+    // e_shnum
+    // e_shstrndx
+    // p_type = PT_LOAD
+    // p_flags = R+X
+    // p_offset = 0
+    // p_vaddr = 0x400000
+    // p_paddr = 0x400000
+    // p_filesz = 132
+    // p_memsz = 132
+    // p_align = 0x1000
+    // mov edi, 42
+    // mov eax, 60
+    // syscall
+    return [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 62, 0, 1, 0, 0, 0, 120, 0, 64, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 56, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 132, 0, 0, 0, 0, 0, 0, 0, 132, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 191, 42, 0, 0, 0, 184, 60, 0, 0, 0, 15, 5];
+}
+
+// --- ELF64 header (64 bytes) ---
+// --- program header: PT_LOAD (56 bytes) ---
+// --- code (12 bytes) ---
+fn main(console: Console, fs: Fs) -> Unit ! {fs.write, io.read, io.write} {
+    let path: Text = read_line(console);
+    let code: List[Int] = elf_bytes();
+    write_bytes(fs, path, code);
+    print(console, "wrote " + str(len(code)) + " bytes to " + path);
+}

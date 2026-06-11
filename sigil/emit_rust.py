@@ -198,6 +198,36 @@ fn rt_file_exists(fs: Fs, path: String) -> bool {
     std::path::Path::new(&rt_fs_effective(&fs, &path)).exists()
 }
 
+fn rt_write_bytes(fs: Fs, path: String, data: Vec<i64>) {
+    if !fs.can_write {
+        rt_cap_fault::<()>(&format!(
+            "write_bytes('{}') denied: this Fs capability is read-only", path));
+    }
+    let effective = rt_fs_effective(&fs, &path);
+    let mut raw: Vec<u8> = Vec::with_capacity(data.len());
+    for b in &data {
+        if *b < 0 || *b > 255 {
+            rt_fault::<()>(&format!(
+                "write_bytes: byte value {} is out of range 0..255", b));
+        }
+        raw.push(*b as u8);
+    }
+    if let Some(parent) = std::path::Path::new(&effective).parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    if let Err(err) = std::fs::write(&effective, &raw) {
+        rt_fault::<()>(&format!("write_bytes failed: {}", err));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&effective,
+                                         std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 fn rt_slice(s: String, start: i64, end: i64) -> String {
     let n = s.chars().count() as i64;
     if start < 0 || end < start || end > n {
@@ -811,7 +841,8 @@ class RustEmitter:
             return (f"rt_set({self.expr(args[0])}, {self.expr(args[1])}, "
                     f"{self.expr(args[2])})")
         if name in ("print", "read_line", "read_file", "write_file",
-                    "file_exists", "read_only", "subdir", "slice", "ord", "chr"):
+                    "write_bytes", "file_exists", "read_only", "subdir",
+                    "slice", "ord", "chr"):
             rendered = ", ".join(self.expr(a) for a in args)
             return f"rt_{name}({rendered})"
 

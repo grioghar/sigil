@@ -379,6 +379,31 @@ class Interpreter:
         except OSError as exc:
             raise RuntimeFault(f"write_file failed: {exc}", line, col)
 
+    def builtin_write_bytes(self, args: list[Any], line: int, col: int) -> None:
+        cap, path, data = args
+        self._require_cap(cap, FsCap, "write_bytes", line, col)
+        if not cap.can_write:
+            raise CapabilityFault(
+                f"write_bytes('{path}') denied: this Fs capability is read-only",
+                line, col)
+        effective = self._fs_effective(cap, path, line, col)
+        raw = bytearray()
+        for b in data:
+            if b < 0 or b > 255:
+                raise RuntimeFault(
+                    f"write_bytes: byte value {b} is out of range 0..255",
+                    line, col)
+            raw.append(b)
+        try:
+            parent = os.path.dirname(effective)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(effective, "wb") as handle:
+                handle.write(bytes(raw))
+            os.chmod(effective, 0o755)  # emit target is a runnable artifact
+        except OSError as exc:
+            raise RuntimeFault(f"write_bytes failed: {exc}", line, col)
+
     def builtin_file_exists(self, args: list[Any], line: int, col: int) -> bool:
         cap, path = args
         self._require_cap(cap, FsCap, "file_exists", line, col)

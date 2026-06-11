@@ -43,19 +43,41 @@ dogfood-driven feature:
   worklist. Today only `List` exists (assoc-list as a stopgap).
 - Likely more as we go (richer text ops, perhaps a growable buffer).
 
-## The one open decision — the backend dependency line
+## The backend: fully dependency-free (decided)
 
-The classic self-hosting bar is "the compiler is written in its own language
-and compiles itself," with the *backend* (assembler, linker, or a codegen
-library like LLVM) conventionally allowed to be external — gcc emits assembly
-and shells out to an assembler; early Rust used LLVM. By that bar, a
-Sigil-written compiler that emits Rust and invokes `rustc` is self-hosting:
-no Python in the toolchain, and the compiler compiles itself.
+The bar is the strict one: **no external tools anywhere on the compile path.**
+No `rustc`, no LLVM, no assembler, no linker, no libc. The Sigil compiler emits
+**native machine code directly** and writes a complete executable file itself.
 
-The stricter bar is a fully dependency-free toolchain: Sigil emitting machine
-code (or assembly) directly, no `rustc`. That is a much larger effort (its own
-register allocation, object-file emission, linking).
+What that entails, concretely:
 
-**This is the one fork that needs a human call**, and only at the emit stage —
-the lexer, parser, and checker are identical work under either answer, so the
-bootstrap starts now and the decision is made when codegen comes into view.
+- **Target: Linux x86-64, static ELF, raw syscalls.** This is the only target
+  that can be *truly* dependency-free: the Linux syscall ABI is stable, so a
+  static ELF can `read`/`write`/`open`/`mmap`/`exit` with zero linked
+  libraries. (macOS and Windows both *mandate* linking a system library —
+  Apple does not support raw syscalls, Windows syscall numbers are unstable —
+  so neither can be dependency-free. Sigil's dependency-free output therefore
+  targets Linux; on the Windows dev box it is built and run under WSL or in
+  CI's `ubuntu-latest`.)
+- **Codegen** the compiler must contain: instruction selection to x86-64
+  machine code, register allocation, layout of an ELF (header + program
+  headers + code + data), and direct emission of the executable's bytes.
+- **A runtime, also dependency-free.** Sigil values (List/Text/records/enums)
+  are heap-allocated; with no libc the runtime allocates via `mmap` and does
+  I/O via the `read`/`write` syscalls. Capabilities lower to nothing (as
+  today); `print`/`read_file`/etc. become syscall sequences.
+
+This is a large, deep effort — its own code generator, register allocator,
+object-file writer, and syscall runtime. It is the genuine cost of "compiles
+with its own toolchain, dependency-free," and it is the work between here and
+1.0.
+
+### First: prove it's physically possible
+
+Before building the full codegen, the riskiest unknown is settled with a
+minimal vertical slice: a Sigil program that emits the bytes of a hand-built
+static x86-64 ELF doing `exit(42)` via a raw syscall, writes them with the new
+`write_bytes` primitive, and — run on Linux — exits 42. If Sigil can produce a
+working dependency-free executable at all, the rest is (large but) known
+engineering. That demo lives in [`selfhost/`](../selfhost) and is exercised in
+CI on `ubuntu-latest`.

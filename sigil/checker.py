@@ -46,6 +46,14 @@ BUILTINS: dict[str, FnSig] = {
                         A.UNIT, frozenset({"fs.write"})),
     "file_exists": FnSig("file_exists", [("fs", A.FS), ("path", A.TEXT)],
                          A.BOOL, frozenset({"fs.read"})),
+    # Raw byte output — the code-emission primitive. Text is Unicode/UTF-8 and
+    # cannot hold arbitrary bytes, so a compiler that writes an executable
+    # needs this. Bytes are 0..255; the file is written executable (mode 0755),
+    # since the intended output is a runnable artifact.
+    "write_bytes": FnSig("write_bytes",
+                         [("fs", A.FS), ("path", A.TEXT),
+                          ("data", A.Type("List", A.INT))],
+                         A.UNIT, frozenset({"fs.write"})),
     # Attenuation: minting a weaker capability is pure — no I/O happens.
     "read_only": FnSig("read_only", [("fs", A.FS)], A.FS, PURE),
     "subdir": FnSig("subdir", [("fs", A.FS), ("prefix", A.TEXT)], A.FS, PURE),
