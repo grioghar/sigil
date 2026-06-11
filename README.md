@@ -44,6 +44,69 @@ indexing and about what a variant carries prove statically — the bundled
 [JSON parser](programs/json) verifies all 49 of its clauses, compiling with
 zero runtime contract checks.
 
+## Coming from another language
+
+Sigil deliberately removes conveniences you lean on elsewhere and asks for
+things other languages let you omit. The point is that *what a function can do
+and what it promises are facts you can read off its signature* — so the cost
+is paid at the boundaries. The fastest way to stop fighting it:
+
+**Everyone, on day one:**
+
+- **There is no global `print`, no global filesystem.** I/O needs a
+  *capability* value, and capabilities enter only through `main`'s parameters
+  and flow down as arguments. A function that needs to write takes a
+  `Console`; one that doesn't take a capability provably cannot use it. This
+  is the single biggest adjustment.
+- **Functions are pure unless they say so.** Side effects are declared after
+  `!` (`! {io.write}`); with no annotation the compiler forbids I/O in that
+  body.
+- **Types are mandatory at every boundary** — parameters, returns,
+  `let`/`var`. There is no inference across a signature: the signature *is* the
+  audit surface.
+- **Immutable by default.** `let` can't be reassigned; reach for `var` only
+  when you must, and it stays local.
+- **No `null`, no exceptions.** Model absence and failure as ordinary values
+  with an `enum` (a `Maybe[T]` / `Result`-style type) and `match`. The only
+  thing that "throws" is a contract violation, which halts with blame.
+- **`match` is exhaustive, with no fallthrough.** A missing variant won't
+  compile; a wildcard that can never fire won't compile either.
+- **The error-handling notes you'd write in comments become `requires` /
+  `ensures`** — and the verifier tries to prove them.
+
+**From Python / JavaScript / Ruby:** the dynamic freedom is gone — everything
+is typed, immutable by default, and `print` is not ambient. But there's no
+class/`self` ceremony either: it's free functions over records and enums.
+Think "typed, capability-passing scripting."
+
+**From Java / C# / Go:** no classes, interfaces, inheritance, or methods —
+records hold data, free functions are behavior. No `null`; errors are return
+values (enums), not exceptions. Treat a `Console`/`Fs` like a dependency you
+must inject — Sigil enforces the injection and tracks it as an effect.
+
+**From C / C++:** memory safety is automatic and total — no pointers, no
+manual allocation, no undefined behavior; values are immutable and copied.
+Bounds checks exist, but the verifier deletes the ones it can prove
+unnecessary. The discipline you spent on memory you now spend on contracts.
+
+**From Rust:** much will feel familiar — sum types, exhaustive `match`,
+"make illegal states unrepresentable," safety-as-proof. The trade: no borrow
+checker, lifetimes, or ownership to manage (immutability buys the safety).
+New on top: **capabilities** (authority is a value you pass, so a dependency
+can't reach a filesystem you never handed it) and **effects + contracts in the
+signature**, machine-verified.
+
+**From Haskell / ML / F#:** you'll recognize ADTs, exhaustive matching,
+purity-by-default, and the effect discipline (a capability feels like passing
+an explicit `IO` handle as a value). Differences: records/enums are nominal,
+not structural; no type classes; no laziness; and recursive data currently
+routes through `List` (see the quirk below).
+
+**One quirk regardless of background:** a recursive type cannot hold itself
+directly yet (there is no `Box`/indirection type), so route recursion through
+`List` — `enum Tree { Node(Int, List[Tree]) }`. And there is exactly one
+canonical layout (`sigil fmt`), so don't litigate style.
+
 ## Quickstart
 
 Requires Python 3.12+. `sigil build` needs Rust (`rustup.rs`); the static
