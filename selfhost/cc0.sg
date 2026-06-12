@@ -1,16 +1,18 @@
-// cc0 — the Sigil compiler, stage 4: a native compiler written in Sigil that
-// compiles a whole PROGRAM (multiple functions, parameters, calls, recursion,
-// and printing) to a static x86-64 Linux ELF — no rustc, no linker, no libc
+// cc0 — the Sigil compiler, stage 5: a native compiler written in Sigil that
+// compiles a whole PROGRAM (functions, recursion, printing, and List[Int] on a
+// real heap) to a static x86-64 Linux ELF — no rustc, no linker, no libc
 // (docs/SELFHOST.md). The whole pipeline runs in Sigil: lex -> parse ->
 // codegen -> ELF -> a binary that runs.
 //
-// Subset: functions over Int/Bool/Unit; let/var locals, assignment, if/else,
-// while (+invariants ignored by codegen), return, expression statements,
-// calls (incl. recursion), and `print("literal")`; expressions over int/bool
-// literals, locals, params, + - * / %, comparisons, and/or/not. The program's
-// `main` is the entry; its returned value becomes the process exit status
-// (masked to 8 bits). `print` lowers to a write(1, ...) syscall against string
-// literals laid out in a data blob after the code (ASCII).
+// Subset: functions over Int/Bool/Unit and List; let/var locals, assignment,
+// if/else, while (+invariants ignored by codegen), return, expression
+// statements, calls (incl. recursion), `print("literal")`, and lists (literals
+// [..], indexing xs[i], len(xs)); expressions over int/bool literals, locals,
+// params, + - * / %, comparisons, and/or/not. The program's `main` is the
+// entry; its returned value becomes the process exit status (masked to 8 bits).
+// `print` lowers to a write(1, ...) syscall against rodata strings. A List is
+// a heap block [length][elem...]; the value is a pointer, bump-allocated from
+// the RW heap segment at 0x600000.
 //
 // Codegen is a stack machine. Each function has a frame: parameters sit above
 // the saved rbp at [rbp + 16 + 8*(nparams-1-i)] (the caller pushed them), and
@@ -238,19 +240,64 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
         ECall(name, args) => {
             return gen_call(name, args, ctx);
         }
-        EText(t) => {
-            return [];
-        }
         EIndex(kids) => {
+            // kids[0] = list, kids[1] = index. Element at [ptr + 8 + 8*index].
+            // pop rcx(index) ; pop rax(ptr) ; mov rax,[rax+rcx*8+8] ; push rax
+            return cat(gen(kids[0], ctx), cat(gen(kids[1], ctx), [89, 88, 72, 139, 68, 200, 8, 80]));
+        }
+        EList(items) => {
+            return gen_list(items, ctx);
+        }
+        EText(t) => {
             return [];
         }
         EField(name, kids) => {
             return [];
         }
-        EList(items) => {
-            return [];
-        }
     }
+}
+
+// A List is a heap block: [length (8 bytes)][elem 0][elem 1]... and the value
+// is a pointer to it. alloc_const bumps the global heap pointer at 0x600000 by
+// a compile-time-constant size and leaves the old pointer (the block) in rax.
+fn alloc_const(n: Int) -> List[Int] {
+    // mov rdi, 0x600000
+    var c: List[Int] = cat([72, 191], le(6291456, 8));
+    // mov rax, [rdi]
+    c = cat(c, [72, 139, 7]);
+    // lea rcx, [rax + n]
+    c = cat(c, cat([72, 141, 136], le_s32(n)));
+    // mov [rdi], rcx
+    return cat(c, [72, 137, 15]);
+}
+
+fn gen_list(items: List[Expr], ctx: Ctx) -> List[Int] {
+    let k: Int = len(items);
+    var code: List[Int] = alloc_const(8 + 8 * k);
+    // mov qword [rax], k
+    code = cat(code, cat([72, 199, 0], le_s32(k)));
+    // push rax (the result)
+    code = cat(code, [80]);
+    var i: Int = 0;
+    while i < k
+        invariant i >= 0
+    {
+        // push element value
+        code = cat(code, gen(items[i], ctx));
+        // pop rcx
+        code = cat(code, [89]);
+        // mov rax, [rsp] (reload ptr)
+        code = cat(code, [72, 139, 4, 36]);
+        // mov [rax+disp], rcx
+        code = cat(code, cat([72, 137, 136], le_s32(8 + 8 * i)));
+        i = i + 1;
+    }
+    return code;
+}
+
+fn gen_len(arg: Expr, ctx: Ctx) -> List[Int] {
+    // pop rax(ptr) ; mov rax,[rax] (length) ; push rax
+    return cat(gen(arg, ctx), [88, 72, 139, 0, 80]);
 }
 
 // print("literal") lowers to a write(1, addr, len) syscall against the
@@ -299,6 +346,9 @@ fn gen_print(args: List[Expr], ctx: Ctx) -> List[Int] {
 fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     if name == "print" {
         return gen_print(args, ctx);
+    }
+    if name == "len" {
+        return gen_len(args[0], ctx);
     }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
     // add rsp, 8*nargs (drop args); push rax (result).
@@ -654,7 +704,9 @@ fn compile_program(fns: List[Fn]) -> List[Int] {
 fn ty_simple(t: Ty) -> Bool {
     match t {
         TApp(name, args) => {
-            return len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit");
+            // scalars (one machine word) or a List (a heap pointer, one word).
+            let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit");
+            return scalar or name == "List" and len(args) == 1;
         }
     }
 }
@@ -684,16 +736,16 @@ fn supported(e: Expr) -> Bool {
             }
             return all_supported(args);
         }
+        EIndex(kids) => {
+            return supported(kids[0]) and supported(kids[1]);
+        }
+        EList(items) => {
+            return all_supported(items);
+        }
         EText(t) => {
             return false;
         }
-        EIndex(kids) => {
-            return false;
-        }
         EField(name, kids) => {
-            return false;
-        }
-        EList(items) => {
             return false;
         }
     }

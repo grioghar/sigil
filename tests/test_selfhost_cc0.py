@@ -106,6 +106,37 @@ class TestCc0(unittest.TestCase):
             blob = self.compile(Path(t), 'fn main() -> Int { print("Hi"); return 0; }')
         self.assertIn(b"Hi", blob)
 
+    def test_list_program_compiles(self):
+        with tempfile.TemporaryDirectory() as t:
+            blob = self.compile(
+                Path(t),
+                "fn main() -> Int { let xs: List[Int] = [10, 20, 30]; "
+                "return xs[1] + len(xs); }")
+        self.assertEqual(blob[:4], b"\x7fELF")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_list_programs(self):
+        cases = [
+            ("fn main() -> Int { let xs: List[Int] = [10, 20, 30]; "
+             "return xs[1] + len(xs); }", 23),
+            ("fn sum3(xs: List[Int]) -> Int { return xs[0] + xs[1] + xs[2]; }\n"
+             "fn main() -> Int { return sum3([10, 15, 17]); }", 42),
+            ("fn main() -> Int { let xs: List[Int] = [7, 14, 21]; var s: Int = 0; "
+             "var i: Int = 0; while i < len(xs) invariant i >= 0 "
+             "{ s = s + xs[i]; i = i + 1; } return s; }", 42),
+            ("fn main() -> Int { let xs: List[Int] = [1, 2, 3]; "
+             "let ys: List[Int] = [40, 50]; return xs[2] + ys[0] - len(ys); }", 41),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
     def test_emitted_programs_print(self):
