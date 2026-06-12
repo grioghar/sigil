@@ -249,7 +249,10 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             return gen_list(items, ctx);
         }
         EText(t) => {
-            return [];
+            // a Text value is a pointer to its [len][bytes] block in rodata.
+            let addr: Int = lookup(ctx.snames, ctx.saddrs, t);
+            // mov rax, addr ; push
+            return cat([72, 184], cat(le(addr, 8), [80]));
         }
         EField(name, kids) => {
             return [];
@@ -318,47 +321,17 @@ fn gen_push(args: List[Expr], ctx: Ctx) -> List[Int] {
     return cat(code, cat(setup, cat(head, cat(loop, tail))));
 }
 
-// print("literal") lowers to a write(1, addr, len) syscall against the
-// string's bytes in the data section. The result (bytes written) is pushed
-// like any call result and discarded by the expression statement.
+// print(text) writes a Text value (any expression, not just a literal): the
+// value is a pointer to a [len][bytes] block, so write(1, ptr+8, [ptr]).
 fn gen_print(args: List[Expr], ctx: Ctx) -> List[Int] {
-    match args[0] {
-        EText(t) => {
-            let addr: Int = lookup(ctx.snames, ctx.saddrs, t);
-            // mov edi,1 ; mov rsi,imm64(addr) ; mov edx,len ; mov eax,1 ;
-            // syscall ; push rax
-            let head: List[Int] = cat([191, 1, 0, 0, 0], cat([72, 190], le(addr, 8)));
-            let tail: List[Int] = cat([186], cat(le(len(t), 4), [184, 1, 0, 0, 0, 15, 5, 80]));
-            return cat(head, tail);
-        }
-        EInt(n) => {
-            return [];
-        }
-        EBool(b) => {
-            return [];
-        }
-        EVar(x) => {
-            return [];
-        }
-        EUn(op, kids) => {
-            return [];
-        }
-        EBin(op, kids) => {
-            return [];
-        }
-        ECall(nm, a) => {
-            return [];
-        }
-        EIndex(kids) => {
-            return [];
-        }
-        EField(nm, kids) => {
-            return [];
-        }
-        EList(items) => {
-            return [];
-        }
-    }
+    // pop rax ; lea rsi,[rax+8] ; mov rdx,[rax] ; mov edi,1 ; mov eax,1 ;
+    // syscall ; push rax
+    return cat(gen(args[0], ctx), [88, 72, 141, 112, 8, 72, 139, 16, 191, 1, 0, 0, 0, 184, 1, 0, 0, 0, 15, 5, 80]);
+}
+
+fn gen_ord(arg: Expr, ctx: Ctx) -> List[Int] {
+    // first byte of the Text: pop rax ; movzx eax, byte [rax+8] ; push rax
+    return cat(gen(arg, ctx), [88, 15, 182, 64, 8, 80]);
 }
 
 fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
@@ -370,6 +343,9 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     }
     if name == "push" {
         return gen_push(args, ctx);
+    }
+    if name == "ord" {
+        return gen_ord(args[0], ctx);
     }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
     // add rsp, 8*nargs (drop args); push rax (result).
@@ -677,6 +653,9 @@ fn string_bytes(t: Text) -> List[Int] {
     return out;
 }
 
+// Each string becomes a Text block [length (8 bytes)][bytes...], so a Text
+// value is just a pointer (the same shape as a List). The address points at
+// the length word; the bytes follow at +8.
 fn str_addrs(strs: List[Text], base: Int) -> List[Int] {
     var addrs: List[Int] = [];
     var off: Int = 0;
@@ -685,7 +664,7 @@ fn str_addrs(strs: List[Text], base: Int) -> List[Int] {
         invariant i >= 0
     {
         addrs = push(addrs, base + off);
-        off = off + len(strs[i]);
+        off = off + 8 + len(strs[i]);
         i = i + 1;
     }
     return addrs;
@@ -697,7 +676,7 @@ fn str_data(strs: List[Text]) -> List[Int] {
     while i < len(strs)
         invariant i >= 0
     {
-        out = cat(out, string_bytes(strs[i]));
+        out = cat(out, cat(le(len(strs[i]), 8), string_bytes(strs[i])));
         i = i + 1;
     }
     return out;
@@ -726,7 +705,7 @@ fn ty_simple(t: Ty) -> Bool {
     match t {
         TApp(name, args) => {
             // scalars (one machine word) or a List (a heap pointer, one word).
-            let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit");
+            let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit" or name == "Text");
             return scalar or name == "List" and len(args) == 1;
         }
     }
@@ -752,9 +731,6 @@ fn supported(e: Expr) -> Bool {
             return (arith or logic or is_cmp(op)) and supported(kids[0]) and supported(kids[1]);
         }
         ECall(name, args) => {
-            if name == "print" {
-                return len(args) == 1 and is_text(args[0]);
-            }
             return all_supported(args);
         }
         EIndex(kids) => {
@@ -764,7 +740,7 @@ fn supported(e: Expr) -> Bool {
             return all_supported(items);
         }
         EText(t) => {
-            return false;
+            return true;
         }
         EField(name, kids) => {
             return false;

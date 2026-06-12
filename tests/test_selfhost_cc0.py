@@ -86,7 +86,7 @@ class TestCc0(unittest.TestCase):
 
     def test_unsupported_expression_rejected(self):
         with tempfile.TemporaryDirectory() as t:
-            (Path(t) / "e.sg").write_text('fn main() -> Text { return "hi"; }',
+            (Path(t) / "e.sg").write_text('fn main() -> Int { return a.b; }',
                                           encoding="utf-8")
             out = io.StringIO()
             old = os.getcwd()
@@ -136,6 +136,29 @@ class TestCc0(unittest.TestCase):
                     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
                     result = subprocess.run([str(exe)])
                 self.assertEqual(result.returncode, expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_text_programs(self):
+        # Text is a heap [len][bytes] value: print any Text, len, ord.
+        cases = [
+            ('fn main() -> Int { let s: Text = "hello\\n"; print(s); return 0; }',
+             b"hello\n", 0),
+            ('fn shout(s: Text) -> Int { print(s); return 0; }\n'
+             'fn main() -> Int { let x: Int = shout("hi\\n"); return 9; }',
+             b"hi\n", 9),
+            ('fn main() -> Int { let s: Text = "hello"; return len(s); }', b"", 5),
+            ('fn main() -> Int { let s: Text = "A"; return ord(s); }', b"", 65),
+        ]
+        for prog, out_expected, code_expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)], capture_output=True)
+                self.assertEqual(result.stdout, out_expected)
+                self.assertEqual(result.returncode, code_expected)
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
