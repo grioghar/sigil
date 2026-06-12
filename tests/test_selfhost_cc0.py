@@ -162,6 +162,35 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_text_equality(self):
+        # type-directed ==: byte-wise for Text. The classify case is exactly
+        # cc0's own `op == "+"` pattern.
+        cases = [
+            ('fn main() -> Int { let s: Text = "abc"; '
+             'if s == "abc" { return 1; } return 0; }', 1),
+            ('fn main() -> Int { let s: Text = "abc"; '
+             'if s == "abd" { return 1; } return 0; }', 0),
+            ('fn main() -> Int { let s: Text = "ab"; '
+             'if s == "abc" { return 1; } return 0; }', 0),
+            ('fn classify(op: Text) -> Int { if op == "+" { return 1; } '
+             'if op == "-" { return 2; } return 0; }\n'
+             'fn main() -> Int { return classify("-"); }', 2),
+            ('fn main() -> Int { let s: Text = "hi"; '
+             'if s != "bye" { return 5; } return 0; }', 5),
+            ('fn main() -> Int { let s: Text = "hi"; '
+             'if s != "hi" { return 5; } return 0; }', 0),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_push_programs(self):
         cases = [
             ("fn main() -> Int { let xs: List[Int] = push([1, 2, 3], 4); "

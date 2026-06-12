@@ -33,6 +33,103 @@ record Ctx {
     foffs: List[Int],
     snames: List[Text],
     saddrs: List[Int],
+    vtags: List[Text],
+    frets: List[Text],
+}
+
+// type environment: each variable's type tag (parallel to vnames) and each
+// function's return-type tag (parallel to fnames). Tags are "Int", "Bool",
+// "Text", "Unit", or "List:<elem>" — enough to lower overloaded + and ==.
+fn ty_tag(t: Ty) -> Text {
+    match t {
+        TApp(name, args) => {
+            if name == "List" and len(args) == 1 {
+                return "List:" + ty_tag(args[0]);
+            }
+            return name;
+        }
+    }
+}
+
+// The type tag of an expression, given the context's type environment. Used to
+// pick integer vs. Text lowering for the overloaded + and == operators.
+fn type_of(e: Expr, ctx: Ctx) -> Text {
+    match e {
+        EInt(n) => {
+            return "Int";
+        }
+        EBool(b) => {
+            return "Bool";
+        }
+        EText(t) => {
+            return "Text";
+        }
+        EVar(x) => {
+            return lookup_tag(ctx.vnames, ctx.vtags, x);
+        }
+        EUn(op, kids) => {
+            if op == "not" {
+                return "Bool";
+            }
+            return "Int";
+        }
+        EBin(op, kids) => {
+            if op == "and" or op == "or" or is_cmp(op) {
+                return "Bool";
+            }
+            if op == "+" {
+                // Int + Int or Text + Text
+                return type_of(kids[0], ctx);
+            }
+            return "Int";
+        }
+        ECall(name, args) => {
+            if name == "len" or name == "ord" {
+                return "Int";
+            }
+            if name == "slice" or name == "chr" or name == "str" {
+                return "Text";
+            }
+            if name == "push" {
+                return type_of(args[0], ctx);
+            }
+            return lookup_tag(ctx.fnames, ctx.frets, name);
+        }
+        EIndex(kids) => {
+            return elem_tag(type_of(kids[0], ctx));
+        }
+        EField(name, kids) => {
+            return "Int";
+        }
+        EList(items) => {
+            if len(items) == 0 {
+                return "List:Int";
+            }
+            return "List:" + type_of(items[0], ctx);
+        }
+    }
+}
+
+// Look up a tag in a parallel name/tag list, defaulting to "Int".
+fn lookup_tag(names: List[Text], tags: List[Text], x: Text) -> Text {
+    var i: Int = 0;
+    while i < len(names)
+        invariant i >= 0
+    {
+        if names[i] == x {
+            return tags[i];
+        }
+        i = i + 1;
+    }
+    return "Int";
+}
+
+// The element tag of a "List:<elem>" tag (drop the "List:" prefix).
+fn elem_tag(tag: Text) -> Text {
+    if len(tag) > 5 {
+        return slice(tag, 5, len(tag));
+    }
+    return "Int";
 }
 
 // ---------------------------------------------------------------- byte helpers
@@ -135,29 +232,82 @@ fn collect_stmt_locals(s: Stmt, acc: List[Text]) -> List[Text] {
     }
 }
 
-// Build the per-function variable map: params above rbp, locals below.
-fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int]) -> Ctx {
+fn collect_local_tags(stmts: List[Stmt], acc: List[Text]) -> List[Text] {
+    var out: List[Text] = acc;
+    var i: Int = 0;
+    while i < len(stmts)
+        invariant i >= 0
+    {
+        out = collect_stmt_tags(stmts[i], out);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn collect_stmt_tags(s: Stmt, acc: List[Text]) -> List[Text] {
+    match s {
+        SLet(n, t, e) => {
+            return push(acc, ty_tag(t));
+        }
+        SVar(n, t, e) => {
+            return push(acc, ty_tag(t));
+        }
+        SIf(c, body) => {
+            return collect_local_tags(body, acc);
+        }
+        SIfElse(c, t, e) => {
+            return collect_local_tags(e, collect_local_tags(t, acc));
+        }
+        SWhile(c, invs, body) => {
+            return collect_local_tags(body, acc);
+        }
+        SAssign(n, e) => {
+            return acc;
+        }
+        SReturn(e) => {
+            return acc;
+        }
+        SReturnVoid => {
+            return acc;
+        }
+        SExpr(e) => {
+            return acc;
+        }
+        SBreak => {
+            return acc;
+        }
+    }
+}
+
+// Build the per-function variable map: params above rbp, locals below, with a
+// parallel type tag for each (params from their declared types, locals from
+// their let/var declarations).
+fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text]) -> Ctx {
     let np: Int = len(f.params);
     var vn: List[Text] = [];
     var vd: List[Int] = [];
+    var vt: List[Text] = [];
     var i: Int = 0;
     while i < np
         invariant i >= 0
     {
         vn = push(vn, f.params[i].name);
         vd = push(vd, 16 + 8 * (np - 1 - i));
+        vt = push(vt, ty_tag(f.params[i].ty));
         i = i + 1;
     }
     let locals: List[Text] = collect_locals(f.body, []);
+    let ltags: List[Text] = collect_local_tags(f.body, []);
     var j: Int = 0;
     while j < len(locals)
         invariant j >= 0
     {
         vn = push(vn, locals[j]);
         vd = push(vd, 0 - 8 * (j + 1));
+        vt = push(vt, ltags[j]);
         j = j + 1;
     }
-    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs };
+    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets };
 }
 
 // ---------------------------------------------------------------- expr codegen
@@ -235,6 +385,10 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             return cat(gen(kids[0], ctx), [88, 72, 247, 216, 80]);
         }
         EBin(op, kids) => {
+            // == and != are overloaded: byte-wise for Text, integer otherwise.
+            if (op == "==" or op == "!=") and type_of(kids[0], ctx) == "Text" {
+                return gen_text_eq(kids[0], kids[1], op, ctx);
+            }
             return cat(gen(kids[0], ctx), cat(gen(kids[1], ctx), bin_op(op)));
         }
         ECall(name, args) => {
@@ -332,6 +486,27 @@ fn gen_print(args: List[Expr], ctx: Ctx) -> List[Int] {
 fn gen_ord(arg: Expr, ctx: Ctx) -> List[Int] {
     // first byte of the Text: pop rax ; movzx eax, byte [rax+8] ; push rax
     return cat(gen(arg, ctx), [88, 15, 182, 64, 8, 80]);
+}
+
+// Text equality: compare two [len][bytes] blocks. Pushes 1 if equal else 0
+// (then negated for !=). A self-contained routine with a byte-compare loop;
+// jump offsets are computed from the fixed instruction sizes (see comments).
+fn gen_text_eq(a: Expr, b: Expr, op: Text, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(a, ctx), gen(b, ctx));
+    // pop rbx(b); pop rax(a); rcx=len_a; rdx=len_b; rsi=0; if len!= -> DONE
+    let h1: List[Int] = cat([91, 88, 72, 139, 8, 72, 139, 19, 72, 49, 246, 72, 57, 209, 15, 133], le_s32(48));
+    // rdi=0 ; LOOP: if i>=len -> EQUAL
+    let h2: List[Int] = cat([72, 49, 255, 72, 57, 207, 15, 141], le_s32(29));
+    // load both bytes ; if differ -> DONE(0)
+    let h3: List[Int] = cat([68, 15, 182, 68, 56, 8, 68, 15, 182, 76, 59, 8, 69, 57, 200, 15, 133], le_s32(15));
+    // inc i ; jmp LOOP ; EQUAL: rsi=1 ; DONE: push rsi
+    let h4: List[Int] = cat([72, 255, 199, 233], cat(le_s32(0 - 38), [72, 199, 198, 1, 0, 0, 0, 86]));
+    code = cat(code, cat(h1, cat(h2, cat(h3, h4))));
+    if op == "!=" {
+        // pop rax ; xor rax, 1 ; push rax
+        code = cat(code, [88, 72, 131, 240, 1, 80]);
+    }
+    return code;
 }
 
 fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
@@ -452,8 +627,8 @@ fn prologue(frame: Int) -> List[Int] {
     return cat([85, 72, 137, 229, 72, 129, 236], le(frame, 4));
 }
 
-fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int]) -> List[Int] {
-    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs);
+fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text]) -> List[Int] {
+    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets);
     let frame: Int = round16(8 * len(collect_locals(f.body, [])));
     // fall-through safety: xor eax, eax ; leave ; ret
     return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
@@ -486,7 +661,7 @@ fn fn_offsets(fns: List[Fn]) -> List[Int] {
         invariant i >= 0
     {
         offs = push(offs, acc);
-        acc = acc + len(gen_fn(fns[i], [], [], [], []));
+        acc = acc + len(gen_fn(fns[i], [], [], [], [], []));
         i = i + 1;
     }
     return offs;
@@ -498,7 +673,7 @@ fn code_length(fns: List[Fn]) -> Int {
     while i < len(fns)
         invariant i >= 0
     {
-        acc = acc + len(gen_fn(fns[i], [], [], [], []));
+        acc = acc + len(gen_fn(fns[i], [], [], [], [], []));
         i = i + 1;
     }
     return acc;
@@ -682,9 +857,22 @@ fn str_data(strs: List[Text]) -> List[Int] {
     return out;
 }
 
+fn fn_rets(fns: List[Fn]) -> List[Text] {
+    var ts: List[Text] = [];
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        ts = push(ts, ty_tag(fns[i].ret));
+        i = i + 1;
+    }
+    return ts;
+}
+
 fn compile_program(fns: List[Fn]) -> List[Int] {
     let names: List[Text] = fn_names(fns);
     let offs: List[Int] = fn_offsets(fns);
+    let rets: List[Text] = fn_rets(fns);
     let strs: List[Text] = collect_strings(fns);
     let data_base: Int = 4194480 + code_length(fns);
     let saddrs: List[Int] = str_addrs(strs, data_base);
@@ -694,7 +882,7 @@ fn compile_program(fns: List[Fn]) -> List[Int] {
     while i < len(fns)
         invariant i >= 0
     {
-        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs));
+        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs, rets));
         i = i + 1;
     }
     return cat(code, str_data(strs));
