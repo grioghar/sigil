@@ -310,7 +310,7 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
         code = cat(code, gen(args[i], ctx));
         i = i + 1;
     }
-    let addr: Int = 4194424 + lookup(ctx.fnames, ctx.foffs, name);
+    let addr: Int = 4194480 + lookup(ctx.fnames, ctx.foffs, name);
     // mov rax, imm64
     code = cat(code, cat([72, 184], le(addr, 8)));
     // call rax
@@ -412,18 +412,28 @@ fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddr
     return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
 }
 
-// Entry stub at code offset 0 (ELF entry 0x400078): call main, exit(rax).
+// Entry stub at code offset 0 (ELF entry 0x4000b0). Initializes the heap bump
+// pointer (the word at 0x600000 := 0x600008, the first allocatable byte), then
+// calls main and exits with its value.
 fn entry_stub(main_off: Int) -> List[Int] {
-    let addr: Int = 4194424 + main_off;
+    // mov rdi, 0x600000 ; mov rax, 0x600008 ; mov [rdi], rax
+    let init: List[Int] = cat(cat([72, 191], le(6291456, 8)), cat(cat([72, 184], le(6291464, 8)), [72, 137, 7]));
+    // mov rax, main_addr ; call rax
+    let addr: Int = 4194480 + main_off;
     let call: List[Int] = cat(cat([72, 184], le(addr, 8)), [255, 208]);
-    return cat(call, [72, 137, 199, 184, 60, 0, 0, 0, 15, 5]);
+    // mov rdi, rax ; mov eax, 60 ; syscall
+    return cat(init, cat(call, [72, 137, 199, 184, 60, 0, 0, 0, 15, 5]));
+}
+
+fn entry_size() -> Int {
+    return len(entry_stub(0));
 }
 
 fn fn_offsets(fns: List[Fn]) -> List[Int] {
-    // pass A: lay functions out after the 22-byte entry stub to get offsets.
-    // Sizes are independent of the (empty) maps, since every imm is fixed-size.
+    // pass A: lay functions out after the entry stub to get offsets. Sizes are
+    // independent of the (empty) maps, since every imm is fixed-size.
     var offs: List[Int] = [];
-    var acc: Int = 22;
+    var acc: Int = entry_size();
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
@@ -436,7 +446,7 @@ fn fn_offsets(fns: List[Fn]) -> List[Int] {
 }
 
 fn code_length(fns: List[Fn]) -> Int {
-    var acc: Int = 22;
+    var acc: Int = entry_size();
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
@@ -626,7 +636,7 @@ fn compile_program(fns: List[Fn]) -> List[Int] {
     let names: List[Text] = fn_names(fns);
     let offs: List[Int] = fn_offsets(fns);
     let strs: List[Text] = collect_strings(fns);
-    let data_base: Int = 4194424 + code_length(fns);
+    let data_base: Int = 4194480 + code_length(fns);
     let saddrs: List[Int] = str_addrs(strs, data_base);
     let main_off: Int = lookup(names, offs, "main");
     var code: List[Int] = entry_stub(main_off);
@@ -822,8 +832,11 @@ fn supported_program(fns: List[Fn]) -> Bool {
 }
 
 // ---------------------------------------------------------------- ELF + main
+// Two PT_LOAD segments: the file (code + rodata) at 0x400000 R+X, and a
+// zero-filled RW heap at 0x600000. Header is 64 (ELF) + 2*56 (phdrs) = 176
+// bytes, so code begins at vaddr 0x4000b0 (the entry point).
 fn elf(code: List[Int]) -> List[Int] {
-    let total: Int = 120 + len(code);
+    let fsize: Int = 176 + len(code);
     var out: List[Int] = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     // e_type = ET_EXEC
     out = cat(out, [2, 0]);
@@ -831,8 +844,8 @@ fn elf(code: List[Int]) -> List[Int] {
     out = cat(out, [62, 0]);
     // e_version
     out = cat(out, le(1, 4));
-    // e_entry = 0x400078
-    out = cat(out, le(4194424, 8));
+    // e_entry = 0x4000b0
+    out = cat(out, le(4194480, 8));
     // e_phoff
     out = cat(out, le(64, 8));
     // e_shoff
@@ -843,14 +856,15 @@ fn elf(code: List[Int]) -> List[Int] {
     out = cat(out, le(64, 2));
     // e_phentsize
     out = cat(out, le(56, 2));
-    // e_phnum
-    out = cat(out, le(1, 2));
+    // e_phnum = 2
+    out = cat(out, le(2, 2));
     // e_shentsize
     out = cat(out, le(0, 2));
     // e_shnum
     out = cat(out, le(0, 2));
     // e_shstrndx
     out = cat(out, le(0, 2));
+    // phdr 1: file image (code + rodata), R+X
     // p_type = PT_LOAD
     out = cat(out, le(1, 4));
     // p_flags = R+X
@@ -862,9 +876,26 @@ fn elf(code: List[Int]) -> List[Int] {
     // p_paddr
     out = cat(out, le(4194304, 8));
     // p_filesz
-    out = cat(out, le(total, 8));
+    out = cat(out, le(fsize, 8));
     // p_memsz
-    out = cat(out, le(total, 8));
+    out = cat(out, le(fsize, 8));
+    // p_align
+    out = cat(out, le(4096, 8));
+    // phdr 2: heap, RW, zero-filled (filesz 0, memsz 16 MiB)
+    // p_type = PT_LOAD
+    out = cat(out, le(1, 4));
+    // p_flags = RW
+    out = cat(out, le(6, 4));
+    // p_offset
+    out = cat(out, le(0, 8));
+    // p_vaddr = 0x600000
+    out = cat(out, le(6291456, 8));
+    // p_paddr
+    out = cat(out, le(6291456, 8));
+    // p_filesz = 0
+    out = cat(out, le(0, 8));
+    // p_memsz = 16 MiB
+    out = cat(out, le(16777216, 8));
     // p_align
     out = cat(out, le(4096, 8));
     return cat(out, code);

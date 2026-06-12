@@ -78,10 +78,11 @@ class TestCc0(unittest.TestCase):
         self.assertEqual(blob[:4], b"\x7fELF")
         self.assertEqual(blob[4], 2)       # ELFCLASS64
         self.assertEqual(blob[18], 62)     # x86-64
-        # file size is headers (120) + emitted code, recorded in p_filesz.
+        self.assertEqual(int.from_bytes(blob[24:32], "little"), 0x4000B0)  # entry
+        self.assertEqual(int.from_bytes(blob[56:58], "little"), 2)         # e_phnum
+        # first program header's p_filesz covers the whole file (headers=176).
         filesz = int.from_bytes(blob[96:104], "little")
         self.assertEqual(filesz, len(blob))
-        self.assertEqual(len(blob), 120 + (len(blob) - 120))
 
     def test_unsupported_expression_rejected(self):
         with tempfile.TemporaryDirectory() as t:
