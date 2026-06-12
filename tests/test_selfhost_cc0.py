@@ -99,6 +99,33 @@ class TestCc0(unittest.TestCase):
             self.assertIn("unsupported", out.getvalue())
             self.assertFalse((Path(t) / "out.bin").exists())
 
+    def test_print_data_section(self):
+        # the string's ASCII bytes are appended after the code.
+        with tempfile.TemporaryDirectory() as t:
+            blob = self.compile(Path(t), 'fn main() -> Int { print("Hi"); return 0; }')
+        self.assertIn(b"Hi", blob)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_programs_print(self):
+        cases = [
+            ('fn main() -> Int { print("hello\\n"); return 0; }', b"hello\n", 0),
+            ('fn main() -> Int { print("A"); print("B"); print("C\\n"); return 7; }',
+             b"ABC\n", 7),
+            ('fn main() -> Int { print("hi"); print("hi"); return 3; }', b"hihi", 3),
+            ('fn greet() -> Int { print("hey\\n"); return 0; }\n'
+             'fn main() -> Int { let x: Int = greet(); return 9; }', b"hey\n", 9),
+        ]
+        for prog, out_expected, code_expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)], capture_output=True)
+                self.assertEqual(result.stdout, out_expected)
+                self.assertEqual(result.returncode, code_expected)
+
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
     def test_emitted_binaries_exit_with_value(self):

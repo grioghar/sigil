@@ -1,14 +1,16 @@
-// cc0 — the Sigil compiler, stage 3: a native compiler written in Sigil that
-// compiles a whole PROGRAM (multiple functions, parameters, calls, recursion)
-// to a static x86-64 Linux ELF — no rustc, no linker, no libc
+// cc0 — the Sigil compiler, stage 4: a native compiler written in Sigil that
+// compiles a whole PROGRAM (multiple functions, parameters, calls, recursion,
+// and printing) to a static x86-64 Linux ELF — no rustc, no linker, no libc
 // (docs/SELFHOST.md). The whole pipeline runs in Sigil: lex -> parse ->
 // codegen -> ELF -> a binary that runs.
 //
 // Subset: functions over Int/Bool/Unit; let/var locals, assignment, if/else,
 // while (+invariants ignored by codegen), return, expression statements,
-// calls (incl. recursion); expressions over int/bool literals, locals, params,
-// + - * / %, comparisons, and/or/not. The program's `main` is the entry; its
-// returned value becomes the process exit status (masked to 8 bits).
+// calls (incl. recursion), and `print("literal")`; expressions over int/bool
+// literals, locals, params, + - * / %, comparisons, and/or/not. The program's
+// `main` is the entry; its returned value becomes the process exit status
+// (masked to 8 bits). `print` lowers to a write(1, ...) syscall against string
+// literals laid out in a data blob after the code (ASCII).
 //
 // Codegen is a stack machine. Each function has a frame: parameters sit above
 // the saved rbp at [rbp + 16 + 8*(nparams-1-i)] (the caller pushed them), and
@@ -27,6 +29,8 @@ record Ctx {
     vdisps: List[Int],
     fnames: List[Text],
     foffs: List[Int],
+    snames: List[Text],
+    saddrs: List[Int],
 }
 
 // ---------------------------------------------------------------- byte helpers
@@ -130,7 +134,7 @@ fn collect_stmt_locals(s: Stmt, acc: List[Text]) -> List[Text] {
 }
 
 // Build the per-function variable map: params above rbp, locals below.
-fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int]) -> Ctx {
+fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int]) -> Ctx {
     let np: Int = len(f.params);
     var vn: List[Text] = [];
     var vd: List[Int] = [];
@@ -151,7 +155,7 @@ fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int]) -> Ctx {
         vd = push(vd, 0 - 8 * (j + 1));
         j = j + 1;
     }
-    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs };
+    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs };
 }
 
 // ---------------------------------------------------------------- expr codegen
@@ -249,7 +253,53 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
     }
 }
 
+// print("literal") lowers to a write(1, addr, len) syscall against the
+// string's bytes in the data section. The result (bytes written) is pushed
+// like any call result and discarded by the expression statement.
+fn gen_print(args: List[Expr], ctx: Ctx) -> List[Int] {
+    match args[0] {
+        EText(t) => {
+            let addr: Int = lookup(ctx.snames, ctx.saddrs, t);
+            // mov edi,1 ; mov rsi,imm64(addr) ; mov edx,len ; mov eax,1 ;
+            // syscall ; push rax
+            let head: List[Int] = cat([191, 1, 0, 0, 0], cat([72, 190], le(addr, 8)));
+            let tail: List[Int] = cat([186], cat(le(len(t), 4), [184, 1, 0, 0, 0, 15, 5, 80]));
+            return cat(head, tail);
+        }
+        EInt(n) => {
+            return [];
+        }
+        EBool(b) => {
+            return [];
+        }
+        EVar(x) => {
+            return [];
+        }
+        EUn(op, kids) => {
+            return [];
+        }
+        EBin(op, kids) => {
+            return [];
+        }
+        ECall(nm, a) => {
+            return [];
+        }
+        EIndex(kids) => {
+            return [];
+        }
+        EField(nm, kids) => {
+            return [];
+        }
+        EList(items) => {
+            return [];
+        }
+    }
+}
+
 fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
+    if name == "print" {
+        return gen_print(args, ctx);
+    }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
     // add rsp, 8*nargs (drop args); push rax (result).
     var code: List[Int] = [];
@@ -355,8 +405,8 @@ fn prologue(frame: Int) -> List[Int] {
     return cat([85, 72, 137, 229, 72, 129, 236], le(frame, 4));
 }
 
-fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int]) -> List[Int] {
-    let ctx: Ctx = build_ctx(f, fnames, foffs);
+fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int]) -> List[Int] {
+    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs);
     let frame: Int = round16(8 * len(collect_locals(f.body, [])));
     // fall-through safety: xor eax, eax ; leave ; ret
     return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
@@ -371,6 +421,7 @@ fn entry_stub(main_off: Int) -> List[Int] {
 
 fn fn_offsets(fns: List[Fn]) -> List[Int] {
     // pass A: lay functions out after the 22-byte entry stub to get offsets.
+    // Sizes are independent of the (empty) maps, since every imm is fixed-size.
     var offs: List[Int] = [];
     var acc: Int = 22;
     var i: Int = 0;
@@ -378,10 +429,22 @@ fn fn_offsets(fns: List[Fn]) -> List[Int] {
         invariant i >= 0
     {
         offs = push(offs, acc);
-        acc = acc + len(gen_fn(fns[i], [], []));
+        acc = acc + len(gen_fn(fns[i], [], [], [], []));
         i = i + 1;
     }
     return offs;
+}
+
+fn code_length(fns: List[Fn]) -> Int {
+    var acc: Int = 22;
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        acc = acc + len(gen_fn(fns[i], [], [], [], []));
+        i = i + 1;
+    }
+    return acc;
 }
 
 fn fn_names(fns: List[Fn]) -> List[Text] {
@@ -396,19 +459,185 @@ fn fn_names(fns: List[Fn]) -> List[Text] {
     return ns;
 }
 
+// ---------------------------------------------------------------- string data
+//
+// Every string literal in the program is collected (deduplicated) and laid out
+// in a data blob right after the code, in the same R+X PT_LOAD segment. Its
+// address is 0x400078 + code_length + offset_in_blob. ASCII only for now (one
+// byte per character; non-ASCII would need UTF-8 encoding here).
+fn add_unique(acc: List[Text], t: Text) -> List[Text] {
+    var i: Int = 0;
+    while i < len(acc)
+        invariant i >= 0
+    {
+        if acc[i] == t {
+            return acc;
+        }
+        i = i + 1;
+    }
+    return push(acc, t);
+}
+
+fn collect_str_expr(e: Expr, acc: List[Text]) -> List[Text] {
+    match e {
+        EText(t) => {
+            return add_unique(acc, t);
+        }
+        EUn(op, kids) => {
+            return collect_str_expr(kids[0], acc);
+        }
+        EBin(op, kids) => {
+            return collect_str_expr(kids[1], collect_str_expr(kids[0], acc));
+        }
+        ECall(name, args) => {
+            return collect_str_args(args, acc);
+        }
+        EInt(n) => {
+            return acc;
+        }
+        EBool(b) => {
+            return acc;
+        }
+        EVar(x) => {
+            return acc;
+        }
+        EIndex(kids) => {
+            return acc;
+        }
+        EField(name, kids) => {
+            return acc;
+        }
+        EList(items) => {
+            return acc;
+        }
+    }
+}
+
+fn collect_str_args(args: List[Expr], acc: List[Text]) -> List[Text] {
+    var out: List[Text] = acc;
+    var i: Int = 0;
+    while i < len(args)
+        invariant i >= 0
+    {
+        out = collect_str_expr(args[i], out);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn collect_str_block(stmts: List[Stmt], acc: List[Text]) -> List[Text] {
+    var out: List[Text] = acc;
+    var i: Int = 0;
+    while i < len(stmts)
+        invariant i >= 0
+    {
+        out = collect_str_stmt(stmts[i], out);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn collect_str_stmt(s: Stmt, acc: List[Text]) -> List[Text] {
+    match s {
+        SLet(n, t, e) => {
+            return collect_str_expr(e, acc);
+        }
+        SVar(n, t, e) => {
+            return collect_str_expr(e, acc);
+        }
+        SAssign(n, e) => {
+            return collect_str_expr(e, acc);
+        }
+        SReturn(e) => {
+            return collect_str_expr(e, acc);
+        }
+        SReturnVoid => {
+            return acc;
+        }
+        SExpr(e) => {
+            return collect_str_expr(e, acc);
+        }
+        SBreak => {
+            return acc;
+        }
+        SIf(c, body) => {
+            return collect_str_block(body, collect_str_expr(c, acc));
+        }
+        SIfElse(c, t, e) => {
+            return collect_str_block(e, collect_str_block(t, collect_str_expr(c, acc)));
+        }
+        SWhile(c, invs, body) => {
+            return collect_str_block(body, collect_str_expr(c, acc));
+        }
+    }
+}
+
+fn collect_strings(fns: List[Fn]) -> List[Text] {
+    var out: List[Text] = [];
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        out = collect_str_block(fns[i].body, out);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn string_bytes(t: Text) -> List[Int] {
+    var out: List[Int] = [];
+    var i: Int = 0;
+    while i < len(t)
+        invariant i >= 0
+    {
+        out = push(out, ord(slice(t, i, i + 1)));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn str_addrs(strs: List[Text], base: Int) -> List[Int] {
+    var addrs: List[Int] = [];
+    var off: Int = 0;
+    var i: Int = 0;
+    while i < len(strs)
+        invariant i >= 0
+    {
+        addrs = push(addrs, base + off);
+        off = off + len(strs[i]);
+        i = i + 1;
+    }
+    return addrs;
+}
+
+fn str_data(strs: List[Text]) -> List[Int] {
+    var out: List[Int] = [];
+    var i: Int = 0;
+    while i < len(strs)
+        invariant i >= 0
+    {
+        out = cat(out, string_bytes(strs[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
 fn compile_program(fns: List[Fn]) -> List[Int] {
     let names: List[Text] = fn_names(fns);
     let offs: List[Int] = fn_offsets(fns);
+    let strs: List[Text] = collect_strings(fns);
+    let data_base: Int = 4194424 + code_length(fns);
+    let saddrs: List[Int] = str_addrs(strs, data_base);
     let main_off: Int = lookup(names, offs, "main");
     var code: List[Int] = entry_stub(main_off);
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
     {
-        code = cat(code, gen_fn(fns[i], names, offs));
+        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs));
         i = i + 1;
     }
-    return code;
+    return cat(code, str_data(strs));
 }
 
 // ---------------------------------------------------------------- support gate
@@ -440,9 +669,47 @@ fn supported(e: Expr) -> Bool {
             return (arith or logic or is_cmp(op)) and supported(kids[0]) and supported(kids[1]);
         }
         ECall(name, args) => {
+            if name == "print" {
+                return len(args) == 1 and is_text(args[0]);
+            }
             return all_supported(args);
         }
         EText(t) => {
+            return false;
+        }
+        EIndex(kids) => {
+            return false;
+        }
+        EField(name, kids) => {
+            return false;
+        }
+        EList(items) => {
+            return false;
+        }
+    }
+}
+
+fn is_text(e: Expr) -> Bool {
+    match e {
+        EText(t) => {
+            return true;
+        }
+        EInt(n) => {
+            return false;
+        }
+        EBool(b) => {
+            return false;
+        }
+        EVar(x) => {
+            return false;
+        }
+        EUn(op, kids) => {
+            return false;
+        }
+        EBin(op, kids) => {
+            return false;
+        }
+        ECall(name, args) => {
             return false;
         }
         EIndex(kids) => {
