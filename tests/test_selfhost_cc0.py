@@ -139,6 +139,30 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_push_programs(self):
+        cases = [
+            ("fn main() -> Int { let xs: List[Int] = push([1, 2, 3], 4); "
+             "return xs[3] + len(xs); }", 8),
+            ("fn main() -> Int { var xs: List[Int] = []; xs = push(xs, 10); "
+             "xs = push(xs, 20); xs = push(xs, 12); "
+             "return xs[0] + xs[1] + xs[2] + len(xs); }", 45),
+            ("fn build(n: Int) -> List[Int] { var xs: List[Int] = []; "
+             "var i: Int = 0; while i < n invariant i >= 0 "
+             "{ xs = push(xs, i * i); i = i + 1; } return xs; }\n"
+             "fn main() -> Int { let xs: List[Int] = build(5); "
+             "return xs[4] + len(xs); }", 21),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_programs_print(self):
         cases = [
             ('fn main() -> Int { print("hello\\n"); return 0; }', b"hello\n", 0),

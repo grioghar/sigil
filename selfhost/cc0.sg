@@ -300,6 +300,24 @@ fn gen_len(arg: Expr, ctx: Ctx) -> List[Int] {
     return cat(gen(arg, ctx), [88, 72, 139, 0, 80]);
 }
 
+// push(xs, x): a new list = xs with x appended (immutable). Emits a
+// self-contained runtime routine: allocate a block of size 16 + 8*oldlen,
+// store the new length, copy the old elements in a loop, append x. Uses
+// rsi=xs, rdi=oldlen, rdx=x, r9=new block, rcx=loop counter — all scratch in
+// the stack machine (live values live on the stack between expressions).
+fn gen_push(args: List[Expr], ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(args[0], ctx), gen(args[1], ctx));
+    // setup: pop x, pop xs, oldlen=[xs], newsize bytes -> rcx
+    let setup: List[Int] = cat([90, 94, 72, 139, 62, 72, 137, 249, 72, 131, 193, 1, 72, 193, 225, 3, 72, 131, 193, 8], cat([73, 184], le(6291456, 8)));
+    // alloc rcx bytes (r9 = block), store newlen, init counter rcx=0
+    let head: List[Int] = [73, 139, 0, 73, 137, 193, 72, 1, 200, 73, 137, 0, 72, 137, 248, 72, 131, 192, 1, 73, 137, 1, 72, 49, 201];
+    // loop: cmp rcx,rdi ; jge +18 ; copy elem ; inc ; jmp -27
+    let loop: List[Int] = cat(cat([72, 57, 249, 15, 141], le_s32(18)), cat([72, 139, 68, 206, 8, 73, 137, 68, 201, 8, 72, 255, 193, 233], le_s32(0 - 27)));
+    // done: store x at [r9 + oldlen*8 + 8] ; rax = r9 ; push rax
+    let tail: List[Int] = [73, 137, 84, 249, 8, 76, 137, 200, 80];
+    return cat(code, cat(setup, cat(head, cat(loop, tail))));
+}
+
 // print("literal") lowers to a write(1, addr, len) syscall against the
 // string's bytes in the data section. The result (bytes written) is pushed
 // like any call result and discarded by the expression statement.
@@ -349,6 +367,9 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     }
     if name == "len" {
         return gen_len(args[0], ctx);
+    }
+    if name == "push" {
+        return gen_push(args, ctx);
     }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
     // add rsp, 8*nargs (drop args); push rax (result).
