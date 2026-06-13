@@ -114,6 +114,55 @@ class TestCc0(unittest.TestCase):
                 "return xs[1] + len(xs); }")
         self.assertEqual(blob[:4], b"\x7fELF")
 
+    def test_record_program_compiles(self):
+        with tempfile.TemporaryDirectory() as t:
+            blob = self.compile(
+                Path(t),
+                "record Point { x: Int, y: Int }\n"
+                "fn main() -> Int { let p: Point = Point { x: 40, y: 2 }; "
+                "return p.x + p.y; }")
+        self.assertEqual(blob[:4], b"\x7fELF")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_record_programs(self):
+        # records are heap blocks of one 8-byte slot per field, in declaration
+        # order; construction places each field at its slot, access loads it.
+        cases = [
+            ("record Point { x: Int, y: Int }\n"
+             "fn main() -> Int { let p: Point = Point { x: 40, y: 2 }; "
+             "return p.x + p.y; }", 42),
+            # field order in the literal differs from declaration order
+            ("record Point { x: Int, y: Int }\n"
+             "fn main() -> Int { let p: Point = Point { y: 2, x: 40 }; "
+             "return p.x + p.y; }", 42),
+            # record passed to and returned from functions (pointer-sized)
+            ("record Pair { a: Int, b: Int }\n"
+             "fn mk(a: Int, b: Int) -> Pair { return Pair { a: a, b: b }; }\n"
+             "fn diff(p: Pair) -> Int { return p.a - p.b; }\n"
+             "fn main() -> Int { return diff(mk(50, 8)); }", 42),
+            # three fields, nested arithmetic in a field value
+            ("record V3 { x: Int, y: Int, z: Int }\n"
+             "fn main() -> Int { let v: V3 = V3 { x: 1, y: 2 * 10, z: 21 }; "
+             "return v.x + v.y + v.z; }", 42),
+            # a record field that is itself a record (pointer in a slot)
+            ("record Inner { n: Int }\nrecord Outer { i: Inner, k: Int }\n"
+             "fn main() -> Int { let o: Outer = "
+             "Outer { i: Inner { n: 30 }, k: 12 }; return o.i.n + o.k; }", 42),
+            # a record holding a Text field; access then ord
+            ("record Tok { kind: Text, n: Int }\n"
+             "fn main() -> Int { let t: Tok = Tok { kind: \"A\", n: 5 }; "
+             "return ord(t.kind) + t.n; }", 70),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
     def test_emitted_list_programs(self):

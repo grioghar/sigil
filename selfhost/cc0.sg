@@ -22,7 +22,7 @@
 //
 // Usage: reads a source path on stdin, then an output path on the next line.
 use lexer { Token, lex }
-use parser { Expr, FieldVal, Fn, Param, Prog, Res, Stmt, Ty, parse_program }
+use parser { Expr, FieldVal, Fn, Param, Prog, RecDecl, Res, Stmt, Ty, parse_program }
 
 // Codegen context: the variable displacement map (this function) and the
 // function-address map (whole program).
@@ -35,6 +35,7 @@ record Ctx {
     saddrs: List[Int],
     vtags: List[Text],
     frets: List[Text],
+    recs: List[RecDecl],
 }
 
 // type environment: each variable's type tag (parallel to vnames) and each
@@ -49,6 +50,67 @@ fn ty_tag(t: Ty) -> Text {
             return name;
         }
     }
+}
+
+// Record layout: a record value is a heap block of one 8-byte slot per field,
+// in declaration order, and the value is a pointer to it. A record's type tag
+// is its bare name ("Ctx"), matching ty_tag, so a record-typed variable and a
+// record literal carry the same tag. These helpers resolve a record name to
+// its declaration so field positions and field types can be computed.
+fn rec_known(recs: List[RecDecl], name: Text) -> Bool {
+    var i: Int = 0;
+    while i < len(recs)
+        invariant i >= 0
+    {
+        if recs[i].name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn rec_fields(recs: List[RecDecl], name: Text) -> List[Param] {
+    var i: Int = 0;
+    while i < len(recs)
+        invariant i >= 0
+    {
+        if recs[i].name == name {
+            return recs[i].fields;
+        }
+        i = i + 1;
+    }
+    return [];
+}
+
+// Slot index (0-based) of field `fname` in record `rname`; -1 if absent.
+fn field_slot(recs: List[RecDecl], rname: Text, fname: Text) -> Int {
+    let fs: List[Param] = rec_fields(recs, rname);
+    var i: Int = 0;
+    while i < len(fs)
+        invariant i >= 0
+    {
+        if fs[i].name == fname {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Type tag of field `fname` in record `rname` ("Int" if absent).
+fn field_ty_tag(recs: List[RecDecl], rname: Text, fname: Text) -> Text {
+    let fs: List[Param] = rec_fields(recs, rname);
+    var i: Int = 0;
+    while i < len(fs)
+        invariant i >= 0
+    {
+        if fs[i].name == fname {
+            return ty_tag(fs[i].ty);
+        }
+        i = i + 1;
+    }
+    return "Int";
 }
 
 // The type tag of an expression, given the context's type environment. Used to
@@ -99,6 +161,10 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             return elem_tag(type_of(kids[0], ctx));
         }
         EField(name, kids) => {
+            let bt: Text = type_of(kids[0], ctx);
+            if rec_known(ctx.recs, bt) {
+                return field_ty_tag(ctx.recs, bt, name);
+            }
             return "Int";
         }
         EList(items) => {
@@ -111,7 +177,7 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             return type_of(kids[1], ctx);
         }
         ERecord(name, fields) => {
-            return "Record:" + name;
+            return name;
         }
     }
 }
@@ -294,7 +360,7 @@ fn collect_stmt_tags(s: Stmt, acc: List[Text]) -> List[Text] {
 // Build the per-function variable map: params above rbp, locals below, with a
 // parallel type tag for each (params from their declared types, locals from
 // their let/var declarations).
-fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text]) -> Ctx {
+fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl]) -> Ctx {
     let np: Int = len(f.params);
     var vn: List[Text] = [];
     var vd: List[Int] = [];
@@ -319,7 +385,7 @@ fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], sa
         vt = push(vt, ltags[j]);
         j = j + 1;
     }
-    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets };
+    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets, recs: recs };
 }
 
 // ---------------------------------------------------------------- expr codegen
@@ -425,8 +491,7 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             return cat(head, cat(then_code, cat(jmp(len(else_code)), else_code)));
         }
         ERecord(name, fields) => {
-            // record codegen is a later increment; rejected by supported() today.
-            return [];
+            return gen_record(name, fields, ctx);
         }
         EText(t) => {
             // a Text value is a pointer to its [len][bytes] block in rodata.
@@ -435,7 +500,7 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             return cat([72, 184], cat(le(addr, 8), [80]));
         }
         EField(name, kids) => {
-            return [];
+            return gen_field(name, kids[0], ctx);
         }
     }
 }
@@ -481,6 +546,41 @@ fn gen_list(items: List[Expr], ctx: Ctx) -> List[Int] {
 fn gen_len(arg: Expr, ctx: Ctx) -> List[Int] {
     // pop rax(ptr) ; mov rax,[rax] (length) ; push rax
     return cat(gen(arg, ctx), [88, 72, 139, 0, 80]);
+}
+
+// A record literal `Name { f: v, ... }`: allocate one 8-byte slot per field,
+// store each field value at its declaration-order slot, leave the block
+// pointer on the stack. Fields may be written in any order in the literal;
+// field_slot maps each to its fixed offset.
+fn gen_record(name: Text, fields: List[FieldVal], ctx: Ctx) -> List[Int] {
+    let k: Int = len(fields);
+    var code: List[Int] = alloc_const(8 * k);
+    // push rax (the result pointer)
+    code = cat(code, [80]);
+    var i: Int = 0;
+    while i < k
+        invariant i >= 0
+    {
+        // push field value
+        code = cat(code, gen(fields[i].fval, ctx));
+        // pop rcx
+        code = cat(code, [89]);
+        // mov rax, [rsp] (reload ptr)
+        code = cat(code, [72, 139, 4, 36]);
+        // mov [rax + slot*8], rcx
+        let slot: Int = field_slot(ctx.recs, name, fields[i].fname);
+        code = cat(code, cat([72, 137, 136], le_s32(8 * slot)));
+        i = i + 1;
+    }
+    return code;
+}
+
+// Field access `base.field`: evaluate base to a record pointer, load the slot.
+fn gen_field(fname: Text, base: Expr, ctx: Ctx) -> List[Int] {
+    let rname: Text = type_of(base, ctx);
+    let slot: Int = field_slot(ctx.recs, rname, fname);
+    // pop rax(ptr) ; mov rax,[rax + slot*8] ; push rax
+    return cat(gen(base, ctx), cat([88, 72, 139, 128], cat(le_s32(8 * slot), [80])));
 }
 
 // push(xs, x): a new list = xs with x appended (immutable). Emits a
@@ -690,8 +790,8 @@ fn prologue(frame: Int) -> List[Int] {
     return cat([85, 72, 137, 229, 72, 129, 236], le(frame, 4));
 }
 
-fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text]) -> List[Int] {
-    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets);
+fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl]) -> List[Int] {
+    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets, recs);
     let frame: Int = round16(8 * len(collect_locals(f.body, [])));
     // fall-through safety: xor eax, eax ; leave ; ret
     return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
@@ -714,7 +814,7 @@ fn entry_size() -> Int {
     return len(entry_stub(0));
 }
 
-fn fn_offsets(fns: List[Fn]) -> List[Int] {
+fn fn_offsets(fns: List[Fn], recs: List[RecDecl]) -> List[Int] {
     // pass A: lay functions out after the entry stub to get offsets. Sizes are
     // independent of the (empty) maps, since every imm is fixed-size.
     var offs: List[Int] = [];
@@ -724,19 +824,19 @@ fn fn_offsets(fns: List[Fn]) -> List[Int] {
         invariant i >= 0
     {
         offs = push(offs, acc);
-        acc = acc + len(gen_fn(fns[i], [], [], [], [], []));
+        acc = acc + len(gen_fn(fns[i], [], [], [], [], [], recs));
         i = i + 1;
     }
     return offs;
 }
 
-fn code_length(fns: List[Fn]) -> Int {
+fn code_length(fns: List[Fn], recs: List[RecDecl]) -> Int {
     var acc: Int = entry_size();
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
     {
-        acc = acc + len(gen_fn(fns[i], [], [], [], [], []));
+        acc = acc + len(gen_fn(fns[i], [], [], [], [], [], recs));
         i = i + 1;
     }
     return acc;
@@ -953,12 +1053,12 @@ fn fn_rets(fns: List[Fn]) -> List[Text] {
     return ts;
 }
 
-fn compile_program(fns: List[Fn]) -> List[Int] {
+fn compile_program(fns: List[Fn], recs: List[RecDecl]) -> List[Int] {
     let names: List[Text] = fn_names(fns);
-    let offs: List[Int] = fn_offsets(fns);
+    let offs: List[Int] = fn_offsets(fns, recs);
     let rets: List[Text] = fn_rets(fns);
     let strs: List[Text] = collect_strings(fns);
-    let data_base: Int = 4194480 + code_length(fns);
+    let data_base: Int = 4194480 + code_length(fns, recs);
     let saddrs: List[Int] = str_addrs(strs, data_base);
     let main_off: Int = lookup(names, offs, "main");
     var code: List[Int] = entry_stub(main_off);
@@ -966,24 +1066,14 @@ fn compile_program(fns: List[Fn]) -> List[Int] {
     while i < len(fns)
         invariant i >= 0
     {
-        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs, rets));
+        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs, rets, recs));
         i = i + 1;
     }
     return cat(code, str_data(strs));
 }
 
 // ---------------------------------------------------------------- support gate
-fn ty_simple(t: Ty) -> Bool {
-    match t {
-        TApp(name, args) => {
-            // scalars (one machine word) or a List (a heap pointer, one word).
-            let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit" or name == "Text");
-            return scalar or name == "List" and len(args) == 1;
-        }
-    }
-}
-
-fn supported(e: Expr) -> Bool {
+fn supported(e: Expr, ctx: Ctx) -> Bool {
     match e {
         EInt(n) => {
             return true;
@@ -995,35 +1085,57 @@ fn supported(e: Expr) -> Bool {
             return true;
         }
         EUn(op, kids) => {
-            return (op == "-" or op == "not") and supported(kids[0]);
+            return (op == "-" or op == "not") and supported(kids[0], ctx);
         }
         EBin(op, kids) => {
             let arith: Bool = op == "+" or op == "-" or op == "*" or op == "/" or op == "%";
             let logic: Bool = op == "and" or op == "or";
-            return (arith or logic or is_cmp(op)) and supported(kids[0]) and supported(kids[1]);
+            return (arith or logic or is_cmp(op)) and supported(kids[0], ctx) and supported(kids[1], ctx);
         }
         ECall(name, args) => {
-            return all_supported(args);
+            return all_supported(args, ctx);
         }
         EIndex(kids) => {
-            return supported(kids[0]) and supported(kids[1]);
+            return supported(kids[0], ctx) and supported(kids[1], ctx);
         }
         EList(items) => {
-            return all_supported(items);
+            return all_supported(items, ctx);
         }
         EIf(kids) => {
-            return supported(kids[0]) and supported(kids[1]) and supported(kids[2]);
+            return supported(kids[0], ctx) and supported(kids[1], ctx) and supported(kids[2], ctx);
         }
         EText(t) => {
             return true;
         }
         EField(name, kids) => {
-            return false;
+            // a field read is supported when the base is a known record and the
+            // field exists in its declaration.
+            let bt: Text = type_of(kids[0], ctx);
+            return rec_known(ctx.recs, bt) and field_slot(ctx.recs, bt, name) >= 0 and supported(kids[0], ctx);
         }
         ERecord(name, fields) => {
-            return false;
+            // a record literal is supported when the record is known, every
+            // field value is supported, and the literal names exactly the
+            // declared fields.
+            return rec_known(ctx.recs, name) and len(fields) == len(rec_fields(ctx.recs, name)) and fields_supported(name, fields, ctx);
         }
     }
+}
+
+fn fields_supported(rname: Text, fields: List[FieldVal], ctx: Ctx) -> Bool {
+    var i: Int = 0;
+    while i < len(fields)
+        invariant i >= 0
+    {
+        if field_slot(ctx.recs, rname, fields[i].fname) < 0 {
+            return false;
+        }
+        if not supported(fields[i].fval, ctx) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
 }
 
 fn is_text(e: Expr) -> Bool {
@@ -1067,12 +1179,12 @@ fn is_text(e: Expr) -> Bool {
     }
 }
 
-fn all_supported(args: List[Expr]) -> Bool {
+fn all_supported(args: List[Expr], ctx: Ctx) -> Bool {
     var i: Int = 0;
     while i < len(args)
         invariant i >= 0
     {
-        if not supported(args[i]) {
+        if not supported(args[i], ctx) {
             return false;
         }
         i = i + 1;
@@ -1080,12 +1192,12 @@ fn all_supported(args: List[Expr]) -> Bool {
     return true;
 }
 
-fn supported_block(stmts: List[Stmt]) -> Bool {
+fn supported_block(stmts: List[Stmt], ctx: Ctx) -> Bool {
     var i: Int = 0;
     while i < len(stmts)
         invariant i >= 0
     {
-        if not supported_stmt(stmts[i]) {
+        if not supported_stmt(stmts[i], ctx) {
             return false;
         }
         i = i + 1;
@@ -1093,37 +1205,37 @@ fn supported_block(stmts: List[Stmt]) -> Bool {
     return true;
 }
 
-fn supported_stmt(s: Stmt) -> Bool {
+fn supported_stmt(s: Stmt, ctx: Ctx) -> Bool {
     match s {
         SLet(n, t, e) => {
-            return supported(e);
+            return supported(e, ctx);
         }
         SVar(n, t, e) => {
-            return supported(e);
+            return supported(e, ctx);
         }
         SAssign(n, e) => {
-            return supported(e);
+            return supported(e, ctx);
         }
         SReturn(e) => {
-            return supported(e);
+            return supported(e, ctx);
         }
         SReturnVoid => {
             return true;
         }
         SExpr(e) => {
-            return supported(e);
+            return supported(e, ctx);
         }
         SBreak => {
             return false;
         }
         SIf(c, body) => {
-            return supported(c) and supported_block(body);
+            return supported(c, ctx) and supported_block(body, ctx);
         }
         SIfElse(c, t, e) => {
-            return supported(c) and supported_block(t) and supported_block(e);
+            return supported(c, ctx) and supported_block(t, ctx) and supported_block(e, ctx);
         }
         SWhile(c, invs, body) => {
-            return supported(c) and supported_block(body);
+            return supported(c, ctx) and supported_block(body, ctx);
         }
         SMatch(scrut, arms) => {
             return false;
@@ -1131,12 +1243,25 @@ fn supported_stmt(s: Stmt) -> Bool {
     }
 }
 
-fn params_ok(ps: List[Param]) -> Bool {
+// A type is one machine word if it is a scalar, a List (heap pointer), or a
+// known record (heap pointer).
+fn ty_simple(t: Ty, recs: List[RecDecl]) -> Bool {
+    match t {
+        TApp(name, args) => {
+            let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit" or name == "Text");
+            let list: Bool = name == "List" and len(args) == 1;
+            let rec: Bool = len(args) == 0 and rec_known(recs, name);
+            return scalar or list or rec;
+        }
+    }
+}
+
+fn params_ok(ps: List[Param], recs: List[RecDecl]) -> Bool {
     var i: Int = 0;
     while i < len(ps)
         invariant i >= 0
     {
-        if not ty_simple(ps[i].ty) {
+        if not ty_simple(ps[i].ty, recs) {
             return false;
         }
         i = i + 1;
@@ -1144,7 +1269,7 @@ fn params_ok(ps: List[Param]) -> Bool {
     return true;
 }
 
-fn supported_program(fns: List[Fn]) -> Bool {
+fn supported_program(fns: List[Fn], recs: List[RecDecl]) -> Bool {
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
@@ -1153,13 +1278,16 @@ fn supported_program(fns: List[Fn]) -> Bool {
         if len(f.tparams) != 0 {
             return false;
         }
-        if not ty_simple(f.ret) {
+        if not ty_simple(f.ret, recs) {
             return false;
         }
-        if not params_ok(f.params) {
+        if not params_ok(f.params, recs) {
             return false;
         }
-        if not supported_block(f.body) {
+        // build the function's type environment so field/record support can be
+        // decided; layout maps are not needed for type tags.
+        let ctx: Ctx = build_ctx(f, fn_names(fns), [], [], [], fn_rets(fns), recs);
+        if not supported_block(f.body, ctx) {
             return false;
         }
         i = i + 1;
@@ -1244,8 +1372,9 @@ fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.writ
     match parse_program(toks, 0, []) {
         ROk(prog, j) => {
             let fns: List[Fn] = prog.fns;
-            if supported_program(fns) {
-                let code: List[Int] = compile_program(fns);
+            let recs: List[RecDecl] = prog.recs;
+            if supported_program(fns, recs) {
+                let code: List[Int] = compile_program(fns, recs);
                 write_bytes(fs, out_path, elf(code));
                 print(console, "compiled " + str(len(fns)) + " function(s), " + str(len(code)) + " bytes");
             } else {
