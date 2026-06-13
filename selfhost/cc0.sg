@@ -1553,15 +1553,15 @@ fn arms_supported(arms: List[MatchArm], ctx: Ctx) -> Bool {
 }
 
 // A type is one machine word if it is a scalar, a List (heap pointer), or a
-// known record or enum (heap pointer).
+// known record or enum (heap pointer). Generic instances (List[Expr],
+// Res[Expr], Box[Int]) are erased to pointers, so the type arguments don't
+// matter — a record/enum is one word at any arity.
 fn ty_simple(t: Ty, recs: List[RecDecl], enums: List[EnumDecl]) -> Bool {
     match t {
         TApp(name, args) => {
             let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit" or name == "Text");
             let list: Bool = name == "List" and len(args) == 1;
-            let rec: Bool = len(args) == 0 and rec_known(recs, name);
-            let enm: Bool = len(args) == 0 and enum_known(enums, name);
-            return scalar or list or rec or enm;
+            return scalar or list or rec_known(recs, name) or enum_known(enums, name);
         }
     }
 }
@@ -1603,6 +1603,32 @@ fn supported_program(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) 
         i = i + 1;
     }
     return true;
+}
+
+// Diagnostic: the name of the first unsupported function plus a short reason,
+// or "" if everything is supported. Used by main to make the failure legible.
+fn first_unsupported(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) -> Text {
+    var i: Int = 0;
+    while i < len(fns)
+        invariant i >= 0
+    {
+        let f: Fn = fns[i];
+        if len(f.tparams) != 0 {
+            return f.name + ": generic function";
+        }
+        if not ty_simple(f.ret, recs, enums) {
+            return f.name + ": return type";
+        }
+        if not params_ok(f.params, recs, enums) {
+            return f.name + ": param type";
+        }
+        let ctx: Ctx = build_ctx(f, fn_names(fns), [], [], [], fn_rets(fns), recs, enums);
+        if not supported_block(f.body, ctx) {
+            return f.name + ": body";
+        }
+        i = i + 1;
+    }
+    return "";
 }
 
 // ---------------------------------------------------------------- ELF + main
@@ -1689,7 +1715,7 @@ fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.writ
                 write_bytes(fs, out_path, elf(code));
                 print(console, "compiled " + str(len(fns)) + " function(s), " + str(len(code)) + " bytes");
             } else {
-                print(console, "cc0: unsupported construct (stage 5)");
+                print(console, "cc0: unsupported construct -> " + first_unsupported(fns, recs, enums));
             }
         }
         RErr(m, p) => {
