@@ -22,7 +22,7 @@
 //
 // Usage: reads a source path on stdin, then an output path on the next line.
 use lexer { Token, lex }
-use parser { Expr, Fn, Param, Res, Stmt, Ty, parse_program }
+use parser { Expr, Fn, Param, Prog, Res, Stmt, Ty, parse_program }
 
 // Codegen context: the variable displacement map (this function) and the
 // function-address map (whole program).
@@ -1195,13 +1195,14 @@ fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.writ
     let out_path: Text = read_line(console);
     let toks: List[Token] = lex(read_file(fs, src_path));
     match parse_program(toks, 0, []) {
-        ROk(fns, j) => {
+        ROk(prog, j) => {
+            let fns: List[Fn] = prog.fns;
             if supported_program(fns) {
                 let code: List[Int] = compile_program(fns);
                 write_bytes(fs, out_path, elf(code));
                 print(console, "compiled " + str(len(fns)) + " function(s), " + str(len(code)) + " bytes");
             } else {
-                print(console, "cc0: unsupported construct (stage 3)");
+                print(console, "cc0: unsupported construct (stage 5)");
             }
         }
         RErr(m, p) => {

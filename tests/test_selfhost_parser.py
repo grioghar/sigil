@@ -134,8 +134,29 @@ def dump_fn(f) -> str:
             + dump_contracts(f.contracts) + " " + dump_block(f.body) + ")")
 
 
-def dump_program(fns) -> str:
-    return "(program" + "".join(" " + dump_fn(f) for f in fns) + ")"
+def dump_rec(r) -> str:
+    fields = "".join(f" (p {n} {t})" for n, t in r.fields)
+    return f"(record {r.name} " + dump_str_list("tparams", r.type_params) + f" (params{fields}))"
+
+
+def dump_enum(en) -> str:
+    vs = ""
+    for vname, payloads in en.variants:
+        ps = "".join(" " + str(t) for t in payloads)
+        vs += f" (v {vname} (payloads{ps}))"
+    return (f"(enum {en.name} " + dump_str_list("tparams", en.type_params)
+            + f" (variants{vs}))")
+
+
+def dump_program(prog) -> str:
+    out = "(program"
+    for r in prog.records:
+        out += " " + dump_rec(r)
+    for en in prog.enums:
+        out += " " + dump_enum(en)
+    for f in prog.functions:
+        out += " " + dump_fn(f)
+    return out + ")"
 
 
 def ref_expr(src: str) -> str:
@@ -149,7 +170,7 @@ def ref_block(src: str) -> str:
 
 
 def ref_program(src: str) -> str:
-    return dump_program(parse(src).functions)
+    return dump_program(parse(src))
 
 
 # Programs (each function has at most one effect, since effect-set ordering is
@@ -164,6 +185,13 @@ PROGRAM_CORPUS = [
     "fn pick(p: Pair[Int, Text]) -> Int { return 0; }",
     "fn ident[T](x: T) -> T { return x; }",
     "fn nothing() -> Unit { return; }",
+    "record Point { x: Int, y: Int }\n"
+    "fn area(p: Point) -> Int { return p.x * p.y; }",
+    "enum Step { Done, Fail }\nfn f(s: Step) -> Int { return 0; }",
+    "enum Res2 { Got(Int), Err(Text, Int) }\nrecord Pair { a: Int, b: Int }\n"
+    "fn g() -> Int { return 0; }",
+    "record Box[T] { item: T }\nenum Opt[T] { None, Some(T) }\n"
+    "fn h() -> Int { return 0; }",
 ]
 
 
