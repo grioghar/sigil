@@ -5,13 +5,50 @@ All notable changes to Sigil are recorded here. The format follows
 are grouped by the roadmap phase that introduced them (see
 [DESIGN.md](DESIGN.md)).
 
-## [Unreleased] — toward 1.0 (self-hosting)
+## [1.0.0] — Self-hosting
 
-1.0 is gated on **self-hosting**: the Sigil compiler written in Sigil,
-compiling itself. A language is not 1.0 until it compiles with its own
-toolchain. Work proceeds component by component in [selfhost/](selfhost),
-each conformance-tested against its Python counterpart. See
-[docs/SELFHOST.md](docs/SELFHOST.md).
+**A language is 1.0 when it compiles with its own toolchain.** Sigil now does.
+
+[cc0](selfhost/cc0.sg) is a Sigil compiler written in Sigil. It compiles a
+practical subset of Sigil — integer and boolean arithmetic, functions,
+recursion, `Text`, `List[T]`, records, enums and exhaustive `match`, generics,
+`if`/`while`, capabilities, and file I/O — directly to a **static x86-64 Linux
+ELF**, by hand-encoding machine instructions and wrapping them in an ELF with a
+writable heap segment. There is **no rustc, LLVM, assembler, linker, or libc**
+on the compile path: cc0 reads source via raw `read`/`open` syscalls, emits
+bytes via `write`, and exits via `exit`.
+
+The proof is a **byte-identical fixpoint**:
+
+1. The Python reference toolchain runs cc0 to compile cc0's own three sources
+   (`lexer.sg` + `parser.sg` + `cc0.sg`) into `cc0_stage1`.
+2. `cc0_stage1`, running natively, compiles the same sources into `cc0_stage2`.
+3. `cc0_stage1 == cc0_stage2`, byte for byte — and `cc0_stage3` (compiled by
+   stage 2) equals them too. The compiler reproduces itself exactly.
+
+`tests/test_selfhost_bootstrap.py` performs this fixpoint on Linux CI. The
+Python toolchain remains the reference semantics and the bootstrap compiler;
+the road past 1.0 (see [DESIGN.md](DESIGN.md)) widens cc0's accepted subset
+toward the full surface and adds the 1.1 source-to-Sigil translator.
+
+How cc0 was built, in committed increments:
+
+- **Native vertical slice → whole programs.** Expressions to exit codes; a
+  stack machine with hand-encoded x86-64; locals/params/`if`/`while`;
+  functions, parameters, calls, recursion via a two-pass absolute-address
+  layout; `print` via `write` with a rodata string section.
+- **A heap.** A second writable `PT_LOAD` segment with a bump allocator;
+  `List[Int]`, `push`, and heap `Text` (literals, `len`, `ord`, `==`, `+`,
+  `slice`) as `[len][…]` blocks; an efficient single-allocation `cat`.
+- **Type-directed lowering.** A `type_of` pass picks integer vs. `Text`
+  lowering for overloaded `==` and `+`.
+- **Records and enums.** Records as fixed-slot heap blocks with field access;
+  enums as `[tag][payload…]` blocks with tag-dispatched `match` and payload
+  binding; generic type arguments propagated through match binders.
+- **Self-host surface.** Multi-file compilation (declarations merge across
+  source files); capability params and `print(console, text)`; `chr`; and the
+  `read_file` / `write_bytes` / `read_line` syscall runtime — everything cc0's
+  own source needs.
 
 ## [0.9.0] — Language surface complete
 
@@ -35,9 +72,10 @@ Python, so this is 0.9, not 1.0:
 Everything below was developed over the preceding milestones, preserved here
 as the project's history.
 
-_Not yet, on the road past 0.9: self-hosting (the 1.0 gate); `let`-else
-destructuring; `?`-style error propagation; a shared standard library;
-`Float`; and a dependency-free distribution._
+_Self-hosting — the 1.0 gate — landed next (see the 1.0.0 section above). Still
+on the road past 1.0: widening cc0's accepted subset toward the full surface;
+`let`-else destructuring; `?`-style error propagation; a shared standard
+library; `Float`; and the 1.1 source-to-Sigil translator._
 
 ## [0.7] — Modules and imports
 
