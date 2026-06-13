@@ -162,6 +162,35 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_slice(self):
+        exit_cases = [
+            ('fn main() -> Int { let s: Text = slice("hello", 1, 4); '
+             'return len(s); }', 3),
+            ('fn main() -> Int { let s: Text = slice("hello", 1, 4); '
+             'if s == "ell" { return 1; } return 0; }', 1),
+            ('fn main() -> Int { let s: Text = slice("hello", 0, 1); '
+             'return ord(s); }', 104),
+            ('fn char_at(s: Text, i: Int) -> Text { return slice(s, i, i + 1); }\n'
+             'fn main() -> Int { return ord(char_at("ABC", 1)); }', 66),
+        ]
+        for prog, expected in exit_cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t), 'fn main() -> Int { '
+                         'print(slice("hello world", 6, 11)); return 0; }')
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            result = subprocess.run([str(exe)], capture_output=True)
+        self.assertEqual(result.stdout, b"world")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_text_concat(self):
         # type-directed +: Text concatenation. Exit-code cases first.
         exit_cases = [

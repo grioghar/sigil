@@ -518,6 +518,16 @@ fn copy_loop() -> List[Int] {
     return cat([72, 133, 201, 15, 132], cat(le_s32(18), cat([138, 6, 136, 7, 72, 255, 198, 72, 255, 199, 72, 255, 201, 233], le_s32(0 - 27))));
 }
 
+// slice(s, i, j): a new Text holding s's bytes [i, j). Allocate 8 + (j-i),
+// store the length, copy the range with the byte-copy loop. Returns a Text ptr.
+fn gen_slice(s: Expr, i: Expr, j: Expr, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(s, ctx), cat(gen(i, ctx), gen(j, ctx)));
+    // pop j,i,s ; r8 = j-i ; alloc 8+r8 -> r9 ; store len ;
+    // lea rsi,[s + i + 8] ; lea rdi,[r9+8] ; rcx = r8 (count)
+    let setup: List[Int] = cat([90, 89, 88, 73, 137, 208, 73, 41, 200, 73, 187], cat(le(6291456, 8), [77, 139, 11, 77, 137, 202, 77, 1, 194, 73, 131, 194, 8, 77, 137, 19, 77, 137, 1, 72, 141, 116, 8, 8, 73, 141, 121, 8, 76, 137, 193]));
+    return cat(code, cat(setup, cat(copy_loop(), [76, 137, 200, 80])));
+}
+
 // Text concatenation: a new [len][bytes] block holding a's bytes then b's.
 // Allocate 8 + len_a + len_b, store the length, copy a, then copy b (the dest
 // pointer rdi flows from the first copy into the second). Returns a Text ptr.
@@ -545,6 +555,9 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     }
     if name == "ord" {
         return gen_ord(args[0], ctx);
+    }
+    if name == "slice" {
+        return gen_slice(args[0], args[1], args[2], ctx);
     }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
     // add rsp, 8*nargs (drop args); push rax (result).
