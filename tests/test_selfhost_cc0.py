@@ -265,6 +265,20 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_chr(self):
+        # chr(n) is the inverse of ord: a one-byte Text holding n's low byte.
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t),
+                         "fn main(c: Console) -> Int { print(c, chr(72)); "
+                         "print(c, chr(105)); return ord(chr(67)); }")
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            r = subprocess.run([str(exe)], capture_output=True)
+        self.assertEqual(r.stdout, b"Hi")
+        self.assertEqual(r.returncode, 67)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_cat(self):
         # cat(a, b) for List[Int] is a single-allocation builtin (the efficient
         # counterpart to the source-level push loop).

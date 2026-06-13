@@ -919,6 +919,18 @@ fn gen_ord(arg: Expr, ctx: Ctx) -> List[Int] {
     return cat(gen(arg, ctx), [88, 15, 182, 64, 8, 80]);
 }
 
+// chr(n): a one-byte Text holding the low byte of n (the inverse of ord). Used
+// by the lexer's \u{..} escape decoder. Only the byte range is handled (enough
+// for the ASCII codepoints cc0's own source uses); a full UTF-8 encoder is not
+// needed on the self-host path.
+fn gen_chr(arg: Expr, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = gen(arg, ctx);
+    // alloc 16 bytes (rax = block) ; pop rcx (n) ; len = 1 ; byte = cl ; push
+    code = cat(code, alloc_const(16));
+    // pop rcx ; mov qword [rax], 1 ; mov [rax+8], cl ; push rax
+    return cat(code, [89, 72, 199, 0, 1, 0, 0, 0, 136, 72, 8, 80]);
+}
+
 // ---------------------------------------------------------------- syscall IO
 // Copy a Text value (pointer in rsi) into a fresh NUL-terminated C string on
 // the heap, leaving its pointer in rax (the heap bump pointer is advanced past
@@ -1069,6 +1081,9 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     }
     if name == "ord" {
         return gen_ord(args[0], ctx);
+    }
+    if name == "chr" {
+        return gen_chr(args[0], ctx);
     }
     if name == "slice" {
         return gen_slice(args[0], args[1], args[2], ctx);
