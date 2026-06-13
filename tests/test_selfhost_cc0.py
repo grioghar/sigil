@@ -219,6 +219,33 @@ class TestCc0(unittest.TestCase):
             exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
             self.assertEqual(subprocess.run([str(exe)]).returncode, 42)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_capability_programs(self):
+        # main may take Console/Fs capability params (phantom one-word values on
+        # bare metal), and print accepts the real print(console, text) form as
+        # well as the one-arg test form — the capability is ignored.
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t),
+                         'fn main(c: Console) -> Int { print(c, "hi\\n"); '
+                         'return 0; }')
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            r = subprocess.run([str(exe)], capture_output=True)
+        self.assertEqual(r.stdout, b"hi\n")
+        self.assertEqual(r.returncode, 0)
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t),
+                         'fn greet(c: Console, s: Text) -> Int { print(c, s); '
+                         'return 0; }\n'
+                         'fn main(c: Console, f: Fs) -> Int { '
+                         'let x: Int = greet(c, "yo\\n"); return 7; }')
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            r = subprocess.run([str(exe)], capture_output=True)
+        self.assertEqual(r.stdout, b"yo\n")
+        self.assertEqual(r.returncode, 7)
+
     def test_enum_program_compiles(self):
         with tempfile.TemporaryDirectory() as t:
             blob = self.compile(

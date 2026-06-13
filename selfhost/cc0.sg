@@ -782,12 +782,15 @@ fn gen_push(args: List[Expr], ctx: Ctx) -> List[Int] {
     return cat(code, cat(setup, cat(head, cat(loop, tail))));
 }
 
-// print(text) writes a Text value (any expression, not just a literal): the
-// value is a pointer to a [len][bytes] block, so write(1, ptr+8, [ptr]).
+// print writes a Text value (any expression) to stdout: the value is a pointer
+// to a [len][bytes] block, so write(1, ptr+8, [ptr]). The Text is the LAST
+// argument, so both print(text) [cc0's test subset] and print(console, text)
+// [real Sigil, used by cc0's own source] work — the console capability is a
+// phantom and is ignored.
 fn gen_print(args: List[Expr], ctx: Ctx) -> List[Int] {
     // pop rax ; lea rsi,[rax+8] ; mov rdx,[rax] ; mov edi,1 ; mov eax,1 ;
     // syscall ; push rax
-    return cat(gen(args[0], ctx), [88, 72, 141, 112, 8, 72, 139, 16, 191, 1, 0, 0, 0, 184, 1, 0, 0, 0, 15, 5, 80]);
+    return cat(gen(args[len(args) - 1], ctx), [88, 72, 141, 112, 8, 72, 139, 16, 191, 1, 0, 0, 0, 184, 1, 0, 0, 0, 15, 5, 80]);
 }
 
 fn gen_ord(arg: Expr, ctx: Ctx) -> List[Int] {
@@ -1561,7 +1564,10 @@ fn ty_simple(t: Ty, recs: List[RecDecl], enums: List[EnumDecl]) -> Bool {
         TApp(name, args) => {
             let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit" or name == "Text");
             let list: Bool = name == "List" and len(args) == 1;
-            return scalar or list or rec_known(recs, name) or enum_known(enums, name);
+            // capabilities are phantom on bare metal: a one-word placeholder
+            // that is only ever passed to a syscall builtin, never inspected.
+            let cap: Bool = len(args) == 0 and (name == "Console" or name == "Fs");
+            return scalar or list or cap or rec_known(recs, name) or enum_known(enums, name);
         }
     }
 }
@@ -1780,13 +1786,13 @@ fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.writ
             if supported_program(fns, recs, enums) {
                 let code: List[Int] = compile_program(fns, recs, enums);
                 write_bytes(fs, out_path, elf(code));
-                print(console, "compiled " + str(len(fns)) + " function(s), " + str(len(code)) + " bytes");
+                print(console, "compiled");
             } else {
                 print(console, "cc0: unsupported construct -> " + first_unsupported(fns, recs, enums));
             }
         }
         RErr(m, p) => {
-            print(console, "parse error: " + m + " @ " + str(p));
+            print(console, "parse error: " + m);
         }
     }
 }
