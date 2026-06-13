@@ -1701,11 +1701,78 @@ fn elf(code: List[Int]) -> List[Int] {
     return cat(out, code);
 }
 
-fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.write} {
-    let src_path: Text = read_line(console);
-    let out_path: Text = read_line(console);
-    let toks: List[Token] = lex(read_file(fs, src_path));
+// --------------------------------------------------------------- multi-file
+// A program may span several source files (cc0's own source is lexer.sg +
+// parser.sg + cc0.sg). cc0 reads the output path, then one source path per
+// line until end of input, parses each file (use/pub headers are skipped by
+// the parser, so cross-file types just merge), and concatenates all the
+// declarations into one program before compiling.
+fn read_paths(console: Console, acc: List[Text]) -> List[Text] ! {io.read} {
+    let p: Text = read_line(console);
+    if p == "" {
+        return acc;
+    }
+    return read_paths(console, push(acc, p));
+}
+
+fn append_fns(a: List[Fn], b: List[Fn]) -> List[Fn] {
+    var out: List[Fn] = a;
+    var i: Int = 0;
+    while i < len(b)
+        invariant i >= 0
+    {
+        out = push(out, b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn append_recs(a: List[RecDecl], b: List[RecDecl]) -> List[RecDecl] {
+    var out: List[RecDecl] = a;
+    var i: Int = 0;
+    while i < len(b)
+        invariant i >= 0
+    {
+        out = push(out, b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn append_enums(a: List[EnumDecl], b: List[EnumDecl]) -> List[EnumDecl] {
+    var out: List[EnumDecl] = a;
+    var i: Int = 0;
+    while i < len(b)
+        invariant i >= 0
+    {
+        out = push(out, b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Parse every source file and merge all declarations into one program; the
+// first parse error (if any) is returned.
+fn load_merge(fs: Fs, paths: List[Text], acc: Prog, idx: Int) -> Res[Prog] ! {fs.read} {
+    if idx >= len(paths) {
+        return ROk(acc, 0);
+    }
+    let toks: List[Token] = lex(read_file(fs, paths[idx]));
     match parse_program(toks, 0, []) {
+        ROk(prog, j) => {
+            let merged: Prog = Prog { fns: append_fns(acc.fns, prog.fns), recs: append_recs(acc.recs, prog.recs), enums: append_enums(acc.enums, prog.enums) };
+            return load_merge(fs, paths, merged, idx + 1);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.write} {
+    let out_path: Text = read_line(console);
+    let paths: List[Text] = read_paths(console, []);
+    match load_merge(fs, paths, Prog { fns: [], recs: [], enums: [] }, 0) {
         ROk(prog, j) => {
             let fns: List[Fn] = prog.fns;
             let recs: List[RecDecl] = prog.recs;

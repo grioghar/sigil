@@ -65,8 +65,26 @@ class TestCc0(unittest.TestCase):
         os.chdir(tmp)
         try:
             Interpreter(self.program, self.sigs,
-                        stdin=io.StringIO("e.sg\nout.bin\n"),
+                        stdin=io.StringIO("out.bin\ne.sg\n"),
                         stdout=out).run_main()
+        finally:
+            os.chdir(old)
+        self.assertIn("compiled", out.getvalue(), out.getvalue())
+        return (tmp / "out.bin").read_bytes()
+
+    def compile_multi(self, tmp: Path, files: dict) -> bytes:
+        # files: {name: source}; compiled together (cc0 merges declarations
+        # across files, skipping use/pub headers). stdin = out path then one
+        # source path per line, in the given order.
+        for name, text in files.items():
+            (tmp / name).write_text(text, encoding="utf-8")
+        stdin = "out.bin\n" + "\n".join(files.keys()) + "\n"
+        out = io.StringIO()
+        old = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Interpreter(self.program, self.sigs,
+                        stdin=io.StringIO(stdin), stdout=out).run_main()
         finally:
             os.chdir(old)
         self.assertIn("compiled", out.getvalue(), out.getvalue())
@@ -93,7 +111,7 @@ class TestCc0(unittest.TestCase):
             os.chdir(t)
             try:
                 Interpreter(self.program, self.sigs,
-                            stdin=io.StringIO("e.sg\nout.bin\n"),
+                            stdin=io.StringIO("out.bin\ne.sg\n"),
                             stdout=out).run_main()
             finally:
                 os.chdir(old)
@@ -162,6 +180,44 @@ class TestCc0(unittest.TestCase):
                     exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
                     result = subprocess.run([str(exe)])
                 self.assertEqual(result.returncode, expected)
+
+    def test_multifile_program_compiles(self):
+        with tempfile.TemporaryDirectory() as t:
+            blob = self.compile_multi(Path(t), {
+                "a.sg": "record Pt { x: Int, y: Int }\n",
+                "b.sg": "use a { Pt }\n"
+                        "fn main() -> Int { let p: Pt = Pt { x: 40, y: 2 }; "
+                        "return p.x + p.y; }\n",
+            })
+        self.assertEqual(blob[:4], b"\x7fELF")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_multifile_programs(self):
+        # declarations merge across files; use/pub headers are skipped, so a
+        # type defined in one file is usable from another.
+        with tempfile.TemporaryDirectory() as t:
+            self.compile_multi(Path(t), {
+                "a.sg": "record Pt { x: Int, y: Int }\n",
+                "b.sg": "use a { Pt }\n"
+                        "fn main() -> Int { let p: Pt = Pt { x: 40, y: 2 }; "
+                        "return p.x + p.y; }\n",
+            })
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            self.assertEqual(subprocess.run([str(exe)]).returncode, 42)
+        with tempfile.TemporaryDirectory() as t:
+            self.compile_multi(Path(t), {
+                "ea.sg": "enum Opt { None, Some(Int) }\n",
+                "eb.sg": "use ea { Opt }\n"
+                         "fn unwrap(o: Opt) -> Int { match o { Some(v) => "
+                         "{ return v; } None => { return 0; } } }\n",
+                "ec.sg": "use ea { Opt }\nuse eb { unwrap }\n"
+                         "fn main() -> Int { return unwrap(Some(42)); }\n",
+            })
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            self.assertEqual(subprocess.run([str(exe)]).returncode, 42)
 
     def test_enum_program_compiles(self):
         with tempfile.TemporaryDirectory() as t:
