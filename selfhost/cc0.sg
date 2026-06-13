@@ -214,6 +214,9 @@ fn collect_stmt_locals(s: Stmt, acc: List[Text]) -> List[Text] {
         SWhile(c, invs, body) => {
             return collect_locals(body, acc);
         }
+        SMatch(scrut, arms) => {
+            return acc;
+        }
         SAssign(n, e) => {
             return acc;
         }
@@ -260,6 +263,9 @@ fn collect_stmt_tags(s: Stmt, acc: List[Text]) -> List[Text] {
         }
         SWhile(c, invs, body) => {
             return collect_local_tags(body, acc);
+        }
+        SMatch(scrut, arms) => {
+            return acc;
         }
         SAssign(n, e) => {
             return acc;
@@ -655,6 +661,9 @@ fn gen_stmt(s: Stmt, ctx: Ctx) -> List[Int] {
             let back: Int = 0 - (len(test) + 6 + len(body_code) + 5);
             return cat(test, cat(jz(len(body_code) + 5), cat(body_code, jmp(back))));
         }
+        SMatch(scrut, arms) => {
+            return [];
+        }
     }
 }
 
@@ -837,6 +846,9 @@ fn collect_str_stmt(s: Stmt, acc: List[Text]) -> List[Text] {
         }
         SWhile(c, invs, body) => {
             return collect_str_block(body, collect_str_expr(c, acc));
+        }
+        SMatch(scrut, arms) => {
+            return acc;
         }
     }
 }
@@ -1065,6 +1077,9 @@ fn supported_stmt(s: Stmt) -> Bool {
         }
         SWhile(c, invs, body) => {
             return supported(c) and supported_block(body);
+        }
+        SMatch(scrut, arms) => {
+            return false;
         }
     }
 }

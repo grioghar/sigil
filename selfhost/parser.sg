@@ -59,6 +59,15 @@ pub enum Stmt {
     SIf(Expr, List[Stmt]),
     SIfElse(Expr, List[Stmt], List[Stmt]),
     SWhile(Expr, List[Expr], List[Stmt]),
+    SMatch(Expr, List[MatchArm]),
+}
+
+// One arm of a match statement: `Variant(b1, b2) => { body }`. The variant
+// "_" is the wildcard. Payload binders are empty for a nullary variant.
+pub record MatchArm {
+    variant: Text,
+    binders: List[Text],
+    body: List[Stmt],
 }
 
 pub record Param {
@@ -473,6 +482,9 @@ fn parse_stmt(toks: List[Token], i: Int) -> Res[Stmt] {
     if k == "while" {
         return parse_while(toks, i);
     }
+    if k == "match" {
+        return parse_match(toks, i);
+    }
     if k == "IDENT" and tkind(toks, i + 1) == "=" {
         let name: Text = tval(toks, i);
         match parse_expr(toks, i + 2) {
@@ -608,6 +620,84 @@ fn parse_invariants(toks: List[Token], cond: Expr, i: Int, invs: List[Expr]) -> 
             return RErr(m, p);
         }
     }
+}
+
+fn parse_match(toks: List[Token], i: Int) -> Res[Stmt] {
+    match parse_expr(toks, i + 1) {
+        ROk(scrut, j) => {
+            if tkind(toks, j) != "{" {
+                return RErr("expected { after match scrutinee", j);
+            }
+            return parse_arms(toks, scrut, j + 1, []);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_arms(toks: List[Token], scrut: Expr, i: Int, acc: List[MatchArm]) -> Res[Stmt] {
+    if tkind(toks, i) == "}" {
+        return ROk(SMatch(scrut, acc), i + 1);
+    }
+    match parse_arm(toks, i) {
+        ROk(arm, j) => {
+            return parse_arms(toks, scrut, j, push(acc, arm));
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+// A match arm: pattern "=>" block. The pattern is a variant name (possibly the
+// wildcard "_") with optional "(" binder, ... ")".
+fn parse_arm(toks: List[Token], i: Int) -> Res[MatchArm] {
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected a pattern (variant name or _)", i);
+    }
+    let variant: Text = tval(toks, i);
+    var binders: List[Text] = [];
+    var j: Int = i + 1;
+    if tkind(toks, j) == "(" {
+        match parse_binders(toks, j + 1, []) {
+            ROk(bs, k) => {
+                binders = bs;
+                j = k;
+            }
+            RErr(m, p) => {
+                return RErr(m, p);
+            }
+        }
+    }
+    if tkind(toks, j) != "=>" {
+        return RErr("expected => in match arm", j);
+    }
+    match parse_block(toks, j + 1) {
+        ROk(body, k) => {
+            return ROk(MatchArm { variant: variant, binders: binders, body: body }, k);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
+}
+
+fn parse_binders(toks: List[Token], i: Int, acc: List[Text]) -> Res[List[Text]] {
+    if tkind(toks, i) == ")" {
+        return ROk(acc, i + 1);
+    }
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected a binder name", i);
+    }
+    let acc2: List[Text] = push(acc, tval(toks, i));
+    if tkind(toks, i + 1) == "," {
+        return parse_binders(toks, i + 2, acc2);
+    }
+    if tkind(toks, i + 1) == ")" {
+        return ROk(acc2, i + 2);
+    }
+    return RErr("expected , or ) in binders", i + 1);
 }
 
 // ---------------------------------------------------------------- declarations
@@ -920,7 +1010,35 @@ fn dump_stmt(s: Stmt) -> Text {
         SWhile(c, invs, body) => {
             return "(while " + dump_expr(c) + " (invs" + dump_expr_list(invs) + ") " + dump_block(body) + ")";
         }
+        SMatch(scrut, arms) => {
+            return "(match " + dump_expr(scrut) + dump_arms(arms) + ")";
+        }
     }
+}
+
+fn dump_arms(arms: List[MatchArm]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(arms)
+        invariant i >= 0
+    {
+        let a: MatchArm = arms[i];
+        out = out + " (arm " + a.variant + " (binders" + dump_str_seq(a.binders) + ") " + dump_block(a.body) + ")";
+        i = i + 1;
+    }
+    return out;
+}
+
+fn dump_str_seq(xs: List[Text]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(xs)
+        invariant i >= 0
+    {
+        out = out + " " + xs[i];
+        i = i + 1;
+    }
+    return out;
 }
 
 fn dump_str_list(label: Text, xs: List[Text]) -> Text {

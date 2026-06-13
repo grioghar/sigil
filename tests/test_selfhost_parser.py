@@ -47,6 +47,10 @@ BLOCK_CORPUS = [
     "{ let p: Pair[Int, Text] = q; return 0; }",
     "{ let t: Text = \"hi\"; return 0; }",
     "{ let n: Int = - x + len(ys); return n; }",
+    "{ match s { Done(v, k) => { return v; } Fail(m, p) => { return p; } } }",
+    "{ match x { A => { return 1; } _ => { return 0; } } }",
+    "{ match opt { Some(v) => { let y: Int = v; return y; } None => { return 0; } } }",
+    "{ match e { Leaf => { return 0; } Node(a, b, c) => { return a + b + c; } } }",
 ]
 
 
@@ -100,6 +104,13 @@ def dump_stmt(s) -> str:
     if isinstance(s, A.While):
         invs = "".join(" " + dump_expr(c.expr) for c in s.invariants)
         return f"(while {dump_expr(s.cond)} (invs{invs}) {dump_block(s.body)})"
+    if isinstance(s, A.Match):
+        arms = ""
+        for a in s.arms:
+            variant = a.variant if a.variant is not None else "_"
+            binders = "".join(" " + b for b in a.binders)
+            arms += f" (arm {variant} (binders{binders}) {dump_block(a.body)})"
+        return f"(match {dump_expr(s.scrutinee)}{arms})"
     raise AssertionError(f"unhandled stmt {type(s).__name__}")
 
 
