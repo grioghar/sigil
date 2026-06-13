@@ -48,6 +48,12 @@ fn ty_tag(t: Ty) -> Text {
             if name == "List" and len(args) == 1 {
                 return "List:" + ty_tag(args[0]);
             }
+            // a generic record/enum instance carries its first type argument as
+            // "Name|Arg" (e.g. Res[Prog] -> "Res|Prog") so a match can recover
+            // what a type-variable payload was instantiated to.
+            if len(args) == 1 {
+                return name + "|" + ty_tag(args[0]);
+            }
             return name;
         }
     }
@@ -112,6 +118,35 @@ fn field_ty_tag(recs: List[RecDecl], rname: Text, fname: Text) -> Text {
         i = i + 1;
     }
     return "Int";
+}
+
+// The base name of a type tag, dropping a generic argument: "Res|Prog" -> "Res"
+// (but "List:Int" keeps its ":" form, which the List paths already understand).
+fn gen_base(tag: Text) -> Text {
+    var i: Int = 0;
+    while i < len(tag)
+        invariant i >= 0
+    {
+        if ord(slice(tag, i, i + 1)) == 124 {
+            return slice(tag, 0, i);
+        }
+        i = i + 1;
+    }
+    return tag;
+}
+
+// The generic argument of a type tag ("Res|Prog" -> "Prog"), or "" if none.
+fn gen_arg(tag: Text) -> Text {
+    var i: Int = 0;
+    while i < len(tag)
+        invariant i >= 0
+    {
+        if ord(slice(tag, i, i + 1)) == 124 {
+            return slice(tag, i + 1, len(tag));
+        }
+        i = i + 1;
+    }
+    return "";
 }
 
 // Enum layout: a variant value is a heap block [tag][payload0][payload1]...,
@@ -265,7 +300,7 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             return elem_tag(type_of(kids[0], ctx));
         }
         EField(name, kids) => {
-            let bt: Text = type_of(kids[0], ctx);
+            let bt: Text = gen_base(type_of(kids[0], ctx));
             if rec_known(ctx.recs, bt) {
                 return field_ty_tag(ctx.recs, bt, name);
             }
@@ -433,19 +468,23 @@ fn push_all(acc: List[Text], xs: List[Text]) -> List[Text] {
     return out;
 }
 
-fn collect_local_tags(stmts: List[Stmt], acc: List[Text], enums: List[EnumDecl]) -> List[Text] {
+// The local type tags are collected in lockstep with collect_locals. A match
+// scrutinee is typed against `pctx` (a params-only environment, enough for the
+// scrutinee — a call or a parameter) so a type-variable payload binder gets the
+// concrete instantiation: matching a Res[Prog] binds ROk's T payload as Prog.
+fn collect_local_tags(stmts: List[Stmt], acc: List[Text], enums: List[EnumDecl], pctx: Ctx) -> List[Text] {
     var out: List[Text] = acc;
     var i: Int = 0;
     while i < len(stmts)
         invariant i >= 0
     {
-        out = collect_stmt_tags(stmts[i], out, enums);
+        out = collect_stmt_tags(stmts[i], out, enums, pctx);
         i = i + 1;
     }
     return out;
 }
 
-fn collect_stmt_tags(s: Stmt, acc: List[Text], enums: List[EnumDecl]) -> List[Text] {
+fn collect_stmt_tags(s: Stmt, acc: List[Text], enums: List[EnumDecl], pctx: Ctx) -> List[Text] {
     match s {
         SLet(n, t, e) => {
             return push(acc, ty_tag(t));
@@ -454,24 +493,26 @@ fn collect_stmt_tags(s: Stmt, acc: List[Text], enums: List[EnumDecl]) -> List[Te
             return push(acc, ty_tag(t));
         }
         SIf(c, body) => {
-            return collect_local_tags(body, acc, enums);
+            return collect_local_tags(body, acc, enums, pctx);
         }
         SIfElse(c, t, e) => {
-            return collect_local_tags(e, collect_local_tags(t, acc, enums), enums);
+            return collect_local_tags(e, collect_local_tags(t, acc, enums, pctx), enums, pctx);
         }
         SWhile(c, invs, body) => {
-            return collect_local_tags(body, acc, enums);
+            return collect_local_tags(body, acc, enums, pctx);
         }
         SMatch(scrut, arms) => {
             // binder tags = the matched variant's payload types, parallel to the
-            // binder names collected in collect_stmt_locals.
+            // binder names collected in collect_stmt_locals; the scrutinee's
+            // generic argument instantiates type-variable payloads.
+            let arg: Text = gen_arg(type_of(scrut, pctx));
             var out: List[Text] = acc;
             var a: Int = 0;
             while a < len(arms)
                 invariant a >= 0
             {
-                out = arm_binder_tags(arms[a], out, enums);
-                out = collect_local_tags(arms[a].body, out, enums);
+                out = arm_binder_tags(arms[a], out, enums, arg);
+                out = collect_local_tags(arms[a].body, out, enums, pctx);
                 a = a + 1;
             }
             return out;
@@ -494,16 +535,66 @@ fn collect_stmt_tags(s: Stmt, acc: List[Text], enums: List[EnumDecl]) -> List[Te
     }
 }
 
-fn arm_binder_tags(arm: MatchArm, acc: List[Text], enums: List[EnumDecl]) -> List[Text] {
+fn arm_binder_tags(arm: MatchArm, acc: List[Text], enums: List[EnumDecl], scrut_arg: Text) -> List[Text] {
     var out: List[Text] = acc;
     var k: Int = 0;
     while k < len(arm.binders)
         invariant k >= 0
     {
-        out = push(out, payload_tag(enums, arm.variant, k));
+        out = push(out, binder_tag(enums, arm.variant, k, scrut_arg));
         k = k + 1;
     }
     return out;
+}
+
+fn ty_name(t: Ty) -> Text {
+    match t {
+        TApp(name, args) => {
+            return name;
+        }
+    }
+}
+
+fn is_in(xs: List[Text], x: Text) -> Bool {
+    var i: Int = 0;
+    while i < len(xs)
+        invariant i >= 0
+    {
+        if xs[i] == x {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The tag of variant `vname`'s k-th payload, substituting the enum's type
+// variable with `scrut_arg` (the scrutinee's generic instantiation).
+fn binder_tag(enums: List[EnumDecl], vname: Text, k: Int, scrut_arg: Text) -> Text {
+    var i: Int = 0;
+    while i < len(enums)
+        invariant i >= 0
+    {
+        let vs: List[Variant] = enums[i].variants;
+        var j: Int = 0;
+        while j < len(vs)
+            invariant j >= 0
+        {
+            if vs[j].name == vname {
+                if k < len(vs[j].payloads) {
+                    let pt: Ty = vs[j].payloads[k];
+                    if is_in(enums[i].tparams, ty_name(pt)) and scrut_arg != "" {
+                        return scrut_arg;
+                    }
+                    return ty_tag(pt);
+                }
+                return "Int";
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return "Int";
 }
 
 // Build the per-function variable map: params above rbp, locals below, with a
@@ -523,8 +614,11 @@ fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], sa
         vt = push(vt, ty_tag(f.params[i].ty));
         i = i + 1;
     }
+    // params-only environment for typing match scrutinees while the local tags
+    // are still being collected.
+    let pctx: Ctx = Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets, recs: recs, enums: enums };
     let locals: List[Text] = collect_locals(f.body, []);
-    let ltags: List[Text] = collect_local_tags(f.body, [], enums);
+    let ltags: List[Text] = collect_local_tags(f.body, [], enums, pctx);
     var j: Int = 0;
     while j < len(locals)
         invariant j >= 0
@@ -758,7 +852,7 @@ fn gen_enum(vname: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
 
 // Field access `base.field`: evaluate base to a record pointer, load the slot.
 fn gen_field(fname: Text, base: Expr, ctx: Ctx) -> List[Int] {
-    let rname: Text = type_of(base, ctx);
+    let rname: Text = gen_base(type_of(base, ctx));
     let slot: Int = field_slot(ctx.recs, rname, fname);
     // pop rax(ptr) ; mov rax,[rax + slot*8] ; push rax
     return cat(gen(base, ctx), cat([88, 72, 139, 128], cat(le_s32(8 * slot), [80])));
@@ -1384,7 +1478,7 @@ fn supported(e: Expr, ctx: Ctx) -> Bool {
         EField(name, kids) => {
             // a field read is supported when the base is a known record and the
             // field exists in its declaration.
-            let bt: Text = type_of(kids[0], ctx);
+            let bt: Text = gen_base(type_of(kids[0], ctx));
             return rec_known(ctx.recs, bt) and field_slot(ctx.recs, bt, name) >= 0 and supported(kids[0], ctx);
         }
         ERecord(name, fields) => {
@@ -1515,7 +1609,7 @@ fn supported_stmt(s: Stmt, ctx: Ctx) -> Bool {
             // a match is supported when the scrutinee is a known enum and every
             // arm names a variant (or wildcard) with the right binder count and
             // a supported body.
-            return enum_known(ctx.enums, type_of(scrut, ctx)) and supported(scrut, ctx) and arms_supported(arms, ctx);
+            return enum_known(ctx.enums, gen_base(type_of(scrut, ctx))) and supported(scrut, ctx) and arms_supported(arms, ctx);
         }
     }
 }

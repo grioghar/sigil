@@ -219,6 +219,50 @@ class TestCc0(unittest.TestCase):
             exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
             self.assertEqual(subprocess.run([str(exe)]).returncode, 42)
 
+    def test_generic_enum_compiles(self):
+        with tempfile.TemporaryDirectory() as t:
+            blob = self.compile(
+                Path(t),
+                "record Box { v: Int }\n"
+                "enum Res[T] { ROk(T, Int), RErr(Text, Int) }\n"
+                "fn mk(n: Int) -> Res[Box] { return ROk(Box { v: n }, 0); }\n"
+                "fn run(n: Int) -> Int { match mk(n) { ROk(b, j) => "
+                "{ return b.v; } RErr(m, p) => { return 0; } } }\n"
+                "fn main() -> Int { return run(42); }")
+        self.assertEqual(blob[:4], b"\x7fELF")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_generic_enum_programs(self):
+        # generic enums are pointer-erased, but a type-variable payload binder
+        # must still resolve to its concrete record/Text so field access and
+        # type-directed ops lower correctly. The scrutinee's instantiation
+        # (Res[Box]) flows to the binder: ROk's T payload binds as Box.
+        cases = [
+            # record payload used concretely (b.v) after the match
+            ("record Box { v: Int }\n"
+             "enum Res[T] { ROk(T, Int), RErr(Text, Int) }\n"
+             "fn mk(n: Int) -> Res[Box] { return ROk(Box { v: n }, 0); }\n"
+             "fn run(n: Int) -> Int { match mk(n) { ROk(b, j) => "
+             "{ return b.v; } RErr(m, p) => { return 0; } } }\n"
+             "fn main() -> Int { return run(42); }", 42),
+            # the Text payload of the other arm lowers len()/+ correctly
+            ('record Box { v: Int }\n'
+             'enum Res[T] { ROk(T, Int), RErr(Text, Int) }\n'
+             'fn mk() -> Res[Box] { return RErr("err", 3); }\n'
+             'fn run() -> Int { match mk() { ROk(b, j) => { return b.v; } '
+             'RErr(m, p) => { return len(m) + p; } } }\n'
+             'fn main() -> Int { return run(); }', 6),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
     def test_emitted_capability_programs(self):
