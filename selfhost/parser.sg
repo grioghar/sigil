@@ -45,6 +45,13 @@ pub enum Expr {
     EField(Text, List[Expr]),
     EList(List[Expr]),
     EIf(List[Expr]),
+    ERecord(Text, List[FieldVal]),
+}
+
+// One field of a record literal: `name: value`.
+pub record FieldVal {
+    fname: Text,
+    fval: Expr,
 }
 
 // cond, then-body
@@ -439,9 +446,51 @@ fn parse_primary(toks: List[Token], i: Int) -> Res[Expr] {
         if tkind(toks, i + 1) == "(" {
             return parse_args(toks, name, i + 2, []);
         }
+        // Name { field: value, ... } is a record literal, but only for an
+        // Uppercase name — a lowercase `x {` keeps x a variable so `if x {`
+        // and `while x {` parse as control flow, not a record literal.
+        if tkind(toks, i + 1) == "{" and is_upper(name) {
+            return parse_fields_lit(toks, name, i + 2, []);
+        }
         return ROk(EVar(name), i + 1);
     }
     return RErr("unexpected token", i);
+}
+
+fn is_upper(name: Text) -> Bool {
+    if len(name) == 0 {
+        return false;
+    }
+    let c: Int = ord(slice(name, 0, 1));
+    return c >= 65 and c <= 90;
+}
+
+fn parse_fields_lit(toks: List[Token], name: Text, i: Int, acc: List[FieldVal]) -> Res[Expr] {
+    if tkind(toks, i) == "}" {
+        return ROk(ERecord(name, acc), i + 1);
+    }
+    if tkind(toks, i) != "IDENT" {
+        return RErr("expected a field name in record literal", i);
+    }
+    let fname: Text = tval(toks, i);
+    if tkind(toks, i + 1) != ":" {
+        return RErr("expected : in record literal field", i + 1);
+    }
+    match parse_expr(toks, i + 2) {
+        ROk(val, j) => {
+            let acc2: List[FieldVal] = push(acc, FieldVal { fname: fname, fval: val });
+            if tkind(toks, j) == "," {
+                return parse_fields_lit(toks, name, j + 1, acc2);
+            }
+            if tkind(toks, j) == "}" {
+                return ROk(ERecord(name, acc2), j + 1);
+            }
+            return RErr("expected , or } in record literal", j);
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
 }
 
 fn parse_args(toks: List[Token], name: Text, i: Int, acc: List[Expr]) -> Res[Expr] {
@@ -1188,7 +1237,22 @@ fn dump_expr(e: Expr) -> Text {
         EIf(kids) => {
             return "(if-expr " + dump_expr(kids[0]) + " " + dump_expr(kids[1]) + " " + dump_expr(kids[2]) + ")";
         }
+        ERecord(name, fields) => {
+            return "(record-lit " + name + dump_fieldvals(fields) + ")";
+        }
     }
+}
+
+fn dump_fieldvals(fields: List[FieldVal]) -> Text {
+    var out: Text = "";
+    var i: Int = 0;
+    while i < len(fields)
+        invariant i >= 0
+    {
+        out = out + " (f " + fields[i].fname + " " + dump_expr(fields[i].fval) + ")";
+        i = i + 1;
+    }
+    return out;
 }
 
 fn dump_expr_list(xs: List[Expr]) -> Text {

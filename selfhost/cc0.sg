@@ -22,7 +22,7 @@
 //
 // Usage: reads a source path on stdin, then an output path on the next line.
 use lexer { Token, lex }
-use parser { Expr, Fn, Param, Prog, Res, Stmt, Ty, parse_program }
+use parser { Expr, FieldVal, Fn, Param, Prog, Res, Stmt, Ty, parse_program }
 
 // Codegen context: the variable displacement map (this function) and the
 // function-address map (whole program).
@@ -109,6 +109,9 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
         }
         EIf(kids) => {
             return type_of(kids[1], ctx);
+        }
+        ERecord(name, fields) => {
+            return "Record:" + name;
         }
     }
 }
@@ -420,6 +423,10 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             let then_code: List[Int] = gen(kids[1], ctx);
             let else_code: List[Int] = gen(kids[2], ctx);
             return cat(head, cat(then_code, cat(jmp(len(else_code)), else_code)));
+        }
+        ERecord(name, fields) => {
+            // record codegen is a later increment; rejected by supported() today.
+            return [];
         }
         EText(t) => {
             // a Text value is a pointer to its [len][bytes] block in rodata.
@@ -801,7 +808,22 @@ fn collect_str_expr(e: Expr, acc: List[Text]) -> List[Text] {
         EIf(kids) => {
             return collect_str_expr(kids[2], collect_str_expr(kids[1], collect_str_expr(kids[0], acc)));
         }
+        ERecord(name, fields) => {
+            return collect_str_fields(fields, acc);
+        }
     }
+}
+
+fn collect_str_fields(fields: List[FieldVal], acc: List[Text]) -> List[Text] {
+    var out: List[Text] = acc;
+    var i: Int = 0;
+    while i < len(fields)
+        invariant i >= 0
+    {
+        out = collect_str_expr(fields[i].fval, out);
+        i = i + 1;
+    }
+    return out;
 }
 
 fn collect_str_args(args: List[Expr], acc: List[Text]) -> List[Text] {
@@ -998,6 +1020,9 @@ fn supported(e: Expr) -> Bool {
         EField(name, kids) => {
             return false;
         }
+        ERecord(name, fields) => {
+            return false;
+        }
     }
 }
 
@@ -1034,6 +1059,9 @@ fn is_text(e: Expr) -> Bool {
             return false;
         }
         EIf(kids) => {
+            return false;
+        }
+        ERecord(name, fields) => {
             return false;
         }
     }
