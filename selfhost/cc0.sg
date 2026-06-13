@@ -107,6 +107,9 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             }
             return "List:" + type_of(items[0], ctx);
         }
+        EIf(kids) => {
+            return type_of(kids[1], ctx);
+        }
     }
 }
 
@@ -410,6 +413,13 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
         }
         EList(items) => {
             return gen_list(items, ctx);
+        }
+        EIf(kids) => {
+            // if-expression: each branch is one value-pushing expression.
+            let head: List[Int] = cat(cond_test(kids[0], ctx), jz(len(gen(kids[1], ctx)) + 5));
+            let then_code: List[Int] = gen(kids[1], ctx);
+            let else_code: List[Int] = gen(kids[2], ctx);
+            return cat(head, cat(then_code, cat(jmp(len(else_code)), else_code)));
         }
         EText(t) => {
             // a Text value is a pointer to its [len][bytes] block in rodata.
@@ -788,6 +798,9 @@ fn collect_str_expr(e: Expr, acc: List[Text]) -> List[Text] {
         EList(items) => {
             return acc;
         }
+        EIf(kids) => {
+            return collect_str_expr(kids[2], collect_str_expr(kids[1], collect_str_expr(kids[0], acc)));
+        }
     }
 }
 
@@ -976,6 +989,9 @@ fn supported(e: Expr) -> Bool {
         EList(items) => {
             return all_supported(items);
         }
+        EIf(kids) => {
+            return supported(kids[0]) and supported(kids[1]) and supported(kids[2]);
+        }
         EText(t) => {
             return true;
         }
@@ -1015,6 +1031,9 @@ fn is_text(e: Expr) -> Bool {
             return false;
         }
         EList(items) => {
+            return false;
+        }
+        EIf(kids) => {
             return false;
         }
     }

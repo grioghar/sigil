@@ -31,6 +31,8 @@ EXPR_CORPUS = [
     "xs[0]", "p.x", "p.items[1].y", "len(xs) > 0 and i < n",
     "[1, 2, 3]", "[]", "[a, f(b), c[0]]", "not not x", "a * b * c % d",
     "0 - -5", "true and false", "1 + 2 + 3 + 4", "f(a)[0].b", "-x + y",
+    "if a then b else c", "if x > 0 then 1 else 2",
+    "if a then f(x) else g(y)", "if a then b else if c then d else e",
 ]
 
 BLOCK_CORPUS = [
@@ -77,6 +79,9 @@ def dump_expr(e) -> str:
         return f"(field {dump_expr(e.base)} {e.field_name})"
     if isinstance(e, A.ListLit):
         return "(list" + "".join(" " + dump_expr(i) for i in e.items) + ")"
+    if isinstance(e, A.IfExpr):
+        return (f"(if-expr {dump_expr(e.cond)} {dump_expr(e.then_expr)} "
+                f"{dump_expr(e.else_expr)})")
     raise AssertionError(f"unhandled expr {type(e).__name__}")
 
 

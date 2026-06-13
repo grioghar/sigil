@@ -162,6 +162,29 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_if_expressions(self):
+        cases = [
+            ('fn main() -> Int { let x: Int = if 1 < 2 then 10 else 20; '
+             'return x; }', 10),
+            ('fn main() -> Int { let x: Int = if 1 > 2 then 10 else 20; '
+             'return x; }', 20),
+            ('fn main() -> Int { let n: Int = 7; '
+             'return if n > 5 then n * 6 else 0; }', 42),
+            ('fn classify(n: Int) -> Int { '
+             'return if n > 0 then 1 else if n < 0 then 2 else 0; }\n'
+             'fn main() -> Int { return classify(0 - 5); }', 2),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_slice(self):
         exit_cases = [
             ('fn main() -> Int { let s: Text = slice("hello", 1, 4); '

@@ -32,6 +32,7 @@ pub enum Ty {
 // [base, index]
 // field name; [base]
 // items
+// [cond, then, else] — if-expression
 pub enum Expr {
     EInt(Int),
     EBool(Bool),
@@ -43,6 +44,7 @@ pub enum Expr {
     EIndex(List[Expr]),
     EField(Text, List[Expr]),
     EList(List[Expr]),
+    EIf(List[Expr]),
 }
 
 // cond, then-body
@@ -185,7 +187,43 @@ fn parse_type_args(toks: List[Token], name: Text, i: Int, acc: List[Ty]) -> Res[
 //
 // or > and > comparison > +,- > *,/,% > unary(not,-) > postfix([], .) > primary
 pub fn parse_expr(toks: List[Token], i: Int) -> Res[Expr] {
+    if tkind(toks, i) == "if" {
+        return parse_if_expr(toks, i);
+    }
     return parse_or(toks, i);
+}
+
+// `if cond then a else b` — an expression. Lowest precedence; the else branch
+// parses a full expression, so `else if ...` chains.
+fn parse_if_expr(toks: List[Token], i: Int) -> Res[Expr] {
+    match parse_expr(toks, i + 1) {
+        ROk(cond, j) => {
+            if tkind(toks, j) != "then" {
+                return RErr("expected then in if-expression", j);
+            }
+            match parse_expr(toks, j + 1) {
+                ROk(thn, k) => {
+                    if tkind(toks, k) != "else" {
+                        return RErr("expected else in if-expression", k);
+                    }
+                    match parse_expr(toks, k + 1) {
+                        ROk(els, m) => {
+                            return ROk(EIf([cond, thn, els]), m);
+                        }
+                        RErr(m, p) => {
+                            return RErr(m, p);
+                        }
+                    }
+                }
+                RErr(m, p) => {
+                    return RErr(m, p);
+                }
+            }
+        }
+        RErr(m, p) => {
+            return RErr(m, p);
+        }
+    }
 }
 
 fn parse_or(toks: List[Token], i: Int) -> Res[Expr] {
@@ -1146,6 +1184,9 @@ fn dump_expr(e: Expr) -> Text {
         }
         EList(items) => {
             return "(list" + dump_expr_list(items) + ")";
+        }
+        EIf(kids) => {
+            return "(if-expr " + dump_expr(kids[0]) + " " + dump_expr(kids[1]) + " " + dump_expr(kids[2]) + ")";
         }
     }
 }
