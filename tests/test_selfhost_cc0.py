@@ -162,6 +162,41 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_text_concat(self):
+        # type-directed +: Text concatenation. Exit-code cases first.
+        exit_cases = [
+            ('fn main() -> Int { let s: Text = "ab" + "cd"; return len(s); }', 4),
+            ('fn main() -> Int { let s: Text = "ab" + "cd"; '
+             'if s == "abcd" { return 1; } return 0; }', 1),
+            ('fn main() -> Int { let s: Text = "ab" + "cd"; '
+             'if s == "abXd" { return 1; } return 0; }', 0),
+        ]
+        for prog, expected in exit_cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+        # stdout cases: concat with a parameter, and chained concatenation.
+        out_cases = [
+            ('fn greet(who: Text) -> Text { return "hi " + who; }\n'
+             'fn main() -> Int { print(greet("bob")); return 0; }', b"hi bob"),
+            ('fn main() -> Int { let s: Text = "a" + "b" + "c"; '
+             'print(s); return 0; }', b"abc"),
+        ]
+        for prog, out_expected in out_cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)], capture_output=True)
+                self.assertEqual(result.stdout, out_expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_text_equality(self):
         # type-directed ==: byte-wise for Text. The classify case is exactly
         # cc0's own `op == "+"` pattern.

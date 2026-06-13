@@ -385,9 +385,12 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             return cat(gen(kids[0], ctx), [88, 72, 247, 216, 80]);
         }
         EBin(op, kids) => {
-            // == and != are overloaded: byte-wise for Text, integer otherwise.
+            // overloaded operators dispatch on operand type.
             if (op == "==" or op == "!=") and type_of(kids[0], ctx) == "Text" {
                 return gen_text_eq(kids[0], kids[1], op, ctx);
+            }
+            if op == "+" and type_of(kids[0], ctx) == "Text" {
+                return gen_concat(kids[0], kids[1], ctx);
             }
             return cat(gen(kids[0], ctx), cat(gen(kids[1], ctx), bin_op(op)));
         }
@@ -507,6 +510,27 @@ fn gen_text_eq(a: Expr, b: Expr, op: Text, ctx: Ctx) -> List[Int] {
         code = cat(code, [88, 72, 131, 240, 1, 80]);
     }
     return code;
+}
+
+// A byte-copy loop: copy rcx bytes from rsi to rdi (advancing both), clobbering
+// al/rsi/rdi/rcx. Self-contained; jump offsets are fixed.
+fn copy_loop() -> List[Int] {
+    return cat([72, 133, 201, 15, 132], cat(le_s32(18), cat([138, 6, 136, 7, 72, 255, 198, 72, 255, 199, 72, 255, 201, 233], le_s32(0 - 27))));
+}
+
+// Text concatenation: a new [len][bytes] block holding a's bytes then b's.
+// Allocate 8 + len_a + len_b, store the length, copy a, then copy b (the dest
+// pointer rdi flows from the first copy into the second). Returns a Text ptr.
+fn gen_concat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(a, ctx), gen(b, ctx));
+    // pop b,a ; rcx=la ; rdx=lb ; r8=total ; alloc -> r9 block ; store len ;
+    // lea rsi,[a+8] ; lea rdi,[r9+8]
+    let setup: List[Int] = cat([91, 88, 72, 139, 8, 72, 139, 19, 73, 137, 200, 73, 1, 208, 73, 187], cat(le(6291456, 8), [77, 139, 11, 77, 137, 202, 77, 1, 194, 73, 131, 194, 8, 77, 137, 19, 77, 137, 1, 72, 141, 112, 8, 73, 141, 121, 8]));
+    // lea rsi,[b+8] ; mov rcx,rdx (count = lb) — dest rdi continues from copy A
+    let between: List[Int] = [72, 141, 115, 8, 72, 137, 209];
+    // mov rax,r9 ; push rax
+    let tail: List[Int] = [76, 137, 200, 80];
+    return cat(code, cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail)))));
 }
 
 fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
