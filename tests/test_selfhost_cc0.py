@@ -265,6 +265,47 @@ class TestCc0(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
+    def test_emitted_cat(self):
+        # cat(a, b) for List[Int] is a single-allocation builtin (the efficient
+        # counterpart to the source-level push loop).
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t),
+                         "fn main() -> Int { let a: List[Int] = [10, 20, 30]; "
+                         "let b: List[Int] = [40, 50]; let c: List[Int] = cat(a, b); "
+                         "return c[0] + c[3] + len(c); }")
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            self.assertEqual(subprocess.run([str(exe)]).returncode, 55)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_io_syscalls(self):
+        # write_bytes then read_file round-trips raw bytes through the
+        # filesystem via raw open/read/write/close syscalls.
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t),
+                         'fn main(c: Console, f: Fs) -> Int { '
+                         'write_bytes(f, "data.bin", [72, 105, 33]); '
+                         'let s: Text = read_file(f, "data.bin"); '
+                         'print(c, s); return len(s); }')
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            r = subprocess.run([str(exe)], capture_output=True, cwd=t)
+        self.assertEqual(r.stdout, b"Hi!")
+        self.assertEqual(r.returncode, 3)
+        # read_line echoes a line from stdin (no trailing newline)
+        with tempfile.TemporaryDirectory() as t:
+            self.compile(Path(t),
+                         'fn main(c: Console) -> Int { let s: Text = read_line(c); '
+                         'print(c, s); return len(s); }')
+            exe = Path(t) / "out.bin"
+            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+            r = subprocess.run([str(exe)], input=b"echoed\n", capture_output=True)
+        self.assertEqual(r.stdout, b"echoed")
+        self.assertEqual(r.returncode, 6)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
     def test_emitted_capability_programs(self):
         # main may take Console/Fs capability params (phantom one-word values on
         # bare metal), and print accepts the real print(console, text) form as

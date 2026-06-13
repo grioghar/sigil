@@ -287,6 +287,15 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             if name == "slice" or name == "chr" or name == "str" {
                 return "Text";
             }
+            if name == "cat" {
+                return type_of(args[0], ctx);
+            }
+            if name == "read_file" or name == "read_line" {
+                return "Text";
+            }
+            if name == "write_bytes" {
+                return "Unit";
+            }
             if name == "push" {
                 return type_of(args[0], ctx);
             }
@@ -394,6 +403,24 @@ fn lookup(names: List[Text], vals: List[Int], x: Text) -> Int {
         i = i + 1;
     }
     return 0;
+}
+
+// Like lookup, but returns the LAST match. Used to pick the entry point: when
+// several source files are merged each may define its own `main` (a standalone
+// entry for that module's tests), and the root translation unit is passed last,
+// so its main wins.
+fn lookup_last(names: List[Text], vals: List[Int], x: Text) -> Int {
+    var found: Int = 0;
+    var i: Int = 0;
+    while i < len(names)
+        invariant i >= 0
+    {
+        if names[i] == x {
+            found = vals[i];
+        }
+        i = i + 1;
+    }
+    return found;
 }
 
 fn collect_locals(stmts: List[Stmt], acc: List[Text]) -> List[Text] {
@@ -892,6 +919,75 @@ fn gen_ord(arg: Expr, ctx: Ctx) -> List[Int] {
     return cat(gen(arg, ctx), [88, 15, 182, 64, 8, 80]);
 }
 
+// ---------------------------------------------------------------- syscall IO
+// Copy a Text value (pointer in rsi) into a fresh NUL-terminated C string on
+// the heap, leaving its pointer in rax (the heap bump pointer is advanced past
+// the NUL). Needed because open(2) wants a NUL-terminated path and a Sigil Text
+// is a counted [len][bytes] block. The copy is a pointer-bump byte loop.
+fn nul_path() -> List[Int] {
+    // mov rcx,[rsi] ; add rsi,8 ; mov rdi,0x600000 ; mov rax,[rdi] ; mov r8,rax
+    var c: List[Int] = cat([72, 139, 14, 72, 131, 198, 8, 72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192]));
+    // LOOP: test rcx,rcx ; jz +15 ; mov dl,[rsi] ; mov [rax],dl ; inc rsi ;
+    // inc rax ; dec rcx ; jmp -20
+    c = cat(c, [72, 133, 201, 116, 15, 138, 22, 136, 16, 72, 255, 198, 72, 255, 192, 72, 255, 201, 235, 236]);
+    // DONE: mov byte [rax],0 ; inc rax ; mov [rdi],rax ; mov rax,r8
+    return cat(c, [198, 0, 0, 72, 255, 192, 72, 137, 7, 76, 137, 192]);
+}
+
+// read_file(fs, path): open the path read-only and read it fully into a fresh
+// Text [len][bytes] block on the heap; returns the block pointer. The fs
+// capability is ignored.
+fn gen_read_file(path: Expr, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(path, ctx), [94]);
+    code = cat(code, nul_path());
+    // open(cstring, O_RDONLY=0, 0) -> fd in rbx
+    code = cat(code, [72, 137, 199, 49, 246, 49, 210, 184, 2, 0, 0, 0, 15, 5, 72, 137, 195]);
+    // block = heap free ; r8 = block ; r9 = write ptr = block+8
+    code = cat(code, cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 76, 141, 72, 8])));
+    // READ: read(fd, r9, 4096) ; if <=0 -> DONE ; r9 += n ; loop
+    code = cat(code, [72, 137, 223, 76, 137, 206, 186, 0, 16, 0, 0, 49, 192, 15, 5, 72, 133, 192, 126, 5, 73, 1, 193, 235, 231]);
+    // DONE: len = r9 - r8 - 8 ; store at [r8]
+    code = cat(code, [76, 137, 201, 76, 41, 193, 72, 131, 233, 8, 73, 137, 8]);
+    // bump heap free to r9
+    code = cat(code, cat([72, 191], cat(le(6291456, 8), [76, 137, 15])));
+    // close(fd) ; mov rax,r8 ; push
+    code = cat(code, [72, 137, 223, 184, 3, 0, 0, 0, 15, 5, 76, 137, 192, 80]);
+    return code;
+}
+
+// write_bytes(fs, path, bytes): create/truncate the path and write the low
+// byte of each Int in the list. The fs capability is ignored.
+fn gen_write_bytes(path: Expr, bytes: Expr, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(bytes, ctx), gen(path, ctx));
+    // pop path -> rsi ; build NUL-terminated cstring (rax)
+    code = cat(code, cat([94], nul_path()));
+    // open(cstring, O_WRONLY|O_CREAT|O_TRUNC=577, 0o755=493) -> fd in rbx
+    code = cat(code, [72, 137, 199, 190, 65, 2, 0, 0, 186, 237, 1, 0, 0, 184, 2, 0, 0, 0, 15, 5, 72, 137, 195]);
+    // pop bytes -> rsi ; rcx=count ; src=rsi+8 ; dst buffer = heap free (r8/r9)
+    code = cat(code, [94, 72, 139, 14, 72, 131, 198, 8]);
+    code = cat(code, cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 73, 137, 193])));
+    // PACK: test rcx,rcx ; jz +17 ; mov dl,[rsi] ; mov [r9],dl ; add rsi,8 ;
+    // inc r9 ; dec rcx ; jmp -22
+    code = cat(code, [72, 133, 201, 116, 17, 138, 22, 65, 136, 17, 72, 131, 198, 8, 73, 255, 193, 72, 255, 201, 235, 234]);
+    // bump heap free to r9 ; write(fd, buf=r8, count=r9-r8) ; close ; push rax
+    code = cat(code, [76, 137, 15, 76, 137, 198, 76, 137, 202, 76, 41, 194, 72, 137, 223, 184, 1, 0, 0, 0, 15, 5, 72, 137, 223, 184, 3, 0, 0, 0, 15, 5, 80]);
+    return code;
+}
+
+// read_line(console): read one line from stdin (no trailing newline) into a
+// fresh Text block; "" at end of input. The console capability is ignored.
+fn gen_read_line(ctx: Ctx) -> List[Int] {
+    // block = heap free ; r8 = block ; r9 = write ptr = block+8
+    var code: List[Int] = cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 76, 141, 72, 8]));
+    // READ: read(0, r9, 1) ; if <=0 -> DONE ; if byte=='\n' -> DONE ; r9++ ; loop
+    code = cat(code, [49, 255, 76, 137, 206, 186, 1, 0, 0, 0, 49, 192, 15, 5, 72, 133, 192, 126, 11, 65, 128, 57, 10, 116, 5, 73, 255, 193, 235, 226]);
+    // DONE: len = r9 - r8 - 8 ; store at [r8]
+    code = cat(code, [76, 137, 201, 76, 41, 193, 72, 131, 233, 8, 73, 137, 8]);
+    // bump heap free to r9 ; mov rax,r8 ; push
+    code = cat(code, cat([72, 191], cat(le(6291456, 8), [76, 137, 15, 76, 137, 192, 80])));
+    return code;
+}
+
 // Text equality: compare two [len][bytes] blocks. Pushes 1 if equal else 0
 // (then negated for !=). A self-contained routine with a byte-compare loop;
 // jump offsets are computed from the fixed instruction sizes (see comments).
@@ -944,6 +1040,23 @@ fn gen_concat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
     return cat(code, cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail)))));
 }
 
+// cat(a, b) for List[Int]: allocate one [len][8-byte elems] block of
+// la+lb elements and copy a's elements then b's, in a single pass. This is the
+// efficient counterpart to the source-level push loop; the elements are 8 bytes
+// each, so the byte counts handed to copy_loop are 8*la and 8*lb.
+fn gen_cat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = cat(gen(a, ctx), gen(b, ctx));
+    // pop b->rbx, a->rax ; rcx=la ; rdx=lb ; r8=la+lb ; r11=heap ; r9=block ;
+    // new free = r9 + 8 + 8*(la+lb) ; store len ; lea rsi,[a+8] ; lea rdi,[r9+8] ;
+    // rcx = 8*la (bytes to copy)
+    let setup: List[Int] = cat([91, 88, 72, 139, 8, 72, 139, 19, 73, 137, 200, 73, 1, 208, 73, 187], cat(le(6291456, 8), [77, 139, 11, 77, 137, 194, 73, 193, 226, 3, 73, 131, 194, 8, 77, 1, 202, 77, 137, 19, 77, 137, 1, 72, 141, 112, 8, 73, 141, 121, 8, 72, 139, 8, 72, 193, 225, 3]));
+    // lea rsi,[b+8] ; rcx = 8*lb ; dest rdi continues from the first copy
+    let between: List[Int] = [72, 141, 115, 8, 72, 139, 11, 72, 193, 225, 3];
+    // mov rax,r9 ; push rax
+    let tail: List[Int] = [76, 137, 200, 80];
+    return cat(code, cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail)))));
+}
+
 fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     if name == "print" {
         return gen_print(args, ctx);
@@ -959,6 +1072,23 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     }
     if name == "slice" {
         return gen_slice(args[0], args[1], args[2], ctx);
+    }
+    // cat(a, b) for List[Int] is a builtin: a single allocation that copies both
+    // lists, instead of the source-level push loop (which is O(n^2) in heap and
+    // overruns the heap when cc0 compiles a large program like its own source).
+    if name == "cat" {
+        return gen_cat(args[0], args[1], ctx);
+    }
+    // capability IO builtins lower to raw syscalls; the capability arg (args[0])
+    // is a phantom and is ignored.
+    if name == "read_file" {
+        return gen_read_file(args[1], ctx);
+    }
+    if name == "write_bytes" {
+        return gen_write_bytes(args[1], args[2], ctx);
+    }
+    if name == "read_line" {
+        return gen_read_line(ctx);
     }
     // an Uppercase call-shaped name is a payload enum variant constructor.
     if variant_known(ctx.enums, name) {
@@ -1428,7 +1558,7 @@ fn compile_program(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) ->
     let strs: List[Text] = collect_strings(fns);
     let data_base: Int = 4194480 + code_length(fns, recs, enums);
     let saddrs: List[Int] = str_addrs(strs, data_base);
-    let main_off: Int = lookup(names, offs, "main");
+    let main_off: Int = lookup_last(names, offs, "main");
     var code: List[Int] = entry_stub(main_off);
     var i: Int = 0;
     while i < len(fns)
@@ -1781,7 +1911,7 @@ fn elf(code: List[Int]) -> List[Int] {
     out = cat(out, le(fsize, 8));
     // p_align
     out = cat(out, le(4096, 8));
-    // phdr 2: heap, RW, zero-filled (filesz 0, memsz 16 MiB)
+    // phdr 2: heap, RW, zero-filled (filesz 0, memsz 4 GiB)
     // p_type = PT_LOAD
     out = cat(out, le(1, 4));
     // p_flags = RW
@@ -1794,8 +1924,8 @@ fn elf(code: List[Int]) -> List[Int] {
     out = cat(out, le(6291456, 8));
     // p_filesz = 0
     out = cat(out, le(0, 8));
-    // p_memsz = 16 MiB
-    out = cat(out, le(16777216, 8));
+    // p_memsz = 4 GiB (demand-zero; self-compilation churns a lot of heap)
+    out = cat(out, le(4294967296, 8));
     // p_align
     out = cat(out, le(4096, 8));
     return cat(out, code);
