@@ -22,7 +22,7 @@
 //
 // Usage: reads a source path on stdin, then an output path on the next line.
 use lexer { Token, lex }
-use parser { Expr, FieldVal, Fn, Param, Prog, RecDecl, Res, Stmt, Ty, parse_program }
+use parser { EnumDecl, Expr, FieldVal, Fn, MatchArm, Param, Prog, RecDecl, Res, Stmt, Ty, Variant, parse_program }
 
 // Codegen context: the variable displacement map (this function) and the
 // function-address map (whole program).
@@ -36,6 +36,7 @@ record Ctx {
     vtags: List[Text],
     frets: List[Text],
     recs: List[RecDecl],
+    enums: List[EnumDecl],
 }
 
 // type environment: each variable's type tag (parallel to vnames) and each
@@ -113,6 +114,101 @@ fn field_ty_tag(recs: List[RecDecl], rname: Text, fname: Text) -> Text {
     return "Int";
 }
 
+// Enum layout: a variant value is a heap block [tag][payload0][payload1]...,
+// where tag is the variant's 0-based index within its enum and each payload is
+// one 8-byte slot. The value is a pointer. A variant is constructed by name
+// (Uppercase, so it never collides with a builtin or local); a nullary variant
+// looks like a plain variable and a payload variant looks like a call, so cc0
+// resolves names against the enum table to tell them apart.
+fn variant_enum(enums: List[EnumDecl], vname: Text) -> Text {
+    var i: Int = 0;
+    while i < len(enums)
+        invariant i >= 0
+    {
+        let vs: List[Variant] = enums[i].variants;
+        var k: Int = 0;
+        while k < len(vs)
+            invariant k >= 0
+        {
+            if vs[k].name == vname {
+                return enums[i].name;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn variant_known(enums: List[EnumDecl], vname: Text) -> Bool {
+    return variant_enum(enums, vname) != "";
+}
+
+// The variant's 0-based index within its enum (-1 if unknown).
+fn variant_tag(enums: List[EnumDecl], vname: Text) -> Int {
+    var i: Int = 0;
+    while i < len(enums)
+        invariant i >= 0
+    {
+        let vs: List[Variant] = enums[i].variants;
+        var k: Int = 0;
+        while k < len(vs)
+            invariant k >= 0
+        {
+            if vs[k].name == vname {
+                return k;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn variant_arity(enums: List[EnumDecl], vname: Text) -> Int {
+    var i: Int = 0;
+    while i < len(enums)
+        invariant i >= 0
+    {
+        let vs: List[Variant] = enums[i].variants;
+        var k: Int = 0;
+        while k < len(vs)
+            invariant k >= 0
+        {
+            if vs[k].name == vname {
+                return len(vs[k].payloads);
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Type tag of the j-th payload of variant `vname` ("Int" if out of range).
+fn payload_tag(enums: List[EnumDecl], vname: Text, j: Int) -> Text {
+    var i: Int = 0;
+    while i < len(enums)
+        invariant i >= 0
+    {
+        let vs: List[Variant] = enums[i].variants;
+        var k: Int = 0;
+        while k < len(vs)
+            invariant k >= 0
+        {
+            if vs[k].name == vname {
+                if j < len(vs[k].payloads) {
+                    return ty_tag(vs[k].payloads[j]);
+                }
+                return "Int";
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return "Int";
+}
+
 // The type tag of an expression, given the context's type environment. Used to
 // pick integer vs. Text lowering for the overloaded + and == operators.
 fn type_of(e: Expr, ctx: Ctx) -> Text {
@@ -127,6 +223,10 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             return "Text";
         }
         EVar(x) => {
+            // a bare Uppercase name may be a nullary enum variant.
+            if variant_known(ctx.enums, x) {
+                return variant_enum(ctx.enums, x);
+            }
             return lookup_tag(ctx.vnames, ctx.vtags, x);
         }
         EUn(op, kids) => {
@@ -154,6 +254,10 @@ fn type_of(e: Expr, ctx: Ctx) -> Text {
             }
             if name == "push" {
                 return type_of(args[0], ctx);
+            }
+            // a call-shaped Uppercase name may be a payload enum variant.
+            if variant_known(ctx.enums, name) {
+                return variant_enum(ctx.enums, name);
             }
             return lookup_tag(ctx.fnames, ctx.frets, name);
         }
@@ -287,7 +391,17 @@ fn collect_stmt_locals(s: Stmt, acc: List[Text]) -> List[Text] {
             return collect_locals(body, acc);
         }
         SMatch(scrut, arms) => {
-            return acc;
+            // each arm's binders become locals, then the arm body's own locals.
+            var out: List[Text] = acc;
+            var a: Int = 0;
+            while a < len(arms)
+                invariant a >= 0
+            {
+                out = push_all(out, arms[a].binders);
+                out = collect_locals(arms[a].body, out);
+                a = a + 1;
+            }
+            return out;
         }
         SAssign(n, e) => {
             return acc;
@@ -307,19 +421,31 @@ fn collect_stmt_locals(s: Stmt, acc: List[Text]) -> List[Text] {
     }
 }
 
-fn collect_local_tags(stmts: List[Stmt], acc: List[Text]) -> List[Text] {
+fn push_all(acc: List[Text], xs: List[Text]) -> List[Text] {
     var out: List[Text] = acc;
     var i: Int = 0;
-    while i < len(stmts)
+    while i < len(xs)
         invariant i >= 0
     {
-        out = collect_stmt_tags(stmts[i], out);
+        out = push(out, xs[i]);
         i = i + 1;
     }
     return out;
 }
 
-fn collect_stmt_tags(s: Stmt, acc: List[Text]) -> List[Text] {
+fn collect_local_tags(stmts: List[Stmt], acc: List[Text], enums: List[EnumDecl]) -> List[Text] {
+    var out: List[Text] = acc;
+    var i: Int = 0;
+    while i < len(stmts)
+        invariant i >= 0
+    {
+        out = collect_stmt_tags(stmts[i], out, enums);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn collect_stmt_tags(s: Stmt, acc: List[Text], enums: List[EnumDecl]) -> List[Text] {
     match s {
         SLet(n, t, e) => {
             return push(acc, ty_tag(t));
@@ -328,16 +454,27 @@ fn collect_stmt_tags(s: Stmt, acc: List[Text]) -> List[Text] {
             return push(acc, ty_tag(t));
         }
         SIf(c, body) => {
-            return collect_local_tags(body, acc);
+            return collect_local_tags(body, acc, enums);
         }
         SIfElse(c, t, e) => {
-            return collect_local_tags(e, collect_local_tags(t, acc));
+            return collect_local_tags(e, collect_local_tags(t, acc, enums), enums);
         }
         SWhile(c, invs, body) => {
-            return collect_local_tags(body, acc);
+            return collect_local_tags(body, acc, enums);
         }
         SMatch(scrut, arms) => {
-            return acc;
+            // binder tags = the matched variant's payload types, parallel to the
+            // binder names collected in collect_stmt_locals.
+            var out: List[Text] = acc;
+            var a: Int = 0;
+            while a < len(arms)
+                invariant a >= 0
+            {
+                out = arm_binder_tags(arms[a], out, enums);
+                out = collect_local_tags(arms[a].body, out, enums);
+                a = a + 1;
+            }
+            return out;
         }
         SAssign(n, e) => {
             return acc;
@@ -357,10 +494,22 @@ fn collect_stmt_tags(s: Stmt, acc: List[Text]) -> List[Text] {
     }
 }
 
+fn arm_binder_tags(arm: MatchArm, acc: List[Text], enums: List[EnumDecl]) -> List[Text] {
+    var out: List[Text] = acc;
+    var k: Int = 0;
+    while k < len(arm.binders)
+        invariant k >= 0
+    {
+        out = push(out, payload_tag(enums, arm.variant, k));
+        k = k + 1;
+    }
+    return out;
+}
+
 // Build the per-function variable map: params above rbp, locals below, with a
 // parallel type tag for each (params from their declared types, locals from
 // their let/var declarations).
-fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl]) -> Ctx {
+fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl], enums: List[EnumDecl]) -> Ctx {
     let np: Int = len(f.params);
     var vn: List[Text] = [];
     var vd: List[Int] = [];
@@ -375,7 +524,7 @@ fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], sa
         i = i + 1;
     }
     let locals: List[Text] = collect_locals(f.body, []);
-    let ltags: List[Text] = collect_local_tags(f.body, []);
+    let ltags: List[Text] = collect_local_tags(f.body, [], enums);
     var j: Int = 0;
     while j < len(locals)
         invariant j >= 0
@@ -385,7 +534,7 @@ fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], sa
         vt = push(vt, ltags[j]);
         j = j + 1;
     }
-    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets, recs: recs };
+    return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets, recs: recs, enums: enums };
 }
 
 // ---------------------------------------------------------------- expr codegen
@@ -452,6 +601,10 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             return cat([72, 184], cat(le(0, 8), [80]));
         }
         EVar(x) => {
+            // a bare Uppercase name is a nullary enum variant: build its block.
+            if variant_known(ctx.enums, x) {
+                return gen_enum(x, [], ctx);
+            }
             // mov rax, [rbp + disp] ; push rax
             let disp: Int = lookup(ctx.vnames, ctx.vdisps, x);
             return cat([72, 139, 133], cat(le_s32(disp), [80]));
@@ -575,6 +728,34 @@ fn gen_record(name: Text, fields: List[FieldVal], ctx: Ctx) -> List[Int] {
     return code;
 }
 
+// An enum value `Variant(args)`: a heap block [tag][payload0][payload1]...,
+// tag = the variant's index in its enum. Built like a record but with the tag
+// in slot 0 and payloads following.
+fn gen_enum(vname: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
+    let tag: Int = variant_tag(ctx.enums, vname);
+    let k: Int = len(args);
+    var code: List[Int] = alloc_const(8 * (1 + k));
+    // mov qword [rax], tag
+    code = cat(code, cat([72, 199, 0], le_s32(tag)));
+    // push rax (the result pointer)
+    code = cat(code, [80]);
+    var i: Int = 0;
+    while i < k
+        invariant i >= 0
+    {
+        // push payload value
+        code = cat(code, gen(args[i], ctx));
+        // pop rcx
+        code = cat(code, [89]);
+        // mov rax, [rsp] (reload ptr)
+        code = cat(code, [72, 139, 4, 36]);
+        // mov [rax + 8*(i+1)], rcx
+        code = cat(code, cat([72, 137, 136], le_s32(8 * (i + 1))));
+        i = i + 1;
+    }
+    return code;
+}
+
 // Field access `base.field`: evaluate base to a record pointer, load the slot.
 fn gen_field(fname: Text, base: Expr, ctx: Ctx) -> List[Int] {
     let rname: Text = type_of(base, ctx);
@@ -682,6 +863,10 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
     if name == "slice" {
         return gen_slice(args[0], args[1], args[2], ctx);
     }
+    // an Uppercase call-shaped name is a payload enum variant constructor.
+    if variant_known(ctx.enums, name) {
+        return gen_enum(name, args, ctx);
+    }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
     // add rsp, 8*nargs (drop args); push rax (result).
     var code: List[Int] = [];
@@ -779,9 +964,58 @@ fn gen_stmt(s: Stmt, ctx: Ctx) -> List[Int] {
             return cat(test, cat(jz(len(body_code) + 5), cat(body_code, jmp(back))));
         }
         SMatch(scrut, arms) => {
-            return [];
+            return gen_match(scrut, arms, ctx);
         }
     }
+}
+
+// match: evaluate the scrutinee once (pointer in rbx, tag in rax), then test
+// the tag against each arm. rbx survives the cmp/jne chain (none of those
+// touch it) and the matched arm's payload binding (which uses rax/rcx); the
+// arm body may then clobber it freely.
+fn gen_match(scrut: Expr, arms: List[MatchArm], ctx: Ctx) -> List[Int] {
+    // pop rax (ptr) ; mov rbx, rax ; mov rax, [rbx] (tag)
+    let pre: List[Int] = cat(gen(scrut, ctx), [88, 72, 137, 195, 72, 139, 3]);
+    return cat(pre, gen_arms(arms, 0, ctx));
+}
+
+// Lay out arms from index `idx` to the end. `rest` is every following arm's
+// code (up to the match's end label); a non-wildcard arm's `jne` skips its own
+// body+jmp to land at `rest`, and its `jmp` skips `rest` to reach the end.
+fn gen_arms(arms: List[MatchArm], idx: Int, ctx: Ctx) -> List[Int] {
+    if idx >= len(arms) {
+        return [];
+    }
+    let arm: MatchArm = arms[idx];
+    let rest: List[Int] = gen_arms(arms, idx + 1, ctx);
+    let body: List[Int] = cat(gen_bind(arm, ctx), gen_block(arm.body, ctx));
+    if arm.variant == "_" {
+        // wildcard: always taken; fall straight into the body.
+        return cat(body, rest);
+    }
+    let tag: Int = variant_tag(ctx.enums, arm.variant);
+    // cmp rax, tag ; jne (skip body + the trailing jmp)
+    let test: List[Int] = cat(cat([72, 61], le(tag, 4)), cat([15, 133], le_s32(len(body) + 5)));
+    // after the body: jmp to the end (over all the remaining arms)
+    return cat(test, cat(body, cat(jmp(len(rest)), rest)));
+}
+
+// Bind an arm's payload binders to the scrutinee's slots: binder k <- [rbx +
+// 8*(k+1)]. The scrutinee pointer is live in rbx.
+fn gen_bind(arm: MatchArm, ctx: Ctx) -> List[Int] {
+    var code: List[Int] = [];
+    var k: Int = 0;
+    while k < len(arm.binders)
+        invariant k >= 0
+    {
+        // mov rcx, [rbx + 8*(k+1)]
+        code = cat(code, cat([72, 139, 139], le_s32(8 * (k + 1))));
+        // mov [rbp + disp], rcx
+        let disp: Int = lookup(ctx.vnames, ctx.vdisps, arm.binders[k]);
+        code = cat(code, cat([72, 137, 141], le_s32(disp)));
+        k = k + 1;
+    }
+    return code;
 }
 
 // ---------------------------------------------------------------- function
@@ -790,8 +1024,8 @@ fn prologue(frame: Int) -> List[Int] {
     return cat([85, 72, 137, 229, 72, 129, 236], le(frame, 4));
 }
 
-fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl]) -> List[Int] {
-    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets, recs);
+fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl], enums: List[EnumDecl]) -> List[Int] {
+    let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets, recs, enums);
     let frame: Int = round16(8 * len(collect_locals(f.body, [])));
     // fall-through safety: xor eax, eax ; leave ; ret
     return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
@@ -814,9 +1048,31 @@ fn entry_size() -> Int {
     return len(entry_stub(0));
 }
 
-fn fn_offsets(fns: List[Fn], recs: List[RecDecl]) -> List[Int] {
-    // pass A: lay functions out after the entry stub to get offsets. Sizes are
-    // independent of the (empty) maps, since every imm is fixed-size.
+// A zero list of length n; used for the not-yet-known function-offset map in
+// the sizing passes (the address value never changes an instruction's size,
+// but the map must stay parallel to fnames so lookup() doesn't run off the end).
+fn zeros(n: Int) -> List[Int] {
+    var out: List[Int] = [];
+    var i: Int = 0;
+    while i < n
+        invariant i >= 0
+    {
+        out = push(out, 0);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn fn_offsets(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) -> List[Int] {
+    // pass A: lay functions out after the entry stub to get offsets. The
+    // address maps carry placeholder values (foffs = zeros parallel to names;
+    // snames/saddrs empty) — every address is a fixed-size imm — but fnames/
+    // frets/recs/enums must be the real ones, since type_of and variant
+    // detection choose code paths of different sizes (Text vs Int ops, variant
+    // construction vs a plain call).
+    let names: List[Text] = fn_names(fns);
+    let rets: List[Text] = fn_rets(fns);
+    let zoffs: List[Int] = zeros(len(names));
     var offs: List[Int] = [];
     var acc: Int = entry_size();
     var i: Int = 0;
@@ -824,19 +1080,22 @@ fn fn_offsets(fns: List[Fn], recs: List[RecDecl]) -> List[Int] {
         invariant i >= 0
     {
         offs = push(offs, acc);
-        acc = acc + len(gen_fn(fns[i], [], [], [], [], [], recs));
+        acc = acc + len(gen_fn(fns[i], names, zoffs, [], [], rets, recs, enums));
         i = i + 1;
     }
     return offs;
 }
 
-fn code_length(fns: List[Fn], recs: List[RecDecl]) -> Int {
+fn code_length(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) -> Int {
+    let names: List[Text] = fn_names(fns);
+    let rets: List[Text] = fn_rets(fns);
+    let zoffs: List[Int] = zeros(len(names));
     var acc: Int = entry_size();
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
     {
-        acc = acc + len(gen_fn(fns[i], [], [], [], [], [], recs));
+        acc = acc + len(gen_fn(fns[i], names, zoffs, [], [], rets, recs, enums));
         i = i + 1;
     }
     return acc;
@@ -983,9 +1242,21 @@ fn collect_str_stmt(s: Stmt, acc: List[Text]) -> List[Text] {
             return collect_str_block(body, collect_str_expr(c, acc));
         }
         SMatch(scrut, arms) => {
-            return acc;
+            return collect_str_arms(arms, collect_str_expr(scrut, acc));
         }
     }
+}
+
+fn collect_str_arms(arms: List[MatchArm], acc: List[Text]) -> List[Text] {
+    var out: List[Text] = acc;
+    var a: Int = 0;
+    while a < len(arms)
+        invariant a >= 0
+    {
+        out = collect_str_block(arms[a].body, out);
+        a = a + 1;
+    }
+    return out;
 }
 
 fn collect_strings(fns: List[Fn]) -> List[Text] {
@@ -1053,12 +1324,12 @@ fn fn_rets(fns: List[Fn]) -> List[Text] {
     return ts;
 }
 
-fn compile_program(fns: List[Fn], recs: List[RecDecl]) -> List[Int] {
+fn compile_program(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) -> List[Int] {
     let names: List[Text] = fn_names(fns);
-    let offs: List[Int] = fn_offsets(fns, recs);
+    let offs: List[Int] = fn_offsets(fns, recs, enums);
     let rets: List[Text] = fn_rets(fns);
     let strs: List[Text] = collect_strings(fns);
-    let data_base: Int = 4194480 + code_length(fns, recs);
+    let data_base: Int = 4194480 + code_length(fns, recs, enums);
     let saddrs: List[Int] = str_addrs(strs, data_base);
     let main_off: Int = lookup(names, offs, "main");
     var code: List[Int] = entry_stub(main_off);
@@ -1066,7 +1337,7 @@ fn compile_program(fns: List[Fn], recs: List[RecDecl]) -> List[Int] {
     while i < len(fns)
         invariant i >= 0
     {
-        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs, rets, recs));
+        code = cat(code, gen_fn(fns[i], names, offs, strs, saddrs, rets, recs, enums));
         i = i + 1;
     }
     return cat(code, str_data(strs));
@@ -1238,30 +1509,69 @@ fn supported_stmt(s: Stmt, ctx: Ctx) -> Bool {
             return supported(c, ctx) and supported_block(body, ctx);
         }
         SMatch(scrut, arms) => {
-            return false;
+            // a match is supported when the scrutinee is a known enum and every
+            // arm names a variant (or wildcard) with the right binder count and
+            // a supported body.
+            return enum_known(ctx.enums, type_of(scrut, ctx)) and supported(scrut, ctx) and arms_supported(arms, ctx);
         }
     }
 }
 
+fn enum_known(enums: List[EnumDecl], name: Text) -> Bool {
+    var i: Int = 0;
+    while i < len(enums)
+        invariant i >= 0
+    {
+        if enums[i].name == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn arms_supported(arms: List[MatchArm], ctx: Ctx) -> Bool {
+    var a: Int = 0;
+    while a < len(arms)
+        invariant a >= 0
+    {
+        let arm: MatchArm = arms[a];
+        if arm.variant != "_" {
+            if not variant_known(ctx.enums, arm.variant) {
+                return false;
+            }
+            if len(arm.binders) != variant_arity(ctx.enums, arm.variant) {
+                return false;
+            }
+        }
+        if not supported_block(arm.body, ctx) {
+            return false;
+        }
+        a = a + 1;
+    }
+    return true;
+}
+
 // A type is one machine word if it is a scalar, a List (heap pointer), or a
-// known record (heap pointer).
-fn ty_simple(t: Ty, recs: List[RecDecl]) -> Bool {
+// known record or enum (heap pointer).
+fn ty_simple(t: Ty, recs: List[RecDecl], enums: List[EnumDecl]) -> Bool {
     match t {
         TApp(name, args) => {
             let scalar: Bool = len(args) == 0 and (name == "Int" or name == "Bool" or name == "Unit" or name == "Text");
             let list: Bool = name == "List" and len(args) == 1;
             let rec: Bool = len(args) == 0 and rec_known(recs, name);
-            return scalar or list or rec;
+            let enm: Bool = len(args) == 0 and enum_known(enums, name);
+            return scalar or list or rec or enm;
         }
     }
 }
 
-fn params_ok(ps: List[Param], recs: List[RecDecl]) -> Bool {
+fn params_ok(ps: List[Param], recs: List[RecDecl], enums: List[EnumDecl]) -> Bool {
     var i: Int = 0;
     while i < len(ps)
         invariant i >= 0
     {
-        if not ty_simple(ps[i].ty, recs) {
+        if not ty_simple(ps[i].ty, recs, enums) {
             return false;
         }
         i = i + 1;
@@ -1269,7 +1579,7 @@ fn params_ok(ps: List[Param], recs: List[RecDecl]) -> Bool {
     return true;
 }
 
-fn supported_program(fns: List[Fn], recs: List[RecDecl]) -> Bool {
+fn supported_program(fns: List[Fn], recs: List[RecDecl], enums: List[EnumDecl]) -> Bool {
     var i: Int = 0;
     while i < len(fns)
         invariant i >= 0
@@ -1278,15 +1588,15 @@ fn supported_program(fns: List[Fn], recs: List[RecDecl]) -> Bool {
         if len(f.tparams) != 0 {
             return false;
         }
-        if not ty_simple(f.ret, recs) {
+        if not ty_simple(f.ret, recs, enums) {
             return false;
         }
-        if not params_ok(f.params, recs) {
+        if not params_ok(f.params, recs, enums) {
             return false;
         }
-        // build the function's type environment so field/record support can be
-        // decided; layout maps are not needed for type tags.
-        let ctx: Ctx = build_ctx(f, fn_names(fns), [], [], [], fn_rets(fns), recs);
+        // build the function's type environment so field/record/match support
+        // can be decided; layout maps are not needed for type tags.
+        let ctx: Ctx = build_ctx(f, fn_names(fns), [], [], [], fn_rets(fns), recs, enums);
         if not supported_block(f.body, ctx) {
             return false;
         }
@@ -1373,8 +1683,9 @@ fn main(console: Console, fs: Fs) -> Unit ! {fs.read, fs.write, io.read, io.writ
         ROk(prog, j) => {
             let fns: List[Fn] = prog.fns;
             let recs: List[RecDecl] = prog.recs;
-            if supported_program(fns, recs) {
-                let code: List[Int] = compile_program(fns, recs);
+            let enums: List[EnumDecl] = prog.enums;
+            if supported_program(fns, recs, enums) {
+                let code: List[Int] = compile_program(fns, recs, enums);
                 write_bytes(fs, out_path, elf(code));
                 print(console, "compiled " + str(len(fns)) + " function(s), " + str(len(code)) + " bytes");
             } else {

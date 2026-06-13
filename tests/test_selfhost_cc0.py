@@ -163,6 +163,86 @@ class TestCc0(unittest.TestCase):
                     result = subprocess.run([str(exe)])
                 self.assertEqual(result.returncode, expected)
 
+    def test_enum_program_compiles(self):
+        with tempfile.TemporaryDirectory() as t:
+            blob = self.compile(
+                Path(t),
+                "enum Opt { None, Some(Int) }\n"
+                "fn unwrap(o: Opt) -> Int { match o { Some(v) => { return v; } "
+                "None => { return 0; } } }\n"
+                "fn main() -> Int { return unwrap(Some(42)); }")
+        self.assertEqual(blob[:4], b"\x7fELF")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "emitted ELF only runs on Linux")
+    def test_emitted_enum_match_programs(self):
+        # an enum value is a heap block [tag][payload...]; construction stores
+        # the variant index + payloads, match dispatches on the tag and binds
+        # payload slots. Covers nullary + payload variants, wildcards, Text
+        # payloads, reordered/declaration-order tags, and nested/reused binders.
+        cases = [
+            # nullary variants, dispatch by tag
+            ("enum Color { Red, Green, Blue }\n"
+             "fn val(c: Color) -> Int { match c { Red => { return 1; } "
+             "Green => { return 2; } Blue => { return 3; } } }\n"
+             "fn main() -> Int { return val(Green) + val(Blue); }", 5),
+            # payload variant, bind and return; arm order != declaration order
+            ("enum Opt { None, Some(Int) }\n"
+             "fn f(o: Opt) -> Int { match o { Some(v) => { return v; } "
+             "None => { return 0; } } }\n"
+             "fn main() -> Int { return f(Some(42)); }", 42),
+            # the other arm of the same enum
+            ("enum Opt { None, Some(Int) }\n"
+             "fn f(o: Opt) -> Int { match o { None => { return 7; } "
+             "Some(v) => { return v; } } }\n"
+             "fn main() -> Int { return f(None); }", 7),
+            # two payloads + a wildcard arm
+            ("enum Res { Ok(Int, Int), Err(Int) }\n"
+             "fn f(r: Res) -> Int { match r { Ok(a, b) => { return a + b; } "
+             "_ => { return 0; } } }\n"
+             "fn main() -> Int { return f(Ok(40, 2)); }", 42),
+            # a Text payload, used via len in the arm
+            ('enum Msg { Greet(Text), Quit }\n'
+             'fn h(m: Msg) -> Int { match m { Greet(s) => { return len(s); } '
+             'Quit => { return 0; } } }\n'
+             'fn main() -> Int { return h(Greet("hello")); }', 5),
+            # match a local; construct then bind
+            ("enum E { A(Int), B(Int) }\n"
+             "fn main() -> Int { let e: E = B(42); "
+             "match e { A(x) => { return 0; } B(y) => { return y; } } }", 42),
+            # reused binder names across two matches in one function (cc0 idiom)
+            ("enum P { Pt(Int, Int) }\n"
+             "fn main() -> Int { let a: P = Pt(10, 20); let b: P = Pt(5, 7); "
+             "var s: Int = 0; match a { Pt(x, y) => { s = s + x + y; } } "
+             "match b { Pt(x, y) => { s = s + x + y; } } return s; }", 42),
+            # match in a while loop, accumulating
+            ("enum Cell { Val(Int) }\n"
+             "fn get(i: Int) -> Cell { return Val(i); }\n"
+             "fn main() -> Int { var s: Int = 0; var i: Int = 1; "
+             "while i <= 8 invariant i >= 1 "
+             "{ match get(i) { Val(v) => { s = s + v; } } i = i + 1; } "
+             "return s; }", 36),
+            # nested match (a match inside an arm body)
+            ("enum A { Wrap(Int) }\nenum B { Box(Int) }\n"
+             "fn f(a: A) -> Int { match a { Wrap(n) => "
+             "{ match Box(n) { Box(m) => { return m + 1; } } } } }\n"
+             "fn main() -> Int { return f(Wrap(41)); }", 42),
+            # function returning an enum, matched at the call site
+            ("enum R { Ok(Int), Err(Int) }\n"
+             "fn step(n: Int) -> R { if n <= 0 { return Ok(0); } return Ok(n); }\n"
+             "fn run(n: Int) -> Int { match step(n) { Ok(v) => { return v; } "
+             "Err(e) => { return 0 - e; } } }\n"
+             "fn main() -> Int { return run(42); }", 42),
+        ]
+        for prog, expected in cases:
+            with self.subTest(prog=prog):
+                with tempfile.TemporaryDirectory() as t:
+                    self.compile(Path(t), prog)
+                    exe = Path(t) / "out.bin"
+                    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+                    result = subprocess.run([str(exe)])
+                self.assertEqual(result.returncode, expected)
+
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "emitted ELF only runs on Linux")
     def test_emitted_list_programs(self):
