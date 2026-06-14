@@ -48,12 +48,12 @@ record Ctx {
 // first-class so the optimizer can reason about them; everything else is opaque
 // Bytes. Control flow is structured (matching cc0's if/while/match shapes), so
 // jump distances are computed by `asm` from sub-block sizes — no labels needed.
-//   Push(r)/Pop(r): push/pop register r (0=rax,1=rcx,2=rdx,3=rbx).
-//   Bytes(b):       opaque straight-line machine bytes (whole instructions).
-//   IfZ(body):           jz over body            (if cond { body })
-//   IfZElse(t, e):       jz t+5; t; jmp e; e     (if/else, if-expression)
-//   While(test, body):   test; jz body+5; body; jmp back
-//   Arm(tag, body, rest): cmp rax,tag; jne body+5; body; jmp rest; rest
+// Push(r)/Pop(r): push/pop register r (0=rax,1=rcx,2=rdx,3=rbx).
+// Bytes(b):       opaque straight-line machine bytes (whole instructions).
+// IfZ(body):           jz over body            (if cond { body })
+// IfZElse(t, e):       jz t+5; t; jmp e; e     (if/else, if-expression)
+// While(test, body):   test; jz body+5; body; jmp back
+// Arm(tag, body, rest): cmp rax,tag; jne body+5; body; jmp rest; rest
 enum Ins {
     Push(Int),
     Pop(Int),
@@ -929,6 +929,150 @@ fn setcc(op: Text) -> List[Int] {
     return [15, 157, 192];
 }
 
+// ------------------------------------------------- register-targeted operands
+// A "leaf" expression has a value that can be loaded straight into a register
+// with no stack use and no side effects, so it never needs spilling and can be
+// freely re-loaded. These are integer/boolean/text literals and plain variables
+// (an Uppercase nullary variant builds a heap block, so it is NOT a leaf).
+fn is_leaf(e: Expr, ctx: Ctx) -> Bool {
+    match e {
+        EInt(n) => {
+            return true;
+        }
+        EBool(b) => {
+            return true;
+        }
+        EVar(x) => {
+            return not variant_known(ctx.enums, x);
+        }
+        EText(t) => {
+            return true;
+        }
+        EUn(op, kids) => {
+            return false;
+        }
+        EBin(op, kids) => {
+            return false;
+        }
+        ECall(name, args) => {
+            return false;
+        }
+        EIndex(kids) => {
+            return false;
+        }
+        EList(items) => {
+            return false;
+        }
+        EIf(kids) => {
+            return false;
+        }
+        ERecord(name, fields) => {
+            return false;
+        }
+        EField(name, kids) => {
+            return false;
+        }
+    }
+}
+
+// Load a leaf's value directly into register `reg` (0=rax,1=rcx,2=rdx,3=rbx).
+fn load_reg(e: Expr, reg: Int, ctx: Ctx) -> List[Int] {
+    match e {
+        EInt(n) => {
+            // mov reg, imm64
+            return cat([72, 184 + reg], le(n, 8));
+        }
+        EBool(b) => {
+            if b {
+                return cat([72, 184 + reg], le(1, 8));
+            }
+            return cat([72, 184 + reg], le(0, 8));
+        }
+        EVar(x) => {
+            // mov reg, [rbp + disp]
+            let disp: Int = lookup(ctx.vnames, ctx.vdisps, x);
+            return cat([72, 139, 133 + 8 * reg], le_s32(disp));
+        }
+        EText(t) => {
+            let addr: Int = lookup(ctx.snames, ctx.saddrs, t);
+            return cat([72, 184 + reg], le(addr, 8));
+        }
+        EUn(op, kids) => {
+            return [];
+        }
+        EBin(op, kids) => {
+            return [];
+        }
+        ECall(name, args) => {
+            return [];
+        }
+        EIndex(kids) => {
+            return [];
+        }
+        EList(items) => {
+            return [];
+        }
+        EIf(kids) => {
+            return [];
+        }
+        ERecord(name, fields) => {
+            return [];
+        }
+        EField(name, kids) => {
+            return [];
+        }
+    }
+}
+
+// The arithmetic/comparison itself, operating on rax (left) and rbx (right) and
+// leaving the result in rax — the operand-handling prefix/suffix (pops and the
+// result push) of bin_op factored out so register-targeted code can reuse it.
+fn op_rr(op: Text) -> List[Int] {
+    if op == "+" {
+        return [72, 1, 216];
+    }
+    if op == "-" {
+        return [72, 41, 216];
+    }
+    if op == "*" {
+        return [72, 15, 175, 195];
+    }
+    if op == "/" {
+        return [72, 153, 72, 247, 251];
+    }
+    if op == "%" {
+        // cqo ; idiv rbx ; mov rax, rdx (remainder)
+        return [72, 153, 72, 247, 251, 72, 137, 208];
+    }
+    if op == "and" {
+        return [72, 33, 216];
+    }
+    if op == "or" {
+        return [72, 9, 216];
+    }
+    if is_cmp(op) {
+        return cat([72, 57, 216], cat(setcc(op), [15, 182, 192]));
+    }
+    return [];
+}
+
+// Generate an integer/boolean binop with operands kept in registers. A leaf
+// right operand is loaded into rbx directly (no push); a leaf left operand is
+// re-loaded after the right is computed, so neither leaf is ever spilled. Only
+// when BOTH operands are non-leaves does it fall back to the stack (and even
+// then the peephole fuses the right operand's push/pop).
+fn gen_binop(op: Text, l: Expr, r: Expr, ctx: Ctx) -> List[Ins] {
+    if is_leaf(r, ctx) {
+        // l -> rax ; rbx = r ; rax = l op r
+        return acat(gen(l, ctx), [Pop(0), Bytes(load_reg(r, 3, ctx)), Bytes(op_rr(op)), Push(0)]);
+    }
+    if is_leaf(l, ctx) {
+        // r -> rax ; rbx = r ; rax = l (reloaded) ; rax = l op r
+        return acat(gen(r, ctx), [Pop(0), Bytes(cat([72, 137, 195], load_reg(l, 0, ctx))), Bytes(op_rr(op)), Push(0)]);
+    }
+    return acat(gen(l, ctx), acat(gen(r, ctx), bin_op(op)));
+}
+
 fn gen(e: Expr, ctx: Ctx) -> List[Ins] {
     match e {
         EInt(n) => {
@@ -966,7 +1110,7 @@ fn gen(e: Expr, ctx: Ctx) -> List[Ins] {
             if op == "+" and type_of(kids[0], ctx) == "Text" {
                 return gen_concat(kids[0], kids[1], ctx);
             }
-            return acat(gen(kids[0], ctx), acat(gen(kids[1], ctx), bin_op(op)));
+            return gen_binop(op, kids[0], kids[1], ctx);
         }
         ECall(name, args) => {
             return gen_call(name, args, ctx);
