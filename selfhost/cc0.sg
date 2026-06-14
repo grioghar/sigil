@@ -751,6 +751,132 @@ fn asm(prog: List[Ins]) -> List[Int] {
     return out;
 }
 
+// ---------------------------------------------------------------- peephole
+// The register an item pushes, or -1 if it is not a Push; likewise for Pop.
+// These let the fuser recognize an adjacent push/pop pair without disassembly.
+fn push_reg(x: Ins) -> Int {
+    match x {
+        Push(r) => {
+            return r;
+        }
+        Pop(r) => {
+            return 0 - 1;
+        }
+        Bytes(b) => {
+            return 0 - 1;
+        }
+        IfZ(body) => {
+            return 0 - 1;
+        }
+        IfZElse(t, e) => {
+            return 0 - 1;
+        }
+        While(test, body) => {
+            return 0 - 1;
+        }
+        Arm(tag, body, rest) => {
+            return 0 - 1;
+        }
+    }
+}
+
+fn pop_reg(x: Ins) -> Int {
+    match x {
+        Push(r) => {
+            return 0 - 1;
+        }
+        Pop(r) => {
+            return r;
+        }
+        Bytes(b) => {
+            return 0 - 1;
+        }
+        IfZ(body) => {
+            return 0 - 1;
+        }
+        IfZElse(t, e) => {
+            return 0 - 1;
+        }
+        While(test, body) => {
+            return 0 - 1;
+        }
+        Arm(tag, body, rest) => {
+            return 0 - 1;
+        }
+    }
+}
+
+// Recurse peephole into a structured item's sub-blocks.
+fn peep1(x: Ins) -> Ins {
+    match x {
+        Push(r) => {
+            return Push(r);
+        }
+        Pop(r) => {
+            return Pop(r);
+        }
+        Bytes(b) => {
+            return Bytes(b);
+        }
+        IfZ(body) => {
+            return IfZ(peephole(body));
+        }
+        IfZElse(t, e) => {
+            return IfZElse(peephole(t), peephole(e));
+        }
+        While(test, body) => {
+            return While(peephole(test), peephole(body));
+        }
+        Arm(tag, body, rest) => {
+            return Arm(tag, peephole(body), peephole(rest));
+        }
+    }
+}
+
+// Peephole optimizer. Adjacent `push a ; pop b` move a value to the stack and
+// straight back, so they collapse: to nothing if a==b, else to `mov b, a` —
+// keeping the value in a register instead of round-tripping through memory.
+// A Bytes/Label/structured item between a push and a pop is a barrier, so a
+// push whose value is genuinely live across other code (e.g. a binop's left
+// operand, spilled while the right is evaluated) is correctly left alone.
+fn peephole(prog: List[Ins]) -> List[Ins] {
+    // optimize nested control-flow blocks first
+    var rec: List[Ins] = [];
+    var i: Int = 0;
+    while i < len(prog)
+        invariant i >= 0
+    {
+        rec = push(rec, peep1(prog[i]));
+        i = i + 1;
+    }
+    // then fuse adjacent push/pop pairs at this level
+    var out: List[Ins] = [];
+    let n: Int = len(rec);
+    var j: Int = 0;
+    while j < n
+        invariant j >= 0
+    {
+        let a: Int = push_reg(rec[j]);
+        var fused: Bool = false;
+        if a >= 0 and j + 1 < n {
+            let b: Int = pop_reg(rec[j + 1]);
+            if b >= 0 {
+                fused = true;
+                if a != b {
+                    // mov b, a  (REX.W 89 /r ; ModRM = 11 src(a) dst(b))
+                    out = push(out, Bytes([72, 137, 192 + 8 * a + b]));
+                }
+                j = j + 2;
+            }
+        }
+        if not fused {
+            out = push(out, rec[j]);
+            j = j + 1;
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- expr codegen
 fn bin_op(op: Text) -> List[Ins] {
     if op == "+" {
@@ -1316,9 +1442,9 @@ fn prologue(frame: Int) -> List[Int] {
 fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl], enums: List[EnumDecl]) -> List[Int] {
     let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets, recs, enums);
     let frame: Int = round16(8 * len(collect_locals(f.body, [])));
-    // lower the function-body IR to bytes, framed by prologue and a
-    // fall-through-safety epilogue: xor eax, eax ; leave ; ret
-    return cat(prologue(frame), cat(asm(gen_block(f.body, ctx)), [49, 192, 201, 195]));
+    // optimize the function-body IR, then lower to bytes, framed by prologue
+    // and a fall-through-safety epilogue: xor eax, eax ; leave ; ret
+    return cat(prologue(frame), cat(asm(peephole(gen_block(f.body, ctx))), [49, 192, 201, 195]));
 }
 
 // Entry stub at code offset 0 (ELF entry 0x4000b0). Initializes the heap bump
