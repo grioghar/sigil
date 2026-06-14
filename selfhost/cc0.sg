@@ -397,8 +397,16 @@ fn le(n: Int, width: Int) -> List[Int] {
     while i < width
         invariant i >= 0
     {
-        out = push(out, v % 256);
-        v = v / 256;
+        // normalize the low byte to 0..255 (Sigil's % truncates, so a negative
+        // v yields a negative remainder), then carry with exact division — this
+        // emits correct two's-complement bytes for negative values (e.g. a
+        // constant-folded `0 - 1`), not just non-negative ones.
+        var b: Int = v % 256;
+        if b < 0 {
+            b = b + 256;
+        }
+        out = push(out, b);
+        v = (v - b) / 256;
         i = i + 1;
     }
     return out;
@@ -1061,8 +1069,166 @@ fn op_rr(op: Text) -> List[Int] {
 // re-loaded after the right is computed, so neither leaf is ever spilled. Only
 // when BOTH operands are non-leaves does it fall back to the stack (and even
 // then the peephole fuses the right operand's push/pop).
+// Whether `e` is an integer literal, and its value.
+fn is_int_lit(e: Expr) -> Bool {
+    match e {
+        EInt(n) => {
+            return true;
+        }
+        EBool(b) => {
+            return false;
+        }
+        EVar(x) => {
+            return false;
+        }
+        EText(t) => {
+            return false;
+        }
+        EUn(op, kids) => {
+            return false;
+        }
+        EBin(op, kids) => {
+            return false;
+        }
+        ECall(name, args) => {
+            return false;
+        }
+        EIndex(kids) => {
+            return false;
+        }
+        EList(items) => {
+            return false;
+        }
+        EIf(kids) => {
+            return false;
+        }
+        ERecord(name, fields) => {
+            return false;
+        }
+        EField(name, kids) => {
+            return false;
+        }
+    }
+}
+
+fn int_lit(e: Expr) -> Int {
+    match e {
+        EInt(n) => {
+            return n;
+        }
+        EBool(b) => {
+            return 0;
+        }
+        EVar(x) => {
+            return 0;
+        }
+        EText(t) => {
+            return 0;
+        }
+        EUn(op, kids) => {
+            return 0;
+        }
+        EBin(op, kids) => {
+            return 0;
+        }
+        ECall(name, args) => {
+            return 0;
+        }
+        EIndex(kids) => {
+            return 0;
+        }
+        EList(items) => {
+            return 0;
+        }
+        EIf(kids) => {
+            return 0;
+        }
+        ERecord(name, fields) => {
+            return 0;
+        }
+        EField(name, kids) => {
+            return 0;
+        }
+    }
+}
+
+fn fits_imm32(n: Int) -> Bool {
+    return n >= 0 - 2147483648 and n <= 2147483647;
+}
+
+// k such that n == 2^k (1 <= k <= 62), else -1 — for strength-reducing `* 2^k`.
+fn log2_pow2(n: Int) -> Int {
+    var k: Int = 1;
+    var v: Int = 2;
+    while k < 63
+        invariant k >= 1
+    {
+        if v == n {
+            return k;
+        }
+        v = v * 2;
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// `op rax, imm32` operating on rax with an immediate right operand, result in
+// rax — saving the `mov rbx, imm` that a register operand would need. Returns []
+// for operators with no immediate form (/, %), which keep the register path.
+fn imm_binop(op: Text, n: Int) -> List[Int] {
+    if op == "+" {
+        return cat([72, 5], le_s32(n));
+    }
+    if op == "-" {
+        return cat([72, 45], le_s32(n));
+    }
+    if op == "and" {
+        return cat([72, 37], le_s32(n));
+    }
+    if op == "or" {
+        return cat([72, 13], le_s32(n));
+    }
+    if op == "*" {
+        let k: Int = log2_pow2(n);
+        if k >= 0 {
+            // shl rax, k  (multiply by a power of two)
+            return [72, 193, 224, k];
+        }
+        // imul rax, rax, imm32
+        return cat([72, 105, 192], le_s32(n));
+    }
+    if is_cmp(op) {
+        // cmp rax, imm32 ; setcc al ; movzx eax, al
+        return cat(cat([72, 61], le_s32(n)), cat(setcc(op), [15, 182, 192]));
+    }
+    return [];
+}
+
 fn gen_binop(op: Text, l: Expr, r: Expr, ctx: Ctx) -> List[Ins] {
+    // constant-fold two integer literals for +, -, * (low-64-bit-correct, so the
+    // emitted literal matches the wrapping runtime; /, % and comparisons are left
+    // alone to avoid signedness mismatches with the hardware).
+    if is_int_lit(l) and is_int_lit(r) {
+        let a: Int = int_lit(l);
+        let b: Int = int_lit(r);
+        if op == "+" {
+            return [Bytes(cat([72, 184], le(a + b, 8))), Push(0)];
+        }
+        if op == "-" {
+            return [Bytes(cat([72, 184], le(a - b, 8))), Push(0)];
+        }
+        if op == "*" {
+            return [Bytes(cat([72, 184], le(a * b, 8))), Push(0)];
+        }
+    }
     if is_leaf(r, ctx) {
+        // immediate fast path: integer-constant right operand needing no register
+        if is_int_lit(r) and fits_imm32(int_lit(r)) {
+            let seq: List[Int] = imm_binop(op, int_lit(r));
+            if len(seq) > 0 {
+                return acat(gen(l, ctx), [Pop(0), Bytes(seq), Push(0)]);
+            }
+        }
         // l -> rax ; rbx = r ; rax = l op r
         return acat(gen(l, ctx), [Pop(0), Bytes(load_reg(r, 3, ctx)), Bytes(op_rr(op)), Push(0)]);
     }
