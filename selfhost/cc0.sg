@@ -39,6 +39,31 @@ record Ctx {
     enums: List[EnumDecl],
 }
 
+// ---------------------------------------------------------------- instruction IR
+//
+// Codegen builds a list of IR items (Ins) rather than raw bytes, and `asm`
+// lowers them to x86-64. This lets an optimization pass rewrite the instruction
+// stream (e.g. fuse an operand's `push` with its consumer's `pop` into a `mov`)
+// before bytes — and addresses — are fixed. Two stack slots, Push/Pop, are
+// first-class so the optimizer can reason about them; everything else is opaque
+// Bytes. Control flow is structured (matching cc0's if/while/match shapes), so
+// jump distances are computed by `asm` from sub-block sizes — no labels needed.
+//   Push(r)/Pop(r): push/pop register r (0=rax,1=rcx,2=rdx,3=rbx).
+//   Bytes(b):       opaque straight-line machine bytes (whole instructions).
+//   IfZ(body):           jz over body            (if cond { body })
+//   IfZElse(t, e):       jz t+5; t; jmp e; e     (if/else, if-expression)
+//   While(test, body):   test; jz body+5; body; jmp back
+//   Arm(tag, body, rest): cmp rax,tag; jne body+5; body; jmp rest; rest
+enum Ins {
+    Push(Int),
+    Pop(Int),
+    Bytes(List[Int]),
+    IfZ(List[Ins]),
+    IfZElse(List[Ins], List[Ins]),
+    While(List[Ins], List[Ins]),
+    Arm(Int, List[Ins], List[Ins]),
+}
+
 // type environment: each variable's type tag (parallel to vnames) and each
 // function's return-type tag (parallel to fnames). Tags are "Int", "Bool",
 // "Text", "Unit", or "List:<elem>" — enough to lower overloaded + and ==.
@@ -658,31 +683,99 @@ fn build_ctx(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], sa
     return Ctx { vnames: vn, vdisps: vd, fnames: fnames, foffs: foffs, snames: snames, saddrs: saddrs, vtags: vt, frets: frets, recs: recs, enums: enums };
 }
 
+// Concatenate two instruction lists.
+fn acat(a: List[Ins], b: List[Ins]) -> List[Ins] {
+    var out: List[Ins] = a;
+    var i: Int = 0;
+    while i < len(b)
+        invariant i >= 0
+    {
+        out = push(out, b[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Wrap raw bytes as a single opaque IR item.
+fn raw(b: List[Int]) -> List[Ins] {
+    return [Bytes(b)];
+}
+
+// Lower one IR item to machine bytes. Structured control flow computes its
+// own rel32 jump distances from the assembled sizes of its sub-blocks; these
+// reproduce exactly the hand-computed offsets of the original flat codegen.
+fn asm1(x: Ins) -> List[Int] {
+    match x {
+        Push(r) => {
+            return [80 + r];
+        }
+        Pop(r) => {
+            return [88 + r];
+        }
+        Bytes(b) => {
+            return b;
+        }
+        IfZ(body) => {
+            let bb: List[Int] = asm(body);
+            return cat(cat([15, 132], le_s32(len(bb))), bb);
+        }
+        IfZElse(t, e) => {
+            let tb: List[Int] = asm(t);
+            let eb: List[Int] = asm(e);
+            return cat(cat([15, 132], le_s32(len(tb) + 5)), cat(tb, cat(cat([233], le_s32(len(eb))), eb)));
+        }
+        While(test, body) => {
+            let tb: List[Int] = asm(test);
+            let bb: List[Int] = asm(body);
+            let back: Int = 0 - (len(tb) + 6 + len(bb) + 5);
+            return cat(tb, cat(cat([15, 132], le_s32(len(bb) + 5)), cat(bb, cat([233], le_s32(back)))));
+        }
+        Arm(tag, body, rest) => {
+            let bb: List[Int] = asm(body);
+            let rb: List[Int] = asm(rest);
+            return cat(cat([72, 61], le(tag, 4)), cat(cat([15, 133], le_s32(len(bb) + 5)), cat(bb, cat(cat([233], le_s32(len(rb))), rb))));
+        }
+    }
+}
+
+// Lower an instruction list to machine bytes.
+fn asm(prog: List[Ins]) -> List[Int] {
+    var out: List[Int] = [];
+    var i: Int = 0;
+    while i < len(prog)
+        invariant i >= 0
+    {
+        out = cat(out, asm1(prog[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------- expr codegen
-fn bin_op(op: Text) -> List[Int] {
+fn bin_op(op: Text) -> List[Ins] {
     if op == "+" {
-        return [91, 88, 72, 1, 216, 80];
+        return [Pop(3), Pop(0), Bytes([72, 1, 216]), Push(0)];
     }
     if op == "-" {
-        return [91, 88, 72, 41, 216, 80];
+        return [Pop(3), Pop(0), Bytes([72, 41, 216]), Push(0)];
     }
     if op == "*" {
-        return [91, 88, 72, 15, 175, 195, 80];
+        return [Pop(3), Pop(0), Bytes([72, 15, 175, 195]), Push(0)];
     }
     if op == "/" {
-        return [91, 88, 72, 153, 72, 247, 251, 80];
+        return [Pop(3), Pop(0), Bytes([72, 153, 72, 247, 251]), Push(0)];
     }
     if op == "%" {
-        return [91, 88, 72, 153, 72, 247, 251, 82];
+        return [Pop(3), Pop(0), Bytes([72, 153, 72, 247, 251]), Push(2)];
     }
     if op == "and" {
-        return [91, 88, 72, 33, 216, 80];
+        return [Pop(3), Pop(0), Bytes([72, 33, 216]), Push(0)];
     }
     if op == "or" {
-        return [91, 88, 72, 9, 216, 80];
+        return [Pop(3), Pop(0), Bytes([72, 9, 216]), Push(0)];
     }
     if is_cmp(op) {
-        return cat([91, 88, 72, 57, 216], cat(setcc(op), [15, 182, 192, 80]));
+        return [Pop(3), Pop(0), Bytes(cat([72, 57, 216], cat(setcc(op), [15, 182, 192]))), Push(0)];
     }
     return [];
 }
@@ -710,16 +803,17 @@ fn setcc(op: Text) -> List[Int] {
     return [15, 157, 192];
 }
 
-fn gen(e: Expr, ctx: Ctx) -> List[Int] {
+fn gen(e: Expr, ctx: Ctx) -> List[Ins] {
     match e {
         EInt(n) => {
-            return cat([72, 184], cat(le(n, 8), [80]));
+            // mov rax, n ; push rax
+            return [Bytes(cat([72, 184], le(n, 8))), Push(0)];
         }
         EBool(b) => {
             if b {
-                return cat([72, 184], cat(le(1, 8), [80]));
+                return [Bytes(cat([72, 184], le(1, 8))), Push(0)];
             }
-            return cat([72, 184], cat(le(0, 8), [80]));
+            return [Bytes(cat([72, 184], le(0, 8))), Push(0)];
         }
         EVar(x) => {
             // a bare Uppercase name is a nullary enum variant: build its block.
@@ -728,13 +822,15 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             }
             // mov rax, [rbp + disp] ; push rax
             let disp: Int = lookup(ctx.vnames, ctx.vdisps, x);
-            return cat([72, 139, 133], cat(le_s32(disp), [80]));
+            return [Bytes(cat([72, 139, 133], le_s32(disp))), Push(0)];
         }
         EUn(op, kids) => {
             if op == "not" {
-                return cat(gen(kids[0], ctx), [88, 72, 131, 240, 1, 80]);
+                // pop rax ; xor rax, 1 ; push rax
+                return acat(gen(kids[0], ctx), [Pop(0), Bytes([72, 131, 240, 1]), Push(0)]);
             }
-            return cat(gen(kids[0], ctx), [88, 72, 247, 216, 80]);
+            // pop rax ; neg rax ; push rax
+            return acat(gen(kids[0], ctx), [Pop(0), Bytes([72, 247, 216]), Push(0)]);
         }
         EBin(op, kids) => {
             // overloaded operators dispatch on operand type.
@@ -744,7 +840,7 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             if op == "+" and type_of(kids[0], ctx) == "Text" {
                 return gen_concat(kids[0], kids[1], ctx);
             }
-            return cat(gen(kids[0], ctx), cat(gen(kids[1], ctx), bin_op(op)));
+            return acat(gen(kids[0], ctx), acat(gen(kids[1], ctx), bin_op(op)));
         }
         ECall(name, args) => {
             return gen_call(name, args, ctx);
@@ -752,17 +848,14 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
         EIndex(kids) => {
             // kids[0] = list, kids[1] = index. Element at [ptr + 8 + 8*index].
             // pop rcx(index) ; pop rax(ptr) ; mov rax,[rax+rcx*8+8] ; push rax
-            return cat(gen(kids[0], ctx), cat(gen(kids[1], ctx), [89, 88, 72, 139, 68, 200, 8, 80]));
+            return acat(gen(kids[0], ctx), acat(gen(kids[1], ctx), [Pop(1), Pop(0), Bytes([72, 139, 68, 200, 8]), Push(0)]));
         }
         EList(items) => {
             return gen_list(items, ctx);
         }
         EIf(kids) => {
             // if-expression: each branch is one value-pushing expression.
-            let head: List[Int] = cat(cond_test(kids[0], ctx), jz(len(gen(kids[1], ctx)) + 5));
-            let then_code: List[Int] = gen(kids[1], ctx);
-            let else_code: List[Int] = gen(kids[2], ctx);
-            return cat(head, cat(then_code, cat(jmp(len(else_code)), else_code)));
+            return acat(cond_test(kids[0], ctx), [IfZElse(gen(kids[1], ctx), gen(kids[2], ctx))]);
         }
         ERecord(name, fields) => {
             return gen_record(name, fields, ctx);
@@ -771,7 +864,7 @@ fn gen(e: Expr, ctx: Ctx) -> List[Int] {
             // a Text value is a pointer to its [len][bytes] block in rodata.
             let addr: Int = lookup(ctx.snames, ctx.saddrs, t);
             // mov rax, addr ; push
-            return cat([72, 184], cat(le(addr, 8), [80]));
+            return [Bytes(cat([72, 184], le(addr, 8))), Push(0)];
         }
         EField(name, kids) => {
             return gen_field(name, kids[0], ctx);
@@ -793,57 +886,43 @@ fn alloc_const(n: Int) -> List[Int] {
     return cat(c, [72, 137, 15]);
 }
 
-fn gen_list(items: List[Expr], ctx: Ctx) -> List[Int] {
+fn gen_list(items: List[Expr], ctx: Ctx) -> List[Ins] {
     let k: Int = len(items);
-    var code: List[Int] = alloc_const(8 + 8 * k);
-    // mov qword [rax], k
-    code = cat(code, cat([72, 199, 0], le_s32(k)));
-    // push rax (the result)
-    code = cat(code, [80]);
+    // alloc 8+8k ; mov qword [rax], k ; push rax (the result)
+    var code: List[Ins] = acat(raw(cat(alloc_const(8 + 8 * k), cat([72, 199, 0], le_s32(k)))), [Push(0)]);
     var i: Int = 0;
     while i < k
         invariant i >= 0
     {
-        // push element value
-        code = cat(code, gen(items[i], ctx));
-        // pop rcx
-        code = cat(code, [89]);
-        // mov rax, [rsp] (reload ptr)
-        code = cat(code, [72, 139, 4, 36]);
-        // mov [rax+disp], rcx
-        code = cat(code, cat([72, 137, 136], le_s32(8 + 8 * i)));
+        // push element value ; pop rcx ; mov rax,[rsp] (reload ptr) ; mov [rax+disp],rcx
+        code = acat(code, gen(items[i], ctx));
+        code = acat(code, [Pop(1), Bytes(cat([72, 139, 4, 36], cat([72, 137, 136], le_s32(8 + 8 * i))))]);
         i = i + 1;
     }
     return code;
 }
 
-fn gen_len(arg: Expr, ctx: Ctx) -> List[Int] {
+fn gen_len(arg: Expr, ctx: Ctx) -> List[Ins] {
     // pop rax(ptr) ; mov rax,[rax] (length) ; push rax
-    return cat(gen(arg, ctx), [88, 72, 139, 0, 80]);
+    return acat(gen(arg, ctx), [Pop(0), Bytes([72, 139, 0]), Push(0)]);
 }
 
 // A record literal `Name { f: v, ... }`: allocate one 8-byte slot per field,
 // store each field value at its declaration-order slot, leave the block
 // pointer on the stack. Fields may be written in any order in the literal;
 // field_slot maps each to its fixed offset.
-fn gen_record(name: Text, fields: List[FieldVal], ctx: Ctx) -> List[Int] {
+fn gen_record(name: Text, fields: List[FieldVal], ctx: Ctx) -> List[Ins] {
     let k: Int = len(fields);
-    var code: List[Int] = alloc_const(8 * k);
-    // push rax (the result pointer)
-    code = cat(code, [80]);
+    // alloc 8k ; push rax (the result pointer)
+    var code: List[Ins] = acat(raw(alloc_const(8 * k)), [Push(0)]);
     var i: Int = 0;
     while i < k
         invariant i >= 0
     {
-        // push field value
-        code = cat(code, gen(fields[i].fval, ctx));
-        // pop rcx
-        code = cat(code, [89]);
-        // mov rax, [rsp] (reload ptr)
-        code = cat(code, [72, 139, 4, 36]);
-        // mov [rax + slot*8], rcx
+        // push field value ; pop rcx ; mov rax,[rsp] (reload ptr) ; mov [rax+slot*8],rcx
+        code = acat(code, gen(fields[i].fval, ctx));
         let slot: Int = field_slot(ctx.recs, name, fields[i].fname);
-        code = cat(code, cat([72, 137, 136], le_s32(8 * slot)));
+        code = acat(code, [Pop(1), Bytes(cat([72, 139, 4, 36], cat([72, 137, 136], le_s32(8 * slot))))]);
         i = i + 1;
     }
     return code;
@@ -852,37 +931,29 @@ fn gen_record(name: Text, fields: List[FieldVal], ctx: Ctx) -> List[Int] {
 // An enum value `Variant(args)`: a heap block [tag][payload0][payload1]...,
 // tag = the variant's index in its enum. Built like a record but with the tag
 // in slot 0 and payloads following.
-fn gen_enum(vname: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
+fn gen_enum(vname: Text, args: List[Expr], ctx: Ctx) -> List[Ins] {
     let tag: Int = variant_tag(ctx.enums, vname);
     let k: Int = len(args);
-    var code: List[Int] = alloc_const(8 * (1 + k));
-    // mov qword [rax], tag
-    code = cat(code, cat([72, 199, 0], le_s32(tag)));
-    // push rax (the result pointer)
-    code = cat(code, [80]);
+    // alloc 8*(1+k) ; mov qword [rax],tag ; push rax (the result pointer)
+    var code: List[Ins] = acat(raw(cat(alloc_const(8 * (1 + k)), cat([72, 199, 0], le_s32(tag)))), [Push(0)]);
     var i: Int = 0;
     while i < k
         invariant i >= 0
     {
-        // push payload value
-        code = cat(code, gen(args[i], ctx));
-        // pop rcx
-        code = cat(code, [89]);
-        // mov rax, [rsp] (reload ptr)
-        code = cat(code, [72, 139, 4, 36]);
-        // mov [rax + 8*(i+1)], rcx
-        code = cat(code, cat([72, 137, 136], le_s32(8 * (i + 1))));
+        // push payload ; pop rcx ; mov rax,[rsp] (reload ptr) ; mov [rax+8*(i+1)],rcx
+        code = acat(code, gen(args[i], ctx));
+        code = acat(code, [Pop(1), Bytes(cat([72, 139, 4, 36], cat([72, 137, 136], le_s32(8 * (i + 1)))))]);
         i = i + 1;
     }
     return code;
 }
 
 // Field access `base.field`: evaluate base to a record pointer, load the slot.
-fn gen_field(fname: Text, base: Expr, ctx: Ctx) -> List[Int] {
+fn gen_field(fname: Text, base: Expr, ctx: Ctx) -> List[Ins] {
     let rname: Text = gen_base(type_of(base, ctx));
     let slot: Int = field_slot(ctx.recs, rname, fname);
     // pop rax(ptr) ; mov rax,[rax + slot*8] ; push rax
-    return cat(gen(base, ctx), cat([88, 72, 139, 128], cat(le_s32(8 * slot), [80])));
+    return acat(gen(base, ctx), [Pop(0), Bytes(cat([72, 139, 128], le_s32(8 * slot))), Push(0)]);
 }
 
 // push(xs, x): a new list = xs with x appended (immutable). Emits a
@@ -890,8 +961,8 @@ fn gen_field(fname: Text, base: Expr, ctx: Ctx) -> List[Int] {
 // store the new length, copy the old elements in a loop, append x. Uses
 // rsi=xs, rdi=oldlen, rdx=x, r9=new block, rcx=loop counter — all scratch in
 // the stack machine (live values live on the stack between expressions).
-fn gen_push(args: List[Expr], ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(args[0], ctx), gen(args[1], ctx));
+fn gen_push(args: List[Expr], ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = acat(gen(args[0], ctx), gen(args[1], ctx));
     // setup: pop x, pop xs, oldlen=[xs], newsize bytes -> rcx
     let setup: List[Int] = cat([90, 94, 72, 139, 62, 72, 137, 249, 72, 131, 193, 1, 72, 193, 225, 3, 72, 131, 193, 8], cat([73, 184], le(6291456, 8)));
     // alloc rcx bytes (r9 = block), store newlen, init counter rcx=0
@@ -900,7 +971,7 @@ fn gen_push(args: List[Expr], ctx: Ctx) -> List[Int] {
     let loop: List[Int] = cat(cat([72, 57, 249, 15, 141], le_s32(18)), cat([72, 139, 68, 206, 8, 73, 137, 68, 201, 8, 72, 255, 193, 233], le_s32(0 - 27)));
     // done: store x at [r9 + oldlen*8 + 8] ; rax = r9 ; push rax
     let tail: List[Int] = [73, 137, 84, 249, 8, 76, 137, 200, 80];
-    return cat(code, cat(setup, cat(head, cat(loop, tail))));
+    return acat(code, raw(cat(setup, cat(head, cat(loop, tail)))));
 }
 
 // print writes a Text value (any expression) to stdout: the value is a pointer
@@ -908,27 +979,27 @@ fn gen_push(args: List[Expr], ctx: Ctx) -> List[Int] {
 // argument, so both print(text) [cc0's test subset] and print(console, text)
 // [real Sigil, used by cc0's own source] work — the console capability is a
 // phantom and is ignored.
-fn gen_print(args: List[Expr], ctx: Ctx) -> List[Int] {
+fn gen_print(args: List[Expr], ctx: Ctx) -> List[Ins] {
     // pop rax ; lea rsi,[rax+8] ; mov rdx,[rax] ; mov edi,1 ; mov eax,1 ;
     // syscall ; push rax
-    return cat(gen(args[len(args) - 1], ctx), [88, 72, 141, 112, 8, 72, 139, 16, 191, 1, 0, 0, 0, 184, 1, 0, 0, 0, 15, 5, 80]);
+    return acat(gen(args[len(args) - 1], ctx), raw([88, 72, 141, 112, 8, 72, 139, 16, 191, 1, 0, 0, 0, 184, 1, 0, 0, 0, 15, 5, 80]));
 }
 
-fn gen_ord(arg: Expr, ctx: Ctx) -> List[Int] {
+fn gen_ord(arg: Expr, ctx: Ctx) -> List[Ins] {
     // first byte of the Text: pop rax ; movzx eax, byte [rax+8] ; push rax
-    return cat(gen(arg, ctx), [88, 15, 182, 64, 8, 80]);
+    return acat(gen(arg, ctx), raw([88, 15, 182, 64, 8, 80]));
 }
 
 // chr(n): a one-byte Text holding the low byte of n (the inverse of ord). Used
 // by the lexer's \u{..} escape decoder. Only the byte range is handled (enough
 // for the ASCII codepoints cc0's own source uses); a full UTF-8 encoder is not
 // needed on the self-host path.
-fn gen_chr(arg: Expr, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = gen(arg, ctx);
+fn gen_chr(arg: Expr, ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = gen(arg, ctx);
     // alloc 16 bytes (rax = block) ; pop rcx (n) ; len = 1 ; byte = cl ; push
-    code = cat(code, alloc_const(16));
+    code = acat(code, raw(alloc_const(16)));
     // pop rcx ; mov qword [rax], 1 ; mov [rax+8], cl ; push rax
-    return cat(code, [89, 72, 199, 0, 1, 0, 0, 0, 136, 72, 8, 80]);
+    return acat(code, raw([89, 72, 199, 0, 1, 0, 0, 0, 136, 72, 8, 80]));
 }
 
 // ---------------------------------------------------------------- syscall IO
@@ -949,62 +1020,61 @@ fn nul_path() -> List[Int] {
 // read_file(fs, path): open the path read-only and read it fully into a fresh
 // Text [len][bytes] block on the heap; returns the block pointer. The fs
 // capability is ignored.
-fn gen_read_file(path: Expr, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(path, ctx), [94]);
-    code = cat(code, nul_path());
+fn gen_read_file(path: Expr, ctx: Ctx) -> List[Ins] {
+    // pop path -> rsi ; build NUL-terminated cstring (rax)
+    var b: List[Int] = cat([94], nul_path());
     // open(cstring, O_RDONLY=0, 0) -> fd in rbx
-    code = cat(code, [72, 137, 199, 49, 246, 49, 210, 184, 2, 0, 0, 0, 15, 5, 72, 137, 195]);
+    b = cat(b, [72, 137, 199, 49, 246, 49, 210, 184, 2, 0, 0, 0, 15, 5, 72, 137, 195]);
     // block = heap free ; r8 = block ; r9 = write ptr = block+8
-    code = cat(code, cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 76, 141, 72, 8])));
+    b = cat(b, cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 76, 141, 72, 8])));
     // READ: read(fd, r9, 4096) ; if <=0 -> DONE ; r9 += n ; loop
-    code = cat(code, [72, 137, 223, 76, 137, 206, 186, 0, 16, 0, 0, 49, 192, 15, 5, 72, 133, 192, 126, 5, 73, 1, 193, 235, 231]);
+    b = cat(b, [72, 137, 223, 76, 137, 206, 186, 0, 16, 0, 0, 49, 192, 15, 5, 72, 133, 192, 126, 5, 73, 1, 193, 235, 231]);
     // DONE: len = r9 - r8 - 8 ; store at [r8]
-    code = cat(code, [76, 137, 201, 76, 41, 193, 72, 131, 233, 8, 73, 137, 8]);
+    b = cat(b, [76, 137, 201, 76, 41, 193, 72, 131, 233, 8, 73, 137, 8]);
     // bump heap free to r9
-    code = cat(code, cat([72, 191], cat(le(6291456, 8), [76, 137, 15])));
+    b = cat(b, cat([72, 191], cat(le(6291456, 8), [76, 137, 15])));
     // close(fd) ; mov rax,r8 ; push
-    code = cat(code, [72, 137, 223, 184, 3, 0, 0, 0, 15, 5, 76, 137, 192, 80]);
-    return code;
+    b = cat(b, [72, 137, 223, 184, 3, 0, 0, 0, 15, 5, 76, 137, 192, 80]);
+    return acat(gen(path, ctx), raw(b));
 }
 
 // write_bytes(fs, path, bytes): create/truncate the path and write the low
 // byte of each Int in the list. The fs capability is ignored.
-fn gen_write_bytes(path: Expr, bytes: Expr, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(bytes, ctx), gen(path, ctx));
+fn gen_write_bytes(path: Expr, bytes: Expr, ctx: Ctx) -> List[Ins] {
     // pop path -> rsi ; build NUL-terminated cstring (rax)
-    code = cat(code, cat([94], nul_path()));
+    var b: List[Int] = cat([94], nul_path());
     // open(cstring, O_WRONLY|O_CREAT|O_TRUNC=577, 0o755=493) -> fd in rbx
-    code = cat(code, [72, 137, 199, 190, 65, 2, 0, 0, 186, 237, 1, 0, 0, 184, 2, 0, 0, 0, 15, 5, 72, 137, 195]);
+    b = cat(b, [72, 137, 199, 190, 65, 2, 0, 0, 186, 237, 1, 0, 0, 184, 2, 0, 0, 0, 15, 5, 72, 137, 195]);
     // pop bytes -> rsi ; rcx=count ; src=rsi+8 ; dst buffer = heap free (r8/r9)
-    code = cat(code, [94, 72, 139, 14, 72, 131, 198, 8]);
-    code = cat(code, cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 73, 137, 193])));
+    b = cat(b, [94, 72, 139, 14, 72, 131, 198, 8]);
+    b = cat(b, cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 73, 137, 193])));
     // PACK: test rcx,rcx ; jz +17 ; mov dl,[rsi] ; mov [r9],dl ; add rsi,8 ;
     // inc r9 ; dec rcx ; jmp -22
-    code = cat(code, [72, 133, 201, 116, 17, 138, 22, 65, 136, 17, 72, 131, 198, 8, 73, 255, 193, 72, 255, 201, 235, 234]);
+    b = cat(b, [72, 133, 201, 116, 17, 138, 22, 65, 136, 17, 72, 131, 198, 8, 73, 255, 193, 72, 255, 201, 235, 234]);
     // bump heap free to r9 ; write(fd, buf=r8, count=r9-r8) ; close ; push rax
-    code = cat(code, [76, 137, 15, 76, 137, 198, 76, 137, 202, 76, 41, 194, 72, 137, 223, 184, 1, 0, 0, 0, 15, 5, 72, 137, 223, 184, 3, 0, 0, 0, 15, 5, 80]);
-    return code;
+    b = cat(b, [76, 137, 15, 76, 137, 198, 76, 137, 202, 76, 41, 194, 72, 137, 223, 184, 1, 0, 0, 0, 15, 5, 72, 137, 223, 184, 3, 0, 0, 0, 15, 5, 80]);
+    return acat(gen(bytes, ctx), acat(gen(path, ctx), raw(b)));
 }
 
 // read_line(console): read one line from stdin (no trailing newline) into a
 // fresh Text block; "" at end of input. The console capability is ignored.
-fn gen_read_line(ctx: Ctx) -> List[Int] {
+fn gen_read_line(ctx: Ctx) -> List[Ins] {
     // block = heap free ; r8 = block ; r9 = write ptr = block+8
-    var code: List[Int] = cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 76, 141, 72, 8]));
+    var b: List[Int] = cat([72, 191], cat(le(6291456, 8), [72, 139, 7, 73, 137, 192, 76, 141, 72, 8]));
     // READ: read(0, r9, 1) ; if <=0 -> DONE ; if byte=='\n' -> DONE ; r9++ ; loop
-    code = cat(code, [49, 255, 76, 137, 206, 186, 1, 0, 0, 0, 49, 192, 15, 5, 72, 133, 192, 126, 11, 65, 128, 57, 10, 116, 5, 73, 255, 193, 235, 226]);
+    b = cat(b, [49, 255, 76, 137, 206, 186, 1, 0, 0, 0, 49, 192, 15, 5, 72, 133, 192, 126, 11, 65, 128, 57, 10, 116, 5, 73, 255, 193, 235, 226]);
     // DONE: len = r9 - r8 - 8 ; store at [r8]
-    code = cat(code, [76, 137, 201, 76, 41, 193, 72, 131, 233, 8, 73, 137, 8]);
+    b = cat(b, [76, 137, 201, 76, 41, 193, 72, 131, 233, 8, 73, 137, 8]);
     // bump heap free to r9 ; mov rax,r8 ; push
-    code = cat(code, cat([72, 191], cat(le(6291456, 8), [76, 137, 15, 76, 137, 192, 80])));
-    return code;
+    b = cat(b, cat([72, 191], cat(le(6291456, 8), [76, 137, 15, 76, 137, 192, 80])));
+    return raw(b);
 }
 
 // Text equality: compare two [len][bytes] blocks. Pushes 1 if equal else 0
 // (then negated for !=). A self-contained routine with a byte-compare loop;
 // jump offsets are computed from the fixed instruction sizes (see comments).
-fn gen_text_eq(a: Expr, b: Expr, op: Text, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(a, ctx), gen(b, ctx));
+fn gen_text_eq(a: Expr, b: Expr, op: Text, ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = acat(gen(a, ctx), gen(b, ctx));
     // pop rbx(b); pop rax(a); rcx=len_a; rdx=len_b; rsi=0; if len!= -> DONE
     let h1: List[Int] = cat([91, 88, 72, 139, 8, 72, 139, 19, 72, 49, 246, 72, 57, 209, 15, 133], le_s32(48));
     // rdi=0 ; LOOP: if i>=len -> EQUAL
@@ -1013,10 +1083,10 @@ fn gen_text_eq(a: Expr, b: Expr, op: Text, ctx: Ctx) -> List[Int] {
     let h3: List[Int] = cat([68, 15, 182, 68, 56, 8, 68, 15, 182, 76, 59, 8, 69, 57, 200, 15, 133], le_s32(15));
     // inc i ; jmp LOOP ; EQUAL: rsi=1 ; DONE: push rsi
     let h4: List[Int] = cat([72, 255, 199, 233], cat(le_s32(0 - 38), [72, 199, 198, 1, 0, 0, 0, 86]));
-    code = cat(code, cat(h1, cat(h2, cat(h3, h4))));
+    code = acat(code, raw(cat(h1, cat(h2, cat(h3, h4)))));
     if op == "!=" {
         // pop rax ; xor rax, 1 ; push rax
-        code = cat(code, [88, 72, 131, 240, 1, 80]);
+        code = acat(code, raw([88, 72, 131, 240, 1, 80]));
     }
     return code;
 }
@@ -1029,19 +1099,19 @@ fn copy_loop() -> List[Int] {
 
 // slice(s, i, j): a new Text holding s's bytes [i, j). Allocate 8 + (j-i),
 // store the length, copy the range with the byte-copy loop. Returns a Text ptr.
-fn gen_slice(s: Expr, i: Expr, j: Expr, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(s, ctx), cat(gen(i, ctx), gen(j, ctx)));
+fn gen_slice(s: Expr, i: Expr, j: Expr, ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = acat(gen(s, ctx), acat(gen(i, ctx), gen(j, ctx)));
     // pop j,i,s ; r8 = j-i ; alloc 8+r8 -> r9 ; store len ;
     // lea rsi,[s + i + 8] ; lea rdi,[r9+8] ; rcx = r8 (count)
     let setup: List[Int] = cat([90, 89, 88, 73, 137, 208, 73, 41, 200, 73, 187], cat(le(6291456, 8), [77, 139, 11, 77, 137, 202, 77, 1, 194, 73, 131, 194, 8, 77, 137, 19, 77, 137, 1, 72, 141, 116, 8, 8, 73, 141, 121, 8, 76, 137, 193]));
-    return cat(code, cat(setup, cat(copy_loop(), [76, 137, 200, 80])));
+    return acat(code, raw(cat(setup, cat(copy_loop(), [76, 137, 200, 80]))));
 }
 
 // Text concatenation: a new [len][bytes] block holding a's bytes then b's.
 // Allocate 8 + len_a + len_b, store the length, copy a, then copy b (the dest
 // pointer rdi flows from the first copy into the second). Returns a Text ptr.
-fn gen_concat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(a, ctx), gen(b, ctx));
+fn gen_concat(a: Expr, b: Expr, ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = acat(gen(a, ctx), gen(b, ctx));
     // pop b,a ; rcx=la ; rdx=lb ; r8=total ; alloc -> r9 block ; store len ;
     // lea rsi,[a+8] ; lea rdi,[r9+8]
     let setup: List[Int] = cat([91, 88, 72, 139, 8, 72, 139, 19, 73, 137, 200, 73, 1, 208, 73, 187], cat(le(6291456, 8), [77, 139, 11, 77, 137, 202, 77, 1, 194, 73, 131, 194, 8, 77, 137, 19, 77, 137, 1, 72, 141, 112, 8, 73, 141, 121, 8]));
@@ -1049,15 +1119,15 @@ fn gen_concat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
     let between: List[Int] = [72, 141, 115, 8, 72, 137, 209];
     // mov rax,r9 ; push rax
     let tail: List[Int] = [76, 137, 200, 80];
-    return cat(code, cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail)))));
+    return acat(code, raw(cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail))))));
 }
 
 // cat(a, b) for List[Int]: allocate one [len][8-byte elems] block of
 // la+lb elements and copy a's elements then b's, in a single pass. This is the
 // efficient counterpart to the source-level push loop; the elements are 8 bytes
 // each, so the byte counts handed to copy_loop are 8*la and 8*lb.
-fn gen_cat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = cat(gen(a, ctx), gen(b, ctx));
+fn gen_cat(a: Expr, b: Expr, ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = acat(gen(a, ctx), gen(b, ctx));
     // pop b->rbx, a->rax ; rcx=la ; rdx=lb ; r8=la+lb ; r11=heap ; r9=block ;
     // new free = r9 + 8 + 8*(la+lb) ; store len ; lea rsi,[a+8] ; lea rdi,[r9+8] ;
     // rcx = 8*la (bytes to copy)
@@ -1066,10 +1136,10 @@ fn gen_cat(a: Expr, b: Expr, ctx: Ctx) -> List[Int] {
     let between: List[Int] = [72, 141, 115, 8, 72, 139, 11, 72, 193, 225, 3];
     // mov rax,r9 ; push rax
     let tail: List[Int] = [76, 137, 200, 80];
-    return cat(code, cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail)))));
+    return acat(code, raw(cat(setup, cat(copy_loop(), cat(between, cat(copy_loop(), tail))))));
 }
 
-fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
+fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Ins] {
     if name == "print" {
         return gen_print(args, ctx);
     }
@@ -1110,100 +1180,81 @@ fn gen_call(name: Text, args: List[Expr], ctx: Ctx) -> List[Int] {
         return gen_enum(name, args, ctx);
     }
     // push args left-to-right, then: mov rax, imm64(addr); call rax;
-    // add rsp, 8*nargs (drop args); push rax (result).
-    var code: List[Int] = [];
+    // add rsp, 8*nargs (drop args); push rax (result). The argument pushes stay
+    // on the stack for the call ABI (a Bytes barrier prevents fusing them away).
+    var code: List[Ins] = [];
     var i: Int = 0;
     while i < len(args)
         invariant i >= 0
     {
-        code = cat(code, gen(args[i], ctx));
+        code = acat(code, gen(args[i], ctx));
         i = i + 1;
     }
     let addr: Int = 4194480 + lookup(ctx.fnames, ctx.foffs, name);
-    // mov rax, imm64
-    code = cat(code, cat([72, 184], le(addr, 8)));
-    // call rax
-    code = cat(code, [255, 208]);
-    // add rsp, n
-    code = cat(code, cat([72, 129, 196], le(8 * len(args), 4)));
-    // push rax
-    return cat(code, [80]);
+    // mov rax, imm64 ; call rax ; add rsp, 8*nargs
+    code = acat(code, raw(cat(cat([72, 184], le(addr, 8)), cat([255, 208], cat([72, 129, 196], le(8 * len(args), 4))))));
+    // push rax (result)
+    return acat(code, [Push(0)]);
 }
 
 // ---------------------------------------------------------------- stmt codegen
-fn store(ctx: Ctx, n: Text) -> List[Int] {
+fn store(ctx: Ctx, n: Text) -> List[Ins] {
     // pop rax ; mov [rbp + disp], rax
     let disp: Int = lookup(ctx.vnames, ctx.vdisps, n);
-    return cat([88, 72, 137, 133], le_s32(disp));
+    return [Pop(0), Bytes(cat([72, 137, 133], le_s32(disp)))];
 }
 
-fn cond_test(c: Expr, ctx: Ctx) -> List[Int] {
+fn cond_test(c: Expr, ctx: Ctx) -> List[Ins] {
     // pop rax ; test rax, rax
-    return cat(gen(c, ctx), [88, 72, 133, 192]);
+    return acat(gen(c, ctx), [Pop(0), Bytes([72, 133, 192])]);
 }
 
-fn jz(rel: Int) -> List[Int] {
-    return cat([15, 132], le_s32(rel));
-}
-
-fn jmp(rel: Int) -> List[Int] {
-    return cat([233], le_s32(rel));
-}
-
-fn gen_block(stmts: List[Stmt], ctx: Ctx) -> List[Int] {
-    var out: List[Int] = [];
+fn gen_block(stmts: List[Stmt], ctx: Ctx) -> List[Ins] {
+    var out: List[Ins] = [];
     var i: Int = 0;
     while i < len(stmts)
         invariant i >= 0
     {
-        out = cat(out, gen_stmt(stmts[i], ctx));
+        out = acat(out, gen_stmt(stmts[i], ctx));
         i = i + 1;
     }
     return out;
 }
 
-fn gen_stmt(s: Stmt, ctx: Ctx) -> List[Int] {
+fn gen_stmt(s: Stmt, ctx: Ctx) -> List[Ins] {
     match s {
         SLet(n, t, e) => {
-            return cat(gen(e, ctx), store(ctx, n));
+            return acat(gen(e, ctx), store(ctx, n));
         }
         SVar(n, t, e) => {
-            return cat(gen(e, ctx), store(ctx, n));
+            return acat(gen(e, ctx), store(ctx, n));
         }
         SAssign(n, e) => {
-            return cat(gen(e, ctx), store(ctx, n));
+            return acat(gen(e, ctx), store(ctx, n));
         }
         SReturn(e) => {
             // value -> pop rax ; leave ; ret
-            return cat(gen(e, ctx), [88, 201, 195]);
+            return acat(gen(e, ctx), [Pop(0), Bytes([201, 195])]);
         }
         SReturnVoid => {
             // leave ; ret
-            return [201, 195];
+            return raw([201, 195]);
         }
         SExpr(e) => {
             // discard pushed value
-            return cat(gen(e, ctx), [88]);
+            return acat(gen(e, ctx), [Pop(0)]);
         }
         SBreak => {
             return [];
         }
         SIf(c, body) => {
-            let then_code: List[Int] = gen_block(body, ctx);
-            return cat(cond_test(c, ctx), cat(jz(len(then_code)), then_code));
+            return acat(cond_test(c, ctx), [IfZ(gen_block(body, ctx))]);
         }
         SIfElse(c, t, e) => {
-            let then_code: List[Int] = gen_block(t, ctx);
-            let else_code: List[Int] = gen_block(e, ctx);
-            let head: List[Int] = cat(cond_test(c, ctx), jz(len(then_code) + 5));
-            let mid: List[Int] = cat(then_code, jmp(len(else_code)));
-            return cat(head, cat(mid, else_code));
+            return acat(cond_test(c, ctx), [IfZElse(gen_block(t, ctx), gen_block(e, ctx))]);
         }
         SWhile(c, invs, body) => {
-            let test: List[Int] = cond_test(c, ctx);
-            let body_code: List[Int] = gen_block(body, ctx);
-            let back: Int = 0 - (len(test) + 6 + len(body_code) + 5);
-            return cat(test, cat(jz(len(body_code) + 5), cat(body_code, jmp(back))));
+            return [While(cond_test(c, ctx), gen_block(body, ctx))];
         }
         SMatch(scrut, arms) => {
             return gen_match(scrut, arms, ctx);
@@ -1215,46 +1266,42 @@ fn gen_stmt(s: Stmt, ctx: Ctx) -> List[Int] {
 // the tag against each arm. rbx survives the cmp/jne chain (none of those
 // touch it) and the matched arm's payload binding (which uses rax/rcx); the
 // arm body may then clobber it freely.
-fn gen_match(scrut: Expr, arms: List[MatchArm], ctx: Ctx) -> List[Int] {
+fn gen_match(scrut: Expr, arms: List[MatchArm], ctx: Ctx) -> List[Ins] {
     // pop rax (ptr) ; mov rbx, rax ; mov rax, [rbx] (tag)
-    let pre: List[Int] = cat(gen(scrut, ctx), [88, 72, 137, 195, 72, 139, 3]);
-    return cat(pre, gen_arms(arms, 0, ctx));
+    let pre: List[Ins] = acat(gen(scrut, ctx), [Pop(0), Bytes([72, 137, 195, 72, 139, 3])]);
+    return acat(pre, gen_arms(arms, 0, ctx));
 }
 
 // Lay out arms from index `idx` to the end. `rest` is every following arm's
 // code (up to the match's end label); a non-wildcard arm's `jne` skips its own
 // body+jmp to land at `rest`, and its `jmp` skips `rest` to reach the end.
-fn gen_arms(arms: List[MatchArm], idx: Int, ctx: Ctx) -> List[Int] {
+fn gen_arms(arms: List[MatchArm], idx: Int, ctx: Ctx) -> List[Ins] {
     if idx >= len(arms) {
         return [];
     }
     let arm: MatchArm = arms[idx];
-    let rest: List[Int] = gen_arms(arms, idx + 1, ctx);
-    let body: List[Int] = cat(gen_bind(arm, ctx), gen_block(arm.body, ctx));
+    let rest: List[Ins] = gen_arms(arms, idx + 1, ctx);
+    let body: List[Ins] = acat(gen_bind(arm, ctx), gen_block(arm.body, ctx));
     if arm.variant == "_" {
         // wildcard: always taken; fall straight into the body.
-        return cat(body, rest);
+        return acat(body, rest);
     }
     let tag: Int = variant_tag(ctx.enums, arm.variant);
-    // cmp rax, tag ; jne (skip body + the trailing jmp)
-    let test: List[Int] = cat(cat([72, 61], le(tag, 4)), cat([15, 133], le_s32(len(body) + 5)));
-    // after the body: jmp to the end (over all the remaining arms)
-    return cat(test, cat(body, cat(jmp(len(rest)), rest)));
+    // cmp rax,tag ; jne (skip body+jmp) ; body ; jmp (over rest) ; rest
+    return [Arm(tag, body, rest)];
 }
 
 // Bind an arm's payload binders to the scrutinee's slots: binder k <- [rbx +
 // 8*(k+1)]. The scrutinee pointer is live in rbx.
-fn gen_bind(arm: MatchArm, ctx: Ctx) -> List[Int] {
-    var code: List[Int] = [];
+fn gen_bind(arm: MatchArm, ctx: Ctx) -> List[Ins] {
+    var code: List[Ins] = [];
     var k: Int = 0;
     while k < len(arm.binders)
         invariant k >= 0
     {
-        // mov rcx, [rbx + 8*(k+1)]
-        code = cat(code, cat([72, 139, 139], le_s32(8 * (k + 1))));
-        // mov [rbp + disp], rcx
+        // mov rcx, [rbx + 8*(k+1)] ; mov [rbp + disp], rcx
         let disp: Int = lookup(ctx.vnames, ctx.vdisps, arm.binders[k]);
-        code = cat(code, cat([72, 137, 141], le_s32(disp)));
+        code = acat(code, raw(cat(cat([72, 139, 139], le_s32(8 * (k + 1))), cat([72, 137, 141], le_s32(disp)))));
         k = k + 1;
     }
     return code;
@@ -1269,8 +1316,9 @@ fn prologue(frame: Int) -> List[Int] {
 fn gen_fn(f: Fn, fnames: List[Text], foffs: List[Int], snames: List[Text], saddrs: List[Int], frets: List[Text], recs: List[RecDecl], enums: List[EnumDecl]) -> List[Int] {
     let ctx: Ctx = build_ctx(f, fnames, foffs, snames, saddrs, frets, recs, enums);
     let frame: Int = round16(8 * len(collect_locals(f.body, [])));
-    // fall-through safety: xor eax, eax ; leave ; ret
-    return cat(prologue(frame), cat(gen_block(f.body, ctx), [49, 192, 201, 195]));
+    // lower the function-body IR to bytes, framed by prologue and a
+    // fall-through-safety epilogue: xor eax, eax ; leave ; ret
+    return cat(prologue(frame), cat(asm(gen_block(f.body, ctx)), [49, 192, 201, 195]));
 }
 
 // Entry stub at code offset 0 (ELF entry 0x4000b0). Initializes the heap bump
